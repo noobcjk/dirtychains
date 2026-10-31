@@ -3693,7 +3693,7 @@ int ovswrap_main(int argc, char **argv)
 
 #define APP_TITLE       "DirtyChains · 页缓存提权"
 /* 构建标识: 标题栏副标题上直接显示, 用来确认跑的是不是最新这份 */
-#define DF_BUILD        "2026-10-31-r24"
+#define DF_BUILD        "2026-10-31-r25"
 #define APP_SUBTITLE    "六链 PoC 图形前端 · " DF_BUILD
 #define LOG_MAX_LINES   20000
 #define PTY_COLS        110
@@ -6685,16 +6685,17 @@ static void install_css(void)
         "}\n"
 
         /*
-         * 日志区: 半透明卡片, 让壁纸透出来。
+         * 日志区: 浅色卡片。
          *
-         * 坑: GtkTextView / GtkScrolledWindow 在部分 GTK 版本里带独立
-         * GdkWindow, 背景设成 transparent 时不会清屏, 无合成器的环境下
-         * 会露出未定义像素 (黑块)。因此四层这里都用 transparent, 但卡片
-         * 底色给足不透明度 (0.58) 保证文字可读; 若某些版本出现黑块,
-         * 只需把 #logcard 的 alpha 调高即可, 其它层不必动。
+         * 这里绝对不能用 rgba/transparent: GtkScrolledWindow 与 GtkTextView
+         * 在 X11 下各带自己的 GdkWindow, 没有合成器时 alpha 背景不会被清屏,
+         * 露出的是 X root window 的旧像素 —— 表现就是日志区"透明"到能看见
+         * 桌面壁纸, 而且拖动窗口时那块画面不跟着刷新 (像贴在屏幕上)。
+         * 因此四层统一给不透明底色; 想要半透明效果只在有合成器时叠加,
+         * 见 install_css() 末尾的 composited 分支。
          */
         "#mainwin #logcard {\n"
-        "  background-color: rgba(255,255,255,0.66);\n"
+        "  background-color: #fbfdff;\n"
         "  border: 1px solid rgba(150,185,220,0.55);\n"
         "  border-radius: 12px;\n"
         "  padding: 0;\n"
@@ -6704,7 +6705,7 @@ static void install_css(void)
         "#mainwin #logcard textview,\n"
         "#mainwin #logcard textview text {\n"
         "  background-image: none;\n"
-        "  background-color: transparent;\n"
+        "  background-color: #fbfdff;\n"
         "}\n"
         "#mainwin #logview {\n"
         "  color: #2b3644;\n"
@@ -6756,12 +6757,14 @@ static void install_css(void)
         "  color: #ffffff;\n"
         "}\n"
 
-        /* 左侧任务抽屉: 不画自身底色, 直接透出壁纸 */
+        /* 左侧任务抽屉: 不画自身底色, 直接透出壁纸
+         * (#sidescroll 是 GtkScrolledWindow, 自带 GdkWindow, 无合成器时
+         *  不能透明, 否则拖动会露出 root 旧像素; 与日志区同一处理) */
         "#mainwin #sidebar {\n"
         "  background-color: transparent;\n"
         "  border-right: 1px solid rgba(150,180,210,0.45);\n"
         "}\n"
-        "#mainwin #sidescroll, #mainwin #sidescroll viewport { background-color: transparent; }\n"
+        "#mainwin #sidescroll, #mainwin #sidescroll viewport { background-color: #eef4fb; }\n"
         "#mainwin #tasklist { background-color: transparent; }\n"
         "#mainwin #tasklist row {\n"
         "  background-color: transparent;\n"
@@ -6819,7 +6822,9 @@ static void install_css(void)
         "  padding: 5px 18px;\n"
         "}\n"
         "#pickok:hover { background-color: #3a8ade; }\n"
-        "#pickscroll, #pickscroll viewport { background-color: transparent; }\n"
+        /* 列表容器必须给实色: 它带自己的 GdkWindow, 透明会露出 root 旧像素 */
+        "#pickscroll, #pickscroll viewport { background-color: #f8fbff; }\n"
+        "#pickscroll list, #pickscroll list row { background-color: transparent; }\n"
         "#mainwin #banner-warn {\n"
         "  background-color: #fdecea;\n"
         "  color: #9c1c16;\n"
@@ -6836,6 +6841,42 @@ static void install_css(void)
         GTK_STYLE_PROVIDER(p),
         GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
     g_object_unref(p);
+
+    /*
+     * 半透明只在有合成器时启用。
+     *
+     * 没有合成器 (纯 X11/XFCE 默认会话) 时, 带 alpha 的窗口背景不会被合成,
+     * GtkTextView / GtkScrolledWindow 这类自带 GdkWindow 的控件就会显示
+     * X root window 的陈旧像素: 日志区"透明"到能看见桌面壁纸, 拖动窗口
+     * 时那块画面还不跟着动。所以默认给不透明底色, 检测到合成器才叠加
+     * 一层半透明覆盖 (优先级高一档, 确保覆盖上面的实色)。
+     */
+    {
+        GdkScreen *scr = gdk_screen_get_default();
+
+        if (scr && gdk_screen_is_composited(scr)) {
+            static const char *css_alpha =
+                "#mainwin #logcard { background-color: rgba(255,255,255,0.72); }\n"
+                "#mainwin #logcard scrolledwindow,\n"
+                "#mainwin #logcard viewport,\n"
+                "#mainwin #logcard textview,\n"
+                "#mainwin #logcard textview text {\n"
+                "  background-image: none;\n"
+                "  background-color: transparent;\n"
+                "}\n"
+                "#mainwin #sidescroll, #mainwin #sidescroll viewport {\n"
+                "  background-color: transparent;\n"
+                "}\n";
+            GtkCssProvider *pa = gtk_css_provider_new();
+
+            gtk_css_provider_load_from_data(pa, css_alpha, -1, NULL);
+            gtk_style_context_add_provider_for_screen(
+                scr,
+                GTK_STYLE_PROVIDER(pa),
+                GTK_STYLE_PROVIDER_PRIORITY_APPLICATION + 1);
+            g_object_unref(pa);
+        }
+    }
 }
 
 static void make_log_tags(App *a)
