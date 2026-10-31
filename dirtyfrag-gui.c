@@ -3693,7 +3693,7 @@ int ovswrap_main(int argc, char **argv)
 
 #define APP_TITLE       "DirtyChains · 页缓存提权"
 /* 构建标识: 标题栏副标题上直接显示, 用来确认跑的是不是最新这份 */
-#define DF_BUILD        "2026-10-31-r13"
+#define DF_BUILD        "2026-10-31-r14"
 #define APP_SUBTITLE    "六链 PoC 图形前端 · " DF_BUILD
 #define LOG_MAX_LINES   20000
 #define PTY_COLS        110
@@ -5026,10 +5026,10 @@ static void install_css(void)
         "  color: #ffffff;\n"
         "}\n"
 
-        /* 左侧任务抽屉 */
+        /* 左侧任务抽屉: 不画自身底色, 直接透出壁纸 */
         "#mainwin #sidebar {\n"
-        "  background-color: #ffffff;\n"
-        "  border-right: 1px solid #dbe7f2;\n"
+        "  background-color: transparent;\n"
+        "  border-right: 1px solid rgba(150,180,210,0.45);\n"
         "}\n"
         "#mainwin #sidescroll, #mainwin #sidescroll viewport { background-color: transparent; }\n"
         "#mainwin #tasklist { background-color: transparent; }\n"
