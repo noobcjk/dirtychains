@@ -106,8 +106,18 @@ make CC=aarch64-linux-gnu-gcc CFLAGS="-O2 -Wall -static -no-pie -D_FILE_OFFSET_B
 ./dirtychains            # 或安装后直接 dirtychains
 ```
 
-下拉框选链 → 填目标用户名 → 运行。前端用 pty 启动引擎，所以引擎里的 `isatty()` 判断、
-彩色输出、成功后的交互式 root shell 都正常。
+左上角「展开」拉开类别面板 → 选一类漏洞；多链类别（原地写类、OOB/越界写类）会在配置区上方
+多出一条「漏洞选择」，在里面挑具体 CVE → 点「检查配置」或「自测」。
+未选 CVE 时右上角显示「暂未选择CVE」，检查 / 自测 / 一键提权都会拦下，不会默认跑全链。
+
+参数区按所选 CVE 动态显隐：RxRPC 只留 `-t`，OVS 只留内核版本，其余链显示 `-t` / `-to` / `-set` / `-offset`。
+选中 CVE-2026-64531 时，内核版本右边还会出现「选择 offset」和「解析 vmlinux」两个按钮。
+
+前端用 pty 启动引擎，所以引擎里的 `isatty()` 判断、彩色输出、成功后的交互式 root shell 都正常。
+
+| 主界面 | CVE-2026-64531 | 选择 offset |
+|---|---|---|
+| <img src="docs/screenshots/main.png" width="330"> | <img src="docs/screenshots/cve-64531.png" width="330"> | <img src="docs/screenshots/picker.png" width="240"> |
 
 ### OVS 引擎（CVE-2026-64531）
 
@@ -208,6 +218,7 @@ python3 tools/mk_offset.py rec.json --root offset    # 直接写成 offset/<N>�
 │   └── kmod/krec_dump.c     没 BTF 时用内核模块直接读偏移
 ├── .github/workflows/
 │   └── release.yml          四架构交叉编译 + 发布到 Releases
+├── docs/screenshots/        界面截图（README 引用）
 └── Makefile
 ```
 
