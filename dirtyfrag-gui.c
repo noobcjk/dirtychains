@@ -3693,7 +3693,7 @@ int ovswrap_main(int argc, char **argv)
 
 #define APP_TITLE       "DirtyChains · 页缓存提权"
 /* 构建标识: 标题栏副标题上直接显示, 用来确认跑的是不是最新这份 */
-#define DF_BUILD        "2026-10-31-r11"
+#define DF_BUILD        "2026-10-31-r12"
 #define APP_SUBTITLE    "六链 PoC 图形前端 · " DF_BUILD
 #define LOG_MAX_LINES   20000
 #define PTY_COLS        110
@@ -3754,8 +3754,9 @@ typedef struct {
     GtkWidget *btn_expand;   /* 左上角「展开」开关 */
     GtkWidget *img_expand;
     GtkWidget *lbl_expand;
-    GtkWidget *revealer;     /* 展开后的扩展面板 */
-    GtkWidget *uaf_slot;     /* 扩展面板里的插槽: 接入新链的控件放这里 */
+    GtkWidget *revealer;     /* 展开后的左侧任务抽屉 */
+    GtkWidget *task_list;    /* 抽屉里的任务列表 (GtkListBox) */
+    gboolean    side_sync;   /* 列表 <-> 下拉框同步中, 防止互相触发 */
     GtkWidget *banner, *banner_lbl;
     GtkWidget *combo;
     GtkWidget *lbl_name, *lbl_desc, *lbl_need;
@@ -4557,12 +4558,16 @@ static void update_desc(App *a)
     gtk_label_set_text(GTK_LABEL(a->lbl_need), c->need);
 }
 
+static void side_select(App *a, int idx);
+
 static void on_combo_changed(GtkComboBox *box, gpointer data)
 {
     App *a = data;
 
     (void)box;
     update_desc(a);
+    /* 下拉框改了, 抽屉列表跟着选中 (side_sync 防止回环) */
+    side_select(a, gtk_combo_box_get_active(GTK_COMBO_BOX(a->combo)));
 }
 
 /* 简易提示对话框 */
@@ -4811,35 +4816,6 @@ static void act_write(GtkWidget *w, gpointer data)
     app_spawn(a, args, "通用写");
 }
 
-/* 按 CVE id 找链在下拉框里的下标 (0 = 全部链, 所以 +1) */
-static int chain_combo_index(const char *id)
-{
-    int i;
-
-    for (i = 0; i < N_CHAINS; i++)
-        if (!strcmp(chains[i].id, id))
-            return i + 1;
-
-    return -1;
-}
-
-static void on_pick_uaf(GtkWidget *w, gpointer data)
-{
-    App *a = data;
-    int idx = chain_combo_index("-2026-43494");
-
-    (void)w;
-    if (idx > 0)
-        gtk_combo_box_set_active(GTK_COMBO_BOX(a->combo), idx);
-}
-
-static void on_test_uaf(GtkWidget *w, gpointer data)
-{
-    App *a = data;
-
-    on_pick_uaf(w, data);
-    act_test(w, a);
-}
 
 static void on_collapse_clicked(GtkWidget *w, gpointer data)
 {
@@ -5053,6 +5029,51 @@ static void install_css(void)
         "  color: #ffffff;\n"
         "}\n"
 
+        /* 左侧任务抽屉 */
+        "#mainwin #sidebar {\n"
+        "  background-color: #ffffff;\n"
+        "  border-right: 1px solid #dbe7f2;\n"
+        "}\n"
+        "#mainwin #sidehead { color: #1e2c3a; font-size: 14pt; }\n"
+        "#mainwin #sidehead-arrow { color: #5a7691; }\n"
+        "#mainwin #sideicon {\n"
+        "  background-image: none;\n"
+        "  background-color: #eef1f5;\n"
+        "  border: none;\n"
+        "  box-shadow: none;\n"
+        "  border-radius: 100px;\n"
+        "  padding: 0;\n"
+        "  min-width: 30px;\n"
+        "  min-height: 30px;\n"
+        "}\n"
+        "#mainwin #sideicon:hover { background-color: #e2e8ef; }\n"
+        "#mainwin #newtask {\n"
+        "  background-image: none;\n"
+        "  background-color: #ffffff;\n"
+        "  border: 1px solid #dbe3ec;\n"
+        "  border-radius: 20px;\n"
+        "  box-shadow: 0 1px 2px rgba(35,70,110,0.06);\n"
+        "  padding: 8px 14px;\n"
+        "}\n"
+        "#mainwin #newtask:hover { background-color: #f7fbff; border-color: #b9d4ec; }\n"
+        "#mainwin #newtask:active { background-color: #eaf4fd; }\n"
+        "#mainwin #newtask-label { color: #1f2b38; font-size: 11pt; }\n"
+        "#mainwin #sidegroup { color: #8a97a5; font-size: 10pt; }\n"
+        "#mainwin #sidegroup-arrow { color: #a8b4c1; }\n"
+        "#mainwin #sidescroll, #mainwin #sidescroll viewport { background-color: transparent; }\n"
+        "#mainwin #tasklist { background-color: transparent; }\n"
+        "#mainwin #tasklist row {\n"
+        "  background-color: transparent;\n"
+        "  border-radius: 10px;\n"
+        "  padding: 7px 10px;\n"
+        "  margin: 1px 0;\n"
+        "  min-height: 26px;\n"
+        "}\n"
+        "#mainwin #tasklist row:hover { background-color: #f4f8fc; }\n"
+        "#mainwin #tasklist row:selected { background-color: #eaf1f8; }\n"
+        "#mainwin #tasklist row label { color: #2b3a49; font-size: 11pt; }\n"
+        "#mainwin #tasklist row:selected label { color: #12314c; font-weight: bold; }\n"
+
         /* 状态与提示 */
         "#mainwin #status-ok   { color: #1c7a44; font-weight: bold; }\n"
         "#mainwin #status-warn { color: #9a6a00; font-weight: bold; }\n"
@@ -5228,64 +5249,175 @@ static GtkWidget *build_actions(App *a)
 }
 
 /*
- * 左上角「展开」按钮拉开的那块面板。
+ * 左上角「展开」拉开的任务抽屉。
  *
- * UAF 接入点: a->uaf_slot 是一个空的水平 GtkBox, 后续要加的目标文件 /
- * 偏移 / 次数之类控件直接 pack 进去即可, 无需改动布局代码。
+ * 版式走手机端会话列表那一套: 页头 → 新建任务 → 分组标题 → 条目列表。
+ * 列表与顶部下拉框双向联动: 点条目等于选链, 选链也会反选条目。
  */
-static GtkWidget *build_uaf_panel(App *a)
+#define SIDEBAR_W 268
+
+static void side_select(App *a, int idx)
 {
-    GtkWidget *frame = gtk_frame_new(NULL);
-    GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
-    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    GtkWidget *lbl, *btn;
+    GtkListBoxRow *row;
 
-    gtk_style_context_add_class(gtk_widget_get_style_context(frame), "card");
+    if (!a->task_list)
+        return;
+    row = gtk_list_box_get_row_at_index(GTK_LIST_BOX(a->task_list), idx);
+    if (!row)
+        return;
+    a->side_sync = TRUE;
+    gtk_list_box_select_row(GTK_LIST_BOX(a->task_list), row);
+    a->side_sync = FALSE;
+}
 
-    lbl = gtk_label_new(NULL);
-    gtk_label_set_markup(GTK_LABEL(lbl), "<b>UAF 扩展区</b>");
-    gtk_widget_set_halign(lbl, GTK_ALIGN_START);
-    gtk_box_pack_start(GTK_BOX(row), lbl, FALSE, FALSE, 0);
+static void on_task_row_selected(GtkListBox *lb, GtkListBoxRow *row, gpointer data)
+{
+    App *a = data;
+    int idx;
 
-    btn = gtk_button_new_with_label("选中 43494");
-    gtk_widget_set_tooltip_text(btn, "把下拉框切到 CVE-2026-43494 (io_uring + RDS)");
-    g_signal_connect(btn, "clicked", G_CALLBACK(on_pick_uaf), a);
-    gtk_box_pack_start(GTK_BOX(row), btn, FALSE, FALSE, 0);
+    (void)lb;
+    if (a->side_sync || !row)
+        return;
+    idx = gtk_list_box_row_get_index(row);
+    if (idx < 0 || idx > N_CHAINS)
+        return;
+    if (gtk_combo_box_get_active(GTK_COMBO_BOX(a->combo)) != idx)
+        gtk_combo_box_set_active(GTK_COMBO_BOX(a->combo), idx);
+}
 
-    btn = gtk_button_new_with_label("自测该链");
-    gtk_widget_set_tooltip_text(btn, "选中 43494 并立即跑自测");
-    g_signal_connect(btn, "clicked", G_CALLBACK(on_test_uaf), a);
-    gtk_box_pack_start(GTK_BOX(row), btn, FALSE, FALSE, 0);
+/* 「新建任务」: 清日志 + 回到全部链, 相当于开一轮新会话 */
+static void on_new_task(GtkWidget *w, gpointer data)
+{
+    App *a = data;
 
-    /* 右侧留白 + 收起按钮 */
-    btn = gtk_button_new_with_label("收起");
+    (void)w;
+    gtk_combo_box_set_active(GTK_COMBO_BOX(a->combo), 0);
+    gtk_text_buffer_set_text(a->logbuf, "", -1);
+    gtk_label_set_text(GTK_LABEL(a->status_lbl), "已新建任务：全部链");
+    gtk_widget_set_name(a->status_lbl, "status-run");
+    if (a->entry_input)
+        gtk_widget_grab_focus(a->entry_input);
+}
+
+/* 圆形图标按钮 (页头右边那种) */
+static GtkWidget *side_icon_button(const char *icon, const char *tip)
+{
+    GtkWidget *btn = gtk_button_new();
+    GtkWidget *img = gtk_image_new_from_icon_name(icon, GTK_ICON_SIZE_MENU);
+
+    gtk_widget_set_name(btn, "sideicon");
+    gtk_button_set_relief(GTK_BUTTON(btn), GTK_RELIEF_NONE);
+    gtk_widget_set_valign(btn, GTK_ALIGN_CENTER);
+    gtk_widget_set_tooltip_text(btn, tip);
+    gtk_container_add(GTK_CONTAINER(btn), img);
+    return btn;
+}
+
+static GtkWidget *build_task_sidebar(App *a)
+{
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    GtkWidget *head = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    GtkWidget *group = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    GtkWidget *btn, *lbl, *img, *scroller, *list;
+    int i;
+
+    gtk_widget_set_name(box, "sidebar");
+    gtk_widget_set_size_request(box, SIDEBAR_W, -1);
+
+    /* ── 页头: 云图标 + 本机 ▾ + 收起 ── */
+    img = gtk_image_new_from_icon_name("computer-symbolic", GTK_ICON_SIZE_MENU);
+    gtk_box_pack_start(GTK_BOX(head), img, FALSE, FALSE, 0);
+
+    lbl = gtk_label_new("本机");
+    gtk_widget_set_name(lbl, "sidehead");
+    gtk_box_pack_start(GTK_BOX(head), lbl, FALSE, FALSE, 0);
+
+    img = gtk_image_new_from_icon_name("pan-down-symbolic", GTK_ICON_SIZE_MENU);
+    gtk_widget_set_name(img, "sidehead-arrow");
+    gtk_box_pack_start(GTK_BOX(head), img, FALSE, FALSE, 0);
+
+    btn = side_icon_button("pan-start-symbolic", "收起任务面板");
     g_signal_connect(btn, "clicked", G_CALLBACK(on_collapse_clicked), a);
-    gtk_box_pack_end(GTK_BOX(row), btn, FALSE, FALSE, 0);
+    gtk_box_pack_end(GTK_BOX(head), btn, FALSE, FALSE, 0);
 
-    gtk_box_pack_start(GTK_BOX(outer), row, FALSE, FALSE, 0);
+    gtk_widget_set_margin_start(head, 16);
+    gtk_widget_set_margin_end(head, 12);
+    gtk_widget_set_margin_top(head, 12);
+    gtk_box_pack_start(GTK_BOX(box), head, FALSE, FALSE, 0);
 
-    lbl = gtk_label_new("CVE-2026-43494  io_uring + RDS 页引用计数劫持，"
-                        "整页覆盖 setuid 文件的页缓存；依赖 "
-                        "IORING_REGISTER_CLONE_BUFFERS（内核 6.12+）。");
-    gtk_widget_set_name(lbl, "hint");
-    gtk_label_set_xalign(GTK_LABEL(lbl), 0.0f);
-    gtk_label_set_line_wrap(GTK_LABEL(lbl), TRUE);
-    gtk_box_pack_start(GTK_BOX(outer), lbl, FALSE, FALSE, 0);
+    /* ── 新建任务 ── */
+    btn = gtk_button_new();
+    {
+        GtkWidget *h = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+        GtkWidget *ic = gtk_image_new_from_icon_name("list-add-symbolic",
+                                                     GTK_ICON_SIZE_MENU);
 
-    /* ==== UAF 扩展插槽: 新控件 pack 到这里 ==== */
-    a->uaf_slot = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    lbl = gtk_label_new("插槽: UAF 专用控件加在这里");
-    gtk_widget_set_name(lbl, "hint");
-    gtk_box_pack_start(GTK_BOX(a->uaf_slot), lbl, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(outer), a->uaf_slot, FALSE, FALSE, 0);
+        gtk_widget_set_halign(h, GTK_ALIGN_CENTER);
+        gtk_box_pack_start(GTK_BOX(h), ic, FALSE, FALSE, 0);
+        lbl = gtk_label_new("新建任务");
+        gtk_widget_set_name(lbl, "newtask-label");
+        gtk_box_pack_start(GTK_BOX(h), lbl, FALSE, FALSE, 0);
+        gtk_container_add(GTK_CONTAINER(btn), h);
+    }
+    gtk_widget_set_name(btn, "newtask");
+    gtk_button_set_relief(GTK_BUTTON(btn), GTK_RELIEF_NONE);
+    gtk_widget_set_tooltip_text(btn, "清空日志并回到「全部链」");
+    g_signal_connect(btn, "clicked", G_CALLBACK(on_new_task), a);
+    gtk_widget_set_margin_start(btn, 12);
+    gtk_widget_set_margin_end(btn, 12);
+    gtk_box_pack_start(GTK_BOX(box), btn, FALSE, FALSE, 0);
 
-    gtk_widget_set_margin_start(outer, 10);
-    gtk_widget_set_margin_end(outer, 10);
-    gtk_widget_set_margin_top(outer, 8);
-    gtk_widget_set_margin_bottom(outer, 8);
-    gtk_container_add(GTK_CONTAINER(frame), outer);
+    /* ── 分组标题: 任务 ▾ ... 列表图标 ── */
+    lbl = gtk_label_new("任务");
+    gtk_widget_set_name(lbl, "sidegroup");
+    gtk_box_pack_start(GTK_BOX(group), lbl, FALSE, FALSE, 0);
 
-    return frame;
+    img = gtk_image_new_from_icon_name("pan-down-symbolic", GTK_ICON_SIZE_MENU);
+    gtk_widget_set_name(img, "sidegroup-arrow");
+    gtk_box_pack_start(GTK_BOX(group), img, FALSE, FALSE, 0);
+
+    img = gtk_image_new_from_icon_name("view-list-symbolic", GTK_ICON_SIZE_MENU);
+    gtk_widget_set_name(img, "sidegroup-arrow");
+    gtk_box_pack_end(GTK_BOX(group), img, FALSE, FALSE, 0);
+
+    gtk_widget_set_margin_start(group, 16);
+    gtk_widget_set_margin_end(group, 14);
+    gtk_widget_set_margin_top(group, 4);
+    gtk_box_pack_start(GTK_BOX(box), group, FALSE, FALSE, 0);
+
+    /* ── 条目列表 ── */
+    scroller = gtk_scrolled_window_new(NULL, NULL);
+    gtk_widget_set_name(scroller, "sidescroll");
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroller),
+                                   GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_vexpand(scroller, TRUE);
+
+    list = gtk_list_box_new();
+    gtk_widget_set_name(list, "tasklist");
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(list), GTK_SELECTION_SINGLE);
+    gtk_list_box_set_activate_on_single_click(GTK_LIST_BOX(list), TRUE);
+
+    for (i = 0; i <= N_CHAINS; i++) {
+        GtkWidget *row = gtk_list_box_row_new();
+        GtkWidget *l = gtk_label_new(i == 0 ? "全部链 · 检查 / 自测"
+                                            : chains[i - 1].tag);
+
+        gtk_label_set_xalign(GTK_LABEL(l), 0.0f);
+        gtk_widget_set_halign(l, GTK_ALIGN_START);
+        gtk_widget_set_valign(l, GTK_ALIGN_CENTER);
+        gtk_container_add(GTK_CONTAINER(row), l);
+        gtk_container_add(GTK_CONTAINER(list), row);
+    }
+    a->task_list = list;
+    g_signal_connect(list, "row-selected", G_CALLBACK(on_task_row_selected), a);
+
+    gtk_container_add(GTK_CONTAINER(scroller), list);
+    gtk_widget_set_margin_start(scroller, 8);
+    gtk_widget_set_margin_end(scroller, 8);
+    gtk_widget_set_margin_bottom(scroller, 10);
+    gtk_box_pack_start(GTK_BOX(box), scroller, TRUE, TRUE, 0);
+
+    return box;
 }
 
 static GtkWidget *build_log_pane(App *a)
@@ -5691,21 +5823,15 @@ static void build_window(App *a)
 
     gtk_box_pack_start(GTK_BOX(vbox), head, FALSE, FALSE, 0);
 
-    /* ── 扩展面板 (左上角「展开」控制) ── */
+    /* ── 任务抽屉 (左上角「展开」控制, 从左侧推挤出来) ── */
     a->revealer = gtk_revealer_new();
     gtk_revealer_set_transition_type(GTK_REVEALER(a->revealer),
-                                     GTK_REVEALER_TRANSITION_TYPE_SLIDE_DOWN);
-    gtk_revealer_set_transition_duration(GTK_REVEALER(a->revealer), 160);
+                                     GTK_REVEALER_TRANSITION_TYPE_SLIDE_RIGHT);
+    gtk_revealer_set_transition_duration(GTK_REVEALER(a->revealer), 180);
     gtk_revealer_set_reveal_child(GTK_REVEALER(a->revealer), FALSE);
-    {
-        GtkWidget *uaf = build_uaf_panel(a);
-
-        gtk_widget_set_margin_start(uaf, 12);
-        gtk_widget_set_margin_end(uaf, 12);
-        gtk_widget_set_margin_top(uaf, 8);
-        gtk_container_add(GTK_CONTAINER(a->revealer), uaf);
-    }
-    gtk_box_pack_start(GTK_BOX(vbox), a->revealer, FALSE, FALSE, 0);
+    gtk_widget_set_vexpand(a->revealer, TRUE);
+    gtk_widget_set_valign(a->revealer, GTK_ALIGN_FILL);
+    gtk_container_add(GTK_CONTAINER(a->revealer), build_task_sidebar(a));
 
     gtk_box_pack_start(GTK_BOX(vbox), frame_params, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(vbox), frame_actions, FALSE, FALSE, 0);
@@ -5716,7 +5842,21 @@ static void build_window(App *a)
     gtk_widget_set_vexpand(vbox, TRUE);
     gtk_widget_set_halign(vbox, GTK_ALIGN_FILL);
     gtk_widget_set_valign(vbox, GTK_ALIGN_FILL);
-    gtk_overlay_add_overlay(GTK_OVERLAY(overlay), vbox);
+
+    /* 抽屉在主内容左边, 展开时把正文推开而不是盖住 */
+    {
+        GtkWidget *shell = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+
+        gtk_box_pack_start(GTK_BOX(shell), a->revealer, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(shell), vbox, TRUE, TRUE, 0);
+        gtk_widget_set_halign(shell, GTK_ALIGN_FILL);
+        gtk_widget_set_valign(shell, GTK_ALIGN_FILL);
+        gtk_overlay_add_overlay(GTK_OVERLAY(overlay), shell);
+    }
+
+    /* 列表初始选中项跟随下拉框 */
+    side_select(a, gtk_combo_box_get_active(GTK_COMBO_BOX(a->combo)));
+
     /* ── 信号 ── */
     g_signal_connect(a->combo, "changed", G_CALLBACK(on_combo_changed), a);
     g_signal_connect(a->btn_check, "clicked", G_CALLBACK(act_check), a);
