@@ -54,7 +54,7 @@ jobs:
             gui: false
     steps:
       - name: 取源码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 计算版本号
         id: ver
@@ -147,7 +147,7 @@ jobs:
           ls -lh pkg/*.tar.gz
 
       - name: 上传产物
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dirtyfrag-${{ matrix.arch }}
           path: pkg/*.tar.gz
@@ -168,7 +168,7 @@ jobs:
       contents: write
     steps:
       - name: 取回全部产物
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -193,7 +193,7 @@ jobs:
           echo "发布到 $t"
 
       - name: 发布 Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           target_commitish: ${{ github.sha }}
