@@ -99,14 +99,26 @@ jobs:
           make CC="$CC" CFLAGS="$CFLAGS" ovswrap
           file poc ovswrap
 
-      - name: 编译 GTK3 前端
+      # runner 自身是 22.04（glibc 2.35），在这里编出的 GUI 会在 Debian 11 /
+      # Ubuntu 20.04 / UOS 上报 "version `GLIBC_2.34' not found"，因为
+      # __libc_start_main 等符号被标成了 2.34。放进 20.04 容器里编，
+      # 产物只要 glibc 2.31，覆盖老发行版；GTK3 的 ABI 在 3.24.x 内稳定，
+      # 用老环境编的在 22.04/24.04 上照常运行（向前兼容）。
+      - name: 编译 GTK3 前端（20.04 基线，glibc >= 2.31）
         if: matrix.gui
         run: |
           set -euo pipefail
-          sudo apt-get install -y --no-install-recommends \
-            build-essential libgtk-3-dev pkg-config
-          make dirtychains
+          docker run --rm -v "$PWD:/src" -w /src ubuntu:20.04 bash -c '
+            set -e
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq
+            apt-get install -y --no-install-recommends \
+              build-essential libgtk-3-dev pkg-config
+            make dirtychains
+          '
           file dirtychains
+          echo "最高所需 glibc：$(objdump -T dirtychains | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"
+          echo "编译环境 glibc：$(docker run --rm ubuntu:20.04 ldd --version | head -1)"
 
       - name: 打包
         env:
@@ -135,7 +147,7 @@ jobs:
             echo "构建时间 : $(date -u +%FT%TZ)"
             echo "链接方式 : poc / ovswrap 静态链接（不依赖目标机 glibc）"
             if [ -f "$D/dirtychains" ]; then
-              echo "           dirtychains 动态链接 GTK3"
+              echo "           dirtychains 动态链接 GTK3（glibc >= 2.31，GTK3 >= 3.24）"
             fi
             echo
             echo "顶层内容 :"
@@ -210,8 +222,12 @@ jobs:
             | `dirtychains-*-armhf.tar.gz` | ARMv7 硬浮点 | `poc` + `ovswrap` |
 
             `poc` 与 `ovswrap` 是 `-static -no-pie` 静态链接，拷到目标机直接跑，
-            不挑 glibc 版本；`dirtychains` 需要 GTK3（Ubuntu 22.04 上
-            `apt install libgtk-3-dev` 即可自行编译）。
+            完全不挑 glibc 版本。
+
+            `dirtychains`（GUI）动态链 GTK3，在 `ubuntu:20.04` 容器里编译，
+            最低要求 **glibc 2.31 + GTK 3.24**：Ubuntu 20.04 及以上、Debian 11 及以上、
+            UOS 20 都能直接跑；22.04/24.04 上同样正常（向前兼容）。
+            比这更老的系统请用 `poc`（同功能，纯命令行，静态链接）。
 
             每个包内都有 `offset/`（740 个内核 release 的偏移表），程序运行时按
             `<exe目录>/offset` → `./offset` → `/usr/share/dirtychains/offset` 的顺序查找。
