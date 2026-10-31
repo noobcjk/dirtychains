@@ -24,24 +24,26 @@ offset/
 
 | 来源 | 数量 | 说明 |
 |---|---|---|
-| 内嵌表导出 | 739 | 原 `dirtyfrag-gui.c` 里 808 条记录去重后的结果（同 release 不同 build 只留最后一条） |
+| 记录集重建 | 739 | 由 `krec-808.json` 的 808 条去重生成（同 release 不同 build 只留最后一条） |
 | 本机实测 | 1 | `5系/5.8.0-59-generic`，内核模块 `tools/kmod` 在真机上读出 |
 
 分布：5系 164（5.14 有 30、5.15 有 133、5.8 有 1）、6系 489、7系 87。
 覆盖 6.1 / 6.6 / 6.8 / 6.11 / 6.12 / 6.13 / 6.14 / 6.15 / 6.16 / 6.17 / 6.18 / 6.19 /
 7.0 / 7.1 各发行版构建。**5.4 没有、5.8 只有这一条**，其余老内核走动态推导或 `-krec` 借用。
 
-完整的 808 条原始记录（含被覆盖的 69 条重复）在源码根目录的 `krec-808.json`。
+完整的 808 条原始记录（含被覆盖的 69 条重复）在源码根目录的 `krec-808.json`，
+`make offset-sync` 可以据此整批重建本目录。**程序只认这里的表，没有内嵌兜底。**
 
 ## 查找顺序
 
 ```
 -offset <dir>  →  $OVSWRAP_OFFSET_DIR  →  <可执行文件目录>/offset
                →  ./offset  →  /usr/share/dirtyfrag/offset
-               →  内嵌 808 条表  →  BTF / pahole / System.map 推导
+               →  BTF / pahole / System.map 推导
 ```
 
-目录里没有本机 release 时逐级回退，所以删掉某个目录不会让程序失效，只是退回内嵌表。
+目录里没有本机 release 时逐级回退，最后退回动态推导（需要 BTF 或 System.map）。
+所以拷走单个二进制时，记得把 `offset/` 一起带上。
 
 ## target.h 里有什么
 
@@ -105,12 +107,11 @@ python3 tools/mk_offset.py rec.json        # 直接写进 offset/
 ## 重新生成
 
 ```bash
-make krec-export      # krec-808.json + 整表重写到 offset/
-make offset-sync      # 只重写 offset/ 目录树
+make offset-sync               # 用 krec-808.json 整批重建 offset/
 make offset-add REC=rec.json   # 单条记录 -> offset/
 ```
 
-`make krec-export` 是幂等的：内容没变的表不会被重写（显示「未变 740」）。
+`make offset-sync` 只在内容不同时才写盘（显示「未变 740」），加 `--force` 才强制覆盖。
 
 ## 校验
 

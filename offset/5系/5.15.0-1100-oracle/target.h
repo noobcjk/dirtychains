@@ -7,7 +7,7 @@
  * 程序启动时按目录名找本机 release，不需要重新编译。
  * 本文件同时也是合法 C 头文件，可以直接 #include 静态编译。
  *
- * 生成: tools/mk_offset.py（内嵌表）
+ * 生成: tools/mk_offset.py（记录集）
  */
 #ifndef DIRTYFRAG_TARGET_H
 #define DIRTYFRAG_TARGET_H

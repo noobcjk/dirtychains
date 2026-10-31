@@ -7,7 +7,7 @@
 两种输入：
 
     python3 tools/mk_offset.py rec.json              # 一条（ovswrap -dump-krec 的输出）
-    python3 tools/mk_offset.py --from-c dirtyfrag-gui.c    # 内嵌表里的 808 条全导出来
+    python3 tools/mk_offset.py --from-json krec-808.json   # 记录集，整批重建 offset/
 
 target.h 是一组 #define，ovswrap 启动时按 `uname -r` 找到对应目录直接读，
 不再需要重新编译。它同时是合法 C 头文件，可以 #include 静态编译。
@@ -161,20 +161,17 @@ def write_one(root, rec, force, dry, stats, source="", quiet_conflict=False):
     path.write_text(text, encoding="utf-8")
 
 
-def load_from_c(path):
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    import gen_krec_table as g
-
-    src = Path(path).read_text(encoding="utf-8")
-    return g.unpack(g.decode_c_blob(src))
+def load_from_json(path):
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    return [data] if isinstance(data, dict) else data
 
 
 def main():
     ap = argparse.ArgumentParser(
         description="把内核偏移记录写成 offset/<N>系/<release>/target.h")
     ap.add_argument("rec", nargs="?", help="rec.json（ovswrap -dump-krec 输出）")
-    ap.add_argument("--from-c", metavar="OVSWRAP_C",
-                    help="从内嵌表批量导出（传 dirtyfrag-gui.c）")
+    ap.add_argument("--from-json", metavar="RECS_JSON",
+                    help="从记录集合批量导出（如 krec-808.json）")
     ap.add_argument("--root", default="offset", help="配置表根目录，默认 offset")
     ap.add_argument("--force", action="store_true", help="覆盖已存在且内容不同的表")
     ap.add_argument("--dry-run", action="store_true", help="只统计不写盘")
@@ -182,20 +179,20 @@ def main():
 
     stats = {"new": 0, "update": 0, "same": 0, "conflict": 0}
 
-    if args.from_c:
-        records = load_from_c(args.from_c)
+    if args.from_json:
+        records = load_from_json(args.from_json)
         # 同 release 有多个 build 时只留最后一条，避免每轮重复覆盖
         last = {}
         for rec in records:
             last[rec["release"]] = rec
-        print(f"内嵌表：{len(records)} 条，{len(last)} 个 release")
+        print(f"记录集：{len(records)} 条，{len(last)} 个 release")
         for rec in last.values():
-            write_one(args.root, rec, args.force, args.dry_run, stats, "内嵌表")
+            write_one(args.root, rec, args.force, args.dry_run, stats, "记录集")
     elif args.rec:
         rec = json.loads(Path(args.rec).read_text(encoding="utf-8"))
         write_one(args.root, rec, args.force, args.dry_run, stats, args.rec)
     else:
-        ap.error("需要 rec.json 或 --from-c dirtyfrag-gui.c")
+        ap.error("需要 rec.json 或 --from-json krec-808.json")
 
     print(f"新增 {stats['new']}，覆盖 {stats['update']}，"
           f"未变 {stats['same']}，冲突 {stats['conflict']}"

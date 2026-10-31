@@ -15,7 +15,7 @@ Linux 页缓存写原语 / 本地提权 PoC 合集，带一个 GTK3 图形前端
 
 | 文件 | 说明 |
 |---|---|
-| `dirtyfrag-gui.c` | **单文件主程序**：GTK3 前端 + 内置 OVS 引擎 + 808 条内嵌偏移表（原 `ovswrap.c` 已并入） |
+| `dirtyfrag-gui.c` | **单文件主程序**：GTK3 前端 + 内置 OVS 引擎（原 `ovswrap.c` 已并入） |
 | `dirtyfrag_lpe.c` | 五链引擎实现，也可单独编成命令行 `poc` |
 
 仓库只保留主干这两份源码。43284 的早期单版本 PoC（`dirtyfrag.c`）、43500 的原语验证与探测
@@ -46,8 +46,8 @@ make ovswrap         # 独立的 OVS 命令行版（不含 GTK）
 sudo make install    # 装到 /usr/local/bin，背景图与 offset/ 进 share/dirtyfrag
 ```
 
-`dirtyfrag-gui.c` 是**自包含单文件**：GTK 前端、OVS 引擎、808 条内嵌偏移表都在里面，
-只编一个 `.c` 就能出完整程序：
+`dirtyfrag-gui.c` 是**自包含单文件**：GTK 前端和 OVS 引擎都在里面，
+只编一个 `.c` 就能出完整程序（偏移表在 `offset/`，运行时读取，不编进二进制）：
 
 ```bash
 gcc -O2 -Wall -o dirtyfrag-gui dirtyfrag-gui.c $(pkg-config --cflags --libs gtk+-3.0) -lutil
@@ -123,10 +123,12 @@ offset/
 3. `<exe 目录>/offset`
 4. `./offset`
 5. `/usr/share/dirtyfrag/offset`
-6. 内嵌表（`dirtyfrag-gui.c` 里的 808 条记录，去重后 739 个 release）
-7. 本机推导（BTF / pahole / System.map）
+6. 本机推导（BTF / pahole / System.map）
 
-**当前内容**：740 个 release —— 739 个由内嵌表导出（`make offset-sync`），
+前 5 个是同一份表的不同根目录，全部落空才走推导。**没有内嵌兜底**——拷走二进制时
+要么带上 `offset/`，要么确保目标机有 BTF 或 `System.map`。
+
+**当前内容**：740 个 release —— 739 个由 `krec-808.json` 重建（`make offset-sync`），
 外加 `5系/5.8.0-59-generic` 是在真机上用内核模块读出来的。详见 `offset/README.md`。
 
 ### 给新内核加一条
@@ -148,8 +150,7 @@ mkdir -p offset/6系/$(uname -r) && cp /tmp/target.h offset/6系/$(uname -r)/
 make kmod && sudo insmod tools/kmod/krec_dump.ko
 cat /proc/krec_dump > rec.json
 sudo rmmod krec_dump
-python3 tools/add_krec.py rec.json dirtyfrag-gui.c      # 并进内嵌表
-python3 tools/mk_offset.py rec.json --root offset # 或只写进 offset/
+python3 tools/mk_offset.py rec.json --root offset    # 直接写成 offset/<N>系/<release>/target.h
 ```
 
 **C. 手写**
@@ -164,13 +165,11 @@ python3 tools/mk_offset.py rec.json --root offset # 或只写进 offset/
 
 ```
 .
-├── dirtyfrag-gui.c          单文件主程序：GTK3 前端 + OVS 引擎 + 内嵌偏移表
+├── dirtyfrag-gui.c          单文件主程序：GTK3 前端 + OVS 引擎
 ├── dirtyfrag_lpe.c          五链引擎（亦可单独编 poc）
 ├── offset/                  内核偏移配置表（740 个 release）
-├── krec-808.json            内嵌表完整导出（808 条）
+├── krec-808.json            历史内嵌表的完整导出（808 条，可选，用于重建 offset/）
 ├── tools/
-│   ├── gen_krec_table.py    内嵌表的解码 / 打包 / 导出
-│   ├── add_krec.py          把一条记录并进 dirtyfrag-gui.c 的表
 │   ├── mk_offset.py         把记录写成 offset/<N>系/<release>/target.h
 │   └── kmod/krec_dump.c     没 BTF 时用内核模块直接读偏移
 └── Makefile

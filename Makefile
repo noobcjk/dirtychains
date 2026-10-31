@@ -3,13 +3,10 @@
 #   make                编译 dirtyfrag-gui（前端 + 五链引擎 + OVS 引擎）
 #   make poc            另外编一个独立的命令行引擎
 #   make ovswrap        用同一个源编出不含 GTK 的 OVS 命令行版
-#   make krec           从原版 ovswrap-poc.py 重新生成预置内核表
-#   make krec-add REC=rec.json   把一条记录并进表
 #   make offset-add REC=rec.json 把一条记录写成 offset/<N>系/<release>/target.h
-#   make offset-sync     把内嵌表整表导出成 offset/ 目录树
-#   make krec-export     导出内嵌表：krec-808.json + 整表写进 offset/
+#   make offset-sync     从 krec-808.json 整批重建 offset/ 目录树
 #   make kmod            编译 tools/kmod 的偏移提取模块
-#   sudo make install   装到 /usr/local/bin，背景图进 share/dirtyfrag
+#   sudo make install   装到 /usr/local/bin，背景图与 offset/ 进 share/dirtyfrag
 #   make clean
 
 CC     ?= gcc
@@ -25,12 +22,10 @@ APPDIR  ?= $(PREFIX)/share/applications
 DATADIR ?= $(PREFIX)/share/dirtyfrag
 
 TARGET     := dirtyfrag-gui
-# 单文件：GTK 前端 + ovswrap 引擎 + 内嵌内核偏移表都在这里
+# 单文件：GTK 前端 + ovswrap 引擎都在这里（偏移表在 offset/，运行时读）
 SRC        := dirtyfrag-gui.c
 ENGINE_SRC := dirtyfrag_lpe.c
 ENGINE     := poc
-KREC_SRC   := $(SRC)
-KREC_PY    ?= ovswrap-poc.py
 REC        ?= rec.json
 BGIMG      := bg.png
 
@@ -70,23 +65,13 @@ krec:
 kmod:
 	$(MAKE) -C tools/kmod
 
-# 把一条记录并进表（rec.json 由 `ovswrap -dump-krec` 生成）
-krec-add:
-	python3 tools/add_krec.py $(REC) $(KREC_SRC)
-
-# 外部配置表：一条记录写成一个目录
+# 外部配置表：一条记录写成一个目录（rec.json 由 `ovswrap -dump-krec` 生成）
 offset-add:
 	python3 tools/mk_offset.py $(REC) --root offset
 
-# 外部配置表：内嵌表整表导出（739 个 release 目录）
+# 外部配置表：从记录集整批重建（krec-808.json 是历史内嵌表的完整导出）
 offset-sync:
-	python3 tools/mk_offset.py --from-c $(KREC_SRC) --root offset
-
-# 提取内嵌表：JSON 全集 + 目录树，直接落到 offset/
-krec-export:
-	python3 tools/gen_krec_table.py --dump $(KREC_SRC) > krec-808.json
-	python3 tools/mk_offset.py --from-c $(KREC_SRC) --root offset
-	@python3 -c 'import json;print("records:", len(json.load(open("krec-808.json"))))'
+	python3 tools/mk_offset.py --from-json krec-808.json --root offset
 
 install: $(TARGET)
 	install -d $(DESTDIR)$(BINDIR) $(DESTDIR)$(APPDIR)
@@ -119,4 +104,4 @@ uninstall:
 clean:
 	rm -f $(TARGET) $(GUI_OBJ) $(ENG_OBJ) $(ENGINE) ovswrap
 
-.PHONY: all install uninstall clean poc ovswrap krec krec-add offset-add offset-sync krec-export kmod
+.PHONY: all install uninstall clean poc ovswrap offset-add offset-sync kmod
