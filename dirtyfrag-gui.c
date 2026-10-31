@@ -3821,7 +3821,7 @@ int ovswrap_main(int argc, char **argv)
 
 #define APP_TITLE       "DirtyChains · 页缓存提权"
 /* 构建标识: 标题栏副标题上直接显示, 用来确认跑的是不是最新这份 */
-#define DF_BUILD        "2026-10-31-r31"
+#define DF_BUILD        "2026-10-31-r32"
 #define APP_SUBTITLE    "六链 PoC 图形前端 · " DF_BUILD
 #define LOG_MAX_LINES   20000
 #define PTY_COLS        110
@@ -4313,6 +4313,23 @@ static void log_flush(App *a)
     log_trim(a);
 }
 
+/* 每个动作开始前清空日志：丢掉上一次的内容，并重置 ANSI 解析状态，
+ * 避免上一条命令残留的半截转义序列影响新输出。 */
+static void log_reset(App *a)
+{
+    if (!a->logbuf)
+        return;
+    if (a->run)
+        g_string_truncate(a->run, 0);
+    if (a->csi)
+        g_string_truncate(a->csi, 0);
+    a->ansi_state = 0;
+    a->cur_fg = -1;
+    a->cur_bold = 0;
+    a->cur_dim = 0;
+    gtk_text_buffer_set_text(a->logbuf, "", -1);
+}
+
 /*
  * 单独的回车 (后面不是 \n): 把当前这一行清掉, 让进度条原地刷新。
  * 不这样处理的话, 每次刷新都会接在同一行尾巴上, 折行后看起来像一堆
@@ -4599,6 +4616,7 @@ static gboolean app_spawn(App *a, char **args, const char *what)
         return FALSE;
     }
     a->action = what;
+    log_reset(a);
     if (!a->poc_path) {
         log_append_plain(a, "[!] 找不到引擎 (内置引擎异常, 可用 --poc <路径> 指定外部 poc)。\n");
         return FALSE;
@@ -5221,6 +5239,7 @@ static void act_vmlinux(GtkWidget *w, gpointer data)
         return;
     }
 
+    log_reset(a);
     ansi_feed(a, "\n\033[2m══ 解析 vmlinux：pahole/BTF 推导本机内核偏移 ══\n\033[0m\n",
               strlen("\n\033[2m══ 解析 vmlinux：pahole/BTF 推导本机内核偏移 ══\n\033[0m\n"));
     log_flush(a);
@@ -5975,6 +5994,7 @@ static void act_root_offset(GtkWidget *w, gpointer data)
         return;
     }
 
+    log_reset(a);
     ansi_feed(a, hdr, strlen(hdr));
     log_flush(a);
 
