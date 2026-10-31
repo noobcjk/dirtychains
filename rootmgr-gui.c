@@ -1,8 +1,8 @@
 /*
  * rootmgr-gui.c —— 常驻 root 管理器的图形界面
  *
- * 版式参照 KernelSU（Material 3）：浅灰底、大标题、白色圆角卡片、
- * 左侧线性图标 + 标题/副标题两行。底部是四格切换栏：
+ * 版式参照 KernelSU（Material 3）：浅灰底、大标题、白色圆角卡片。
+ * 窗口默认 960x600 横屏；卡片在宽屏下分左右两列，底部是四格切换栏：
  *   主页 / 超级用户 / 模块 / 设置
  *
  * 配合 tools/kmod/rootmgr.c 使用：
@@ -52,6 +52,9 @@ typedef enum {
 #define TAB_COUNT 4
 #define LOG_VIEWS 2
 
+/* 进程列表的三列 */
+enum { COL_PID, COL_USER, COL_CMD, COL_N };
+
 typedef struct {
     GtkWidget *win;
     GtkWidget *stack;
@@ -68,7 +71,8 @@ typedef struct {
     /* 超级用户 / 模块 / 设置页 */
     GtkWidget *ko_label;
     GtkWidget *lbl_mod;     /* 模块页的「已加载 / 未加载」 */
-    GtkWidget *list;        /* 进程列表 */
+    GtkWidget *tree;        /* 进程列表 */
+    GtkListStore *store;
     GtkWidget *btn_give;
     GtkWidget *logviews[LOG_VIEWS];
     int        nlog;
@@ -467,52 +471,16 @@ static gboolean is_shell_name(const char *name)
     return FALSE;
 }
 
-static void add_row(App *a, int pid, const char *user, const char *cmd)
-{
-    GtkWidget *row, *box, *l1, *l2, *l3;
-
-    row = gtk_list_box_row_new();
-    box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
-    gtk_widget_set_margin_start(box, 14);
-    gtk_widget_set_margin_end(box, 14);
-    gtk_widget_set_margin_top(box, 9);
-    gtk_widget_set_margin_bottom(box, 9);
-
-    l1 = gtk_label_new(NULL);
-    gtk_label_set_markup(GTK_LABEL(l1), g_strdup_printf("<b>%d</b>", pid));
-    gtk_widget_set_size_request(l1, 62, -1);
-    gtk_widget_set_halign(l1, GTK_ALIGN_START);
-
-    l2 = gtk_label_new(user);
-    gtk_widget_set_size_request(l2, 76, -1);
-    gtk_widget_set_halign(l2, GTK_ALIGN_START);
-
-    l3 = gtk_label_new(cmd);
-    gtk_widget_set_halign(l3, GTK_ALIGN_START);
-    gtk_label_set_ellipsize(GTK_LABEL(l3), PANGO_ELLIPSIZE_END);
-    gtk_widget_set_hexpand(l3, TRUE);
-
-    gtk_box_pack_start(GTK_BOX(box), l1, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(box), l2, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(box), l3, TRUE, TRUE, 0);
-    gtk_container_add(GTK_CONTAINER(row), box);
-
-    g_object_set_data(G_OBJECT(row), "pid", GINT_TO_POINTER(pid));
-    gtk_container_add(GTK_CONTAINER(a->list), row);
-}
-
 static void refresh_procs(App *a)
 {
-    GtkListBoxRow *row;
     DIR *d;
     struct dirent *de;
     uid_t me = getuid();
 
-    if (!a->list)
+    if (!a->store)
         return;
 
-    while ((row = gtk_list_box_get_row_at_index(GTK_LIST_BOX(a->list), 0)))
-        gtk_widget_destroy(GTK_WIDGET(row));
+    gtk_list_store_clear(a->store);
     a->sel_pid = 0;
 
     d = opendir("/proc");
@@ -558,11 +526,17 @@ static void refresh_procs(App *a)
         if (!cmd[0])
             g_strlcpy(cmd, name, sizeof(cmd));
 
-        add_row(a, atoi(de->d_name), user_name(me), cmd);
+        {
+            GtkTreeIter it;
+
+            gtk_list_store_append(a->store, &it);
+            gtk_list_store_set(a->store, &it,
+                               COL_PID, atoi(de->d_name),
+                               COL_USER, user_name(me),
+                               COL_CMD, cmd, -1);
+        }
     }
     closedir(d);
-
-    gtk_widget_show_all(a->list);
 }
 
 /* --------------------------------------------------------------------------
@@ -715,12 +689,17 @@ static void on_unload(GtkWidget *w, gpointer data)
     refresh_procs(a);
 }
 
-static void on_row_selected(GtkListBox *lb, GtkListBoxRow *row, gpointer data)
+static void on_sel_changed(GtkTreeSelection *sel, gpointer data)
 {
     App *a = data;
+    GtkTreeModel *model;
+    GtkTreeIter it;
+    int pid = 0;
 
-    (void)lb;
-    a->sel_pid = row ? GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "pid")) : 0;
+    if (gtk_tree_selection_get_selected(sel, &model, &it))
+        gtk_tree_model_get(model, &it, COL_PID, &pid, -1);
+
+    a->sel_pid = pid;
     gtk_widget_set_sensitive(a->btn_give, a->sel_pid > 0 && module_loaded());
 }
 
@@ -836,8 +815,8 @@ static const char *CSS =
     "#textbtn:hover { background-color: rgba(0,0,0,0.06); }\n"
     "#logview, #logview text { background-color: #fafafc; color: #3a3a3c; }\n"
     "#logscroll, #logscroll viewport { background-color: #fafafc; }\n"
-    "#listbox { background-color: #ffffff; padding: 0; }\n"
-    "#listbox row { border-radius: 12px; padding: 0; }\n"
+    "#proctree { background-color: #ffffff; -GtkTreeView-vertical-separator: 9; }\n"
+    "#proctree:selected, #proctree:selected:focus { background-color: #e7e7ec; color: #1b1b1b; }\n"
     "#tabbar { background-color: #ededf1; border-top: 1px solid rgba(0,0,0,0.075); }\n"
     "#tablbl { color: #8e8e93; font-size: 11.5px; }\n"
     "#tablbl.on { color: #1b1b1b; font-weight: 600; }\n"
@@ -994,7 +973,6 @@ static GtkWidget *build_home(App *a)
                        info_row(IC_CHIP, "内核版本", &a->val_kernel), FALSE, FALSE, 0);
     gtk_widget_set_margin_top(card_info, 4);
     gtk_widget_set_margin_bottom(card_info, 4);
-    gtk_box_pack_start(GTK_BOX(body), card_info, FALSE, FALSE, 0);
 
     /* 系统状态卡 */
     card_sys = card_new();
@@ -1004,7 +982,20 @@ static GtkWidget *build_home(App *a)
     gtk_box_pack_start(GTK_BOX(card_sys),
                        info_row(IC_FILTER, "Seccomp 状态", &a->val_seccomp), FALSE, FALSE, 0);
 
-    gtk_box_pack_start(GTK_BOX(body), card_sys, FALSE, FALSE, 0);
+    /* 横屏：版本卡和系统卡并排两列 */
+    {
+        GtkWidget *cols = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+        GtkWidget *left = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+        GtkWidget *right = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+
+        gtk_widget_set_halign(left, GTK_ALIGN_FILL);
+        gtk_widget_set_halign(right, GTK_ALIGN_FILL);
+        gtk_box_pack_start(GTK_BOX(cols), left, TRUE, TRUE, 0);
+        gtk_box_pack_start(GTK_BOX(cols), right, TRUE, TRUE, 0);
+        gtk_box_pack_start(GTK_BOX(left), card_info, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(right), card_sys, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(body), cols, FALSE, FALSE, 0);
+    }
 
     gtk_container_add(GTK_CONTAINER(scroll), body);
     return scroll;
@@ -1085,11 +1076,38 @@ static GtkWidget *build_super(App *a)
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
                                    GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
     gtk_widget_set_vexpand(scroll, TRUE);
-    a->list = gtk_list_box_new();
-    gtk_widget_set_name(a->list, "listbox");
-    gtk_list_box_set_selection_mode(GTK_LIST_BOX(a->list), GTK_SELECTION_SINGLE);
-    g_signal_connect(a->list, "row-selected", G_CALLBACK(on_row_selected), a);
-    gtk_container_add(GTK_CONTAINER(scroll), a->list);
+    a->store = gtk_list_store_new(COL_N, G_TYPE_INT, G_TYPE_STRING, G_TYPE_STRING);
+    a->tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(a->store));
+    gtk_widget_set_name(a->tree, "proctree");
+    gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(a->tree), FALSE);
+    gtk_tree_view_set_enable_search(GTK_TREE_VIEW(a->tree), FALSE);
+    g_signal_connect(gtk_tree_view_get_selection(GTK_TREE_VIEW(a->tree)),
+                     "changed", G_CALLBACK(on_sel_changed), a);
+
+    {
+        GtkCellRenderer *r;
+        GtkTreeViewColumn *c;
+
+        r = gtk_cell_renderer_text_new();
+        g_object_set(r, "weight", PANGO_WEIGHT_BOLD, "xpad", 10, NULL);
+        c = gtk_tree_view_column_new_with_attributes("pid", r, "text", COL_PID, NULL);
+        gtk_tree_view_column_set_min_width(c, 78);
+        gtk_tree_view_append_column(GTK_TREE_VIEW(a->tree), c);
+
+        r = gtk_cell_renderer_text_new();
+        g_object_set(r, "xpad", 10, NULL);
+        c = gtk_tree_view_column_new_with_attributes("user", r, "text", COL_USER, NULL);
+        gtk_tree_view_column_set_min_width(c, 84);
+        gtk_tree_view_append_column(GTK_TREE_VIEW(a->tree), c);
+
+        r = gtk_cell_renderer_text_new();
+        g_object_set(r, "ellipsize", PANGO_ELLIPSIZE_END, "xpad", 10, NULL);
+        c = gtk_tree_view_column_new_with_attributes("cmd", r, "text", COL_CMD, NULL);
+        gtk_tree_view_column_set_expand(c, TRUE);
+        gtk_tree_view_append_column(GTK_TREE_VIEW(a->tree), c);
+    }
+
+    gtk_container_add(GTK_CONTAINER(scroll), a->tree);
     gtk_box_pack_start(GTK_BOX(cbody), scroll, TRUE, TRUE, 0);
 
     a->btn_give = gtk_button_new_with_label("提权选中进程");
@@ -1098,8 +1116,17 @@ static GtkWidget *build_super(App *a)
     gtk_box_pack_start(GTK_BOX(cbody), a->btn_give, FALSE, FALSE, 0);
 
     gtk_box_pack_start(GTK_BOX(card_proc), cbody, TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(box), card_proc, TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(box), log_card(a, 150), FALSE, FALSE, 0);
+
+    /* 横屏：左边进程列表，右边输出 */
+    {
+        GtkWidget *cols = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+        GtkWidget *right = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+
+        gtk_box_pack_start(GTK_BOX(cols), card_proc, TRUE, TRUE, 0);
+        gtk_box_pack_start(GTK_BOX(cols), right, TRUE, TRUE, 0);
+        gtk_box_pack_start(GTK_BOX(right), log_card(a, 150), TRUE, TRUE, 0);
+        gtk_box_pack_start(GTK_BOX(box), cols, TRUE, TRUE, 0);
+    }
 
     g_signal_connect(a->btn_give, "clicked", G_CALLBACK(on_give), a);
     return box;
@@ -1159,7 +1186,7 @@ static GtkWidget *build_mod(App *a)
 
     gtk_box_pack_start(GTK_BOX(card_mod), cbody, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(box), card_mod, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(box), log_card(a, 220), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(box), log_card(a, 220), TRUE, TRUE, 0);
 
     g_signal_connect(btn_refresh, "clicked", G_CALLBACK(on_refresh), a);
     g_signal_connect(btn_load, "clicked", G_CALLBACK(on_load), a);
@@ -1208,7 +1235,6 @@ static GtkWidget *build_settings(App *a)
     gtk_box_pack_start(GTK_BOX(cbody), a->ko_label, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(cbody), hint, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(card_path), cbody, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(box), card_path, FALSE, FALSE, 0);
 
     card_about = card_new();
     cbody = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
@@ -1232,7 +1258,17 @@ static GtkWidget *build_settings(App *a)
     gtk_box_pack_start(GTK_BOX(cbody), lbl, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(cbody), hint, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(card_about), cbody, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(box), card_about, FALSE, FALSE, 0);
+
+    /* 横屏：两张卡并排 */
+    {
+        GtkWidget *cols = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+        GtkWidget *right = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+
+        gtk_box_pack_start(GTK_BOX(cols), card_path, TRUE, TRUE, 0);
+        gtk_box_pack_start(GTK_BOX(cols), right, TRUE, TRUE, 0);
+        gtk_box_pack_start(GTK_BOX(right), card_about, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(box), cols, FALSE, FALSE, 0);
+    }
 
     btn_refresh = gtk_button_new_with_label("刷新状态");
     gtk_widget_set_halign(btn_refresh, GTK_ALIGN_END);
@@ -1292,7 +1328,7 @@ static void build_ui(App *a)
 
     a->win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(a->win), "RootMgr");
-    gtk_window_set_default_size(GTK_WINDOW(a->win), 440, 720);
+    gtk_window_set_default_size(GTK_WINDOW(a->win), 960, 600);
     gtk_window_set_position(GTK_WINDOW(a->win), GTK_WIN_POS_CENTER);
     g_signal_connect(a->win, "destroy", G_CALLBACK(gtk_main_quit), NULL);
 
