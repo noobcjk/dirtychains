@@ -27,7 +27,7 @@
 #include <unistd.h>
 
 #define APP_TITLE   "RootMgr"
-#define MGR_VERSION "1.1"
+#define MGR_VERSION "1.2"
 
 /* 图标种类：全部用 cairo 画，不依赖图标字体 / 主题 */
 typedef enum {
@@ -45,8 +45,8 @@ typedef enum {
 
 #define TAB_COUNT 4
 
-/* 进程列表的三列 */
-enum { COL_PID, COL_USER, COL_CMD, COL_N };
+/* 进程列表：图标 / PID / 程序位置 / 用户 / 悬浮提示（命令行） */
+enum { COL_ICON, COL_PID, COL_PATH, COL_USER, COL_TIP, COL_N };
 
 typedef struct {
     GtkWidget *win;
@@ -62,6 +62,7 @@ typedef struct {
     GtkWidget *val_seccomp;
 
     /* 超级用户页 */
+    GtkWidget *lbl_count;
     GtkWidget *tree;
     GtkListStore *store;
 
@@ -448,21 +449,109 @@ static void refresh_home(App *a)
 }
 
 /* --------------------------------------------------------------------------
- * 超级用户页：当前用户自己的 shell 进程
+ * 超级用户页：当前用户进程对应的「程序位置」
  * ----------------------------------------------------------------------- */
 
-static gboolean is_shell_name(const char *name)
+/* 读 /proc/<pid>/exe，返回可执行文件的绝对路径；读不到返回 NULL */
+static char *proc_exe(int pid)
 {
-    static const char *ok[] = {
-        "sh", "bash", "dash", "zsh", "ksh", "ash", "fish",
-        "tmux", "screen", "su", "sudo", "rootmgr-gui"
-    };
-    size_t i;
+    char link[64], buf[2048];
+    ssize_t n;
+    size_t len;
 
-    for (i = 0; i < G_N_ELEMENTS(ok); i++)
-        if (!strcmp(name, ok[i]))
-            return TRUE;
-    return FALSE;
+    g_snprintf(link, sizeof(link), "/proc/%d/exe", pid);
+    n = readlink(link, buf, sizeof(buf) - 1);
+    if (n <= 0)
+        return NULL;
+    buf[n] = '\0';
+
+    /* 程序被删掉后内核会追加 " (deleted)"，去掉更干净 */
+    len = strlen(buf);
+    if (len > 10 && !strcmp(buf + len - 10, " (deleted)"))
+        buf[len - 10] = '\0';
+
+    return g_strdup(buf);
+}
+
+/* 程序图标：浅色圆角方块 + 程序名首字母，纯 cairo 绘制，不依赖图标主题 */
+static GdkPixbuf *prog_icon(const char *path, const char *name)
+{
+    enum { S = 32 };
+    static const double pal[][3] = {
+        { 0.906, 0.918, 0.941 },   /* 冷灰 */
+        { 0.929, 0.910, 0.902 },   /* 暖灰 */
+        { 0.902, 0.933, 0.914 },   /* 青灰 */
+        { 0.933, 0.918, 0.949 },   /* 紫灰 */
+        { 0.945, 0.929, 0.898 }    /* 米灰 */
+    };
+    cairo_surface_t *surf;
+    cairo_t *cr;
+    PangoLayout *pl;
+    PangoFontDescription *fd;
+    const double *bg;
+    unsigned h;
+    char letter[8] = "?";
+    const char *base;
+    gunichar u;
+    GdkPixbuf *pb;
+
+    /* 取 basename 的首字符做大写字母 */
+    base = path ? strrchr(path, '/') : NULL;
+    base = (base && base[1]) ? base + 1 : (name ? name : (path ? path : "?"));
+    u = g_utf8_get_char(base);
+    if (u && u != G_DIR_SEPARATOR) {
+        int k;
+
+        u = g_unichar_toupper(u);
+        k = g_unichar_to_utf8(u, letter);
+        letter[k] = '\0';
+    }
+
+    h = g_str_hash(path && *path ? path : base);
+    bg = pal[h % G_N_ELEMENTS(pal)];
+
+    surf = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, S, S);
+    cr = cairo_create(surf);
+    cairo_set_antialias(cr, CAIRO_ANTIALIAS_BEST);
+
+    {
+        const double r = 8.6;
+
+        cairo_new_sub_path(cr);
+        cairo_arc(cr, S - r, r, r, -G_PI / 2, 0);
+        cairo_arc(cr, S - r, S - r, r, 0, G_PI / 2);
+        cairo_arc(cr, r, S - r, r, G_PI / 2, G_PI);
+        cairo_arc(cr, r, r, r, G_PI, 1.5 * G_PI);
+        cairo_close_path(cr);
+    }
+    cairo_set_source_rgb(cr, bg[0], bg[1], bg[2]);
+    cairo_fill(cr);
+
+    pl = pango_cairo_create_layout(cr);
+    fd = pango_font_description_new();
+    pango_font_description_set_family(fd, "Sans");
+    pango_font_description_set_weight(fd, PANGO_WEIGHT_BOLD);
+    pango_font_description_set_absolute_size(fd, 19 * PANGO_SCALE);
+    pango_layout_set_font_description(pl, fd);
+    pango_layout_set_text(pl, letter, -1);
+
+    {
+        int w = 0, hh = 0;
+
+        pango_layout_get_pixel_size(pl, &w, &hh);
+        cairo_set_source_rgb(cr, 0.22, 0.22, 0.25);
+        cairo_move_to(cr, (S - w) / 2.0, (S - hh) / 2.0);
+        pango_cairo_show_layout(cr, pl);
+    }
+
+    pango_font_description_free(fd);
+    g_object_unref(pl);
+    cairo_destroy(cr);
+
+    pb = gdk_pixbuf_get_from_surface(surf, 0, 0, S, S);
+    cairo_surface_destroy(surf);
+
+    return pb;
 }
 
 static void refresh_procs(App *a)
@@ -481,15 +570,22 @@ static void refresh_procs(App *a)
         return;
 
     while ((de = readdir(d))) {
-        char path[300], buf[1024], name[64] = "", cmd[256] = "";
+        char path[300], buf[1024], name[64] = "", args[400] = "";
         FILE *f;
         unsigned uid = 0;
+        int pid;
+        char *exe;
+        char *tip;
         char *p;
 
         if (de->d_name[0] < '0' || de->d_name[0] > '9')
             continue;
 
-        g_snprintf(path, sizeof(path), "/proc/%s/status", de->d_name);
+        pid = atoi(de->d_name);
+        if (pid <= 0)
+            continue;
+
+        g_snprintf(path, sizeof(path), "/proc/%d/status", pid);
         f = fopen(path, "r");
         if (!f)
             continue;
@@ -502,34 +598,59 @@ static void refresh_procs(App *a)
         }
         fclose(f);
 
-        if (uid != (unsigned)me || !is_shell_name(name))
+        if (uid != (unsigned)me)
             continue;
 
-        g_snprintf(path, sizeof(path), "/proc/%s/cmdline", de->d_name);
+        exe = proc_exe(pid);
+        if (!exe) {
+            /* 内核线程或权限不足时没有 exe 链接，用进程名占位 */
+            if (!name[0]) {
+                continue;
+            }
+            exe = g_strdup_printf("(%s)", name);
+        }
+
+        g_snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
         f = fopen(path, "r");
         if (f) {
-            size_t n = fread(cmd, 1, sizeof(cmd) - 1, f);
+            size_t n = fread(args, 1, sizeof(args) - 1, f);
 
             fclose(f);
-            cmd[n] = '\0';
-            for (p = cmd; p < cmd + n; p++)
+            args[n] = '\0';
+            for (p = args; p < args + n; p++)
                 if (*p == '\0')
                     *p = ' ';
         }
-        if (!cmd[0])
-            g_strlcpy(cmd, name, sizeof(cmd));
+
+        tip = args[0] ? g_strdup_printf("%s\n%s", exe, args) : g_strdup(exe);
 
         {
             GtkTreeIter it;
+            GdkPixbuf *ico = prog_icon(exe, name);
 
             gtk_list_store_append(a->store, &it);
             gtk_list_store_set(a->store, &it,
-                               COL_PID, atoi(de->d_name),
+                               COL_ICON, ico,
+                               COL_PID, pid,
+                               COL_PATH, exe,
                                COL_USER, user_name(me),
-                               COL_CMD, cmd, -1);
+                               COL_TIP, tip, -1);
+            if (ico)
+                g_object_unref(ico);
         }
+
+        g_free(tip);
+        g_free(exe);
     }
     closedir(d);
+
+    if (a->lbl_count) {
+        char cnt[64];
+
+        g_snprintf(cnt, sizeof(cnt), "%u 个进程",
+                   gtk_tree_model_iter_n_children(GTK_TREE_MODEL(a->store), NULL));
+        gtk_label_set_text(GTK_LABEL(a->lbl_count), cnt);
+    }
 }
 
 /* --------------------------------------------------------------------------
@@ -1050,8 +1171,9 @@ static GtkWidget *build_super(App *a)
     gtk_widget_set_margin_bottom(cbody, 14);
 
     h = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    lbl = gtk_label_new("当前用户的进程");
+    lbl = gtk_label_new("程序位置");
     sub = gtk_label_new(user_name(getuid()));
+    a->lbl_count = sub;
     btn = gtk_button_new_with_label("刷新");
     gtk_widget_set_name(lbl, "cardtitle");
     gtk_widget_set_name(sub, "cardvalue");
@@ -1070,35 +1192,47 @@ static GtkWidget *build_super(App *a)
                                    GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
     gtk_widget_set_vexpand(scroll, TRUE);
 
-    a->store = gtk_list_store_new(COL_N, G_TYPE_INT, G_TYPE_STRING, G_TYPE_STRING);
+    a->store = gtk_list_store_new(COL_N, GDK_TYPE_PIXBUF, G_TYPE_INT,
+                                  G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING);
     tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(a->store));
     a->tree = tree;
     gtk_widget_set_name(tree, "proctree");
     gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(tree), FALSE);
     gtk_tree_view_set_enable_search(GTK_TREE_VIEW(tree), FALSE);
+    gtk_tree_view_set_tooltip_column(GTK_TREE_VIEW(tree), COL_TIP);
 
     {
         GtkCellRenderer *r;
         GtkTreeViewColumn *c;
 
+        r = gtk_cell_renderer_pixbuf_new();
+        g_object_set(r, "xpad", 8, "ypad", 6, NULL);
+        c = gtk_tree_view_column_new_with_attributes("icon", r, "pixbuf", COL_ICON, NULL);
+        gtk_tree_view_column_set_min_width(c, 46);
+        gtk_tree_view_append_column(GTK_TREE_VIEW(tree), c);
+
         r = gtk_cell_renderer_text_new();
-        g_object_set(r, "weight", PANGO_WEIGHT_BOLD, "xpad", 10, NULL);
+        g_object_set(r, "weight", PANGO_WEIGHT_BOLD, "xpad", 6, NULL);
         c = gtk_tree_view_column_new_with_attributes("pid", r, "text", COL_PID, NULL);
-        gtk_tree_view_column_set_min_width(c, 78);
+        gtk_tree_view_column_set_min_width(c, 76);
         gtk_tree_view_append_column(GTK_TREE_VIEW(tree), c);
 
         r = gtk_cell_renderer_text_new();
-        g_object_set(r, "xpad", 10, NULL);
-        c = gtk_tree_view_column_new_with_attributes("user", r, "text", COL_USER, NULL);
-        gtk_tree_view_column_set_min_width(c, 84);
-        gtk_tree_view_append_column(GTK_TREE_VIEW(tree), c);
-
-        r = gtk_cell_renderer_text_new();
-        g_object_set(r, "ellipsize", PANGO_ELLIPSIZE_END, "xpad", 10, NULL);
-        c = gtk_tree_view_column_new_with_attributes("cmd", r, "text", COL_CMD, NULL);
+        g_object_set(r, "ellipsize", PANGO_ELLIPSIZE_MIDDLE, "xpad", 6, NULL);
+        c = gtk_tree_view_column_new_with_attributes("path", r, "text", COL_PATH, NULL);
         gtk_tree_view_column_set_expand(c, TRUE);
         gtk_tree_view_append_column(GTK_TREE_VIEW(tree), c);
+
+        r = gtk_cell_renderer_text_new();
+        g_object_set(r, "ellipsize", PANGO_ELLIPSIZE_END, "xpad", 6, "xalign", 1.0, NULL);
+        c = gtk_tree_view_column_new_with_attributes("user", r, "text", COL_USER, NULL);
+        gtk_tree_view_column_set_min_width(c, 78);
+        gtk_tree_view_append_column(GTK_TREE_VIEW(tree), c);
     }
+
+    /* 按程序位置排序，同一个程序的多个进程会挨在一起 */
+    gtk_tree_sortable_set_sort_column_id(GTK_TREE_SORTABLE(a->store),
+                                         COL_PATH, GTK_SORT_ASCENDING);
 
     gtk_container_add(GTK_CONTAINER(scroll), tree);
     gtk_box_pack_start(GTK_BOX(cbody), scroll, TRUE, TRUE, 0);
@@ -1106,7 +1240,7 @@ static GtkWidget *build_super(App *a)
     gtk_box_pack_start(GTK_BOX(box), card, TRUE, TRUE, 0);
 
     {
-        GtkWidget *hint = gtk_label_new("这里是 /proc 里属于当前用户的 shell 进程，仅供查看。");
+        GtkWidget *hint = gtk_label_new("程序位置取自 /proc/<pid>/exe，按路径排序；鼠标悬停可看完整命令行。");
         gtk_widget_set_name(hint, "cardvalue");
         gtk_widget_set_halign(hint, GTK_ALIGN_START);
         gtk_widget_set_margin_start(hint, 14);
