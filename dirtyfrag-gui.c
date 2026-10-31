@@ -3693,7 +3693,7 @@ int ovswrap_main(int argc, char **argv)
 
 #define APP_TITLE       "DirtyChains · 页缓存提权"
 /* 构建标识: 标题栏副标题上直接显示, 用来确认跑的是不是最新这份 */
-#define DF_BUILD        "2026-10-31-r18"
+#define DF_BUILD        "2026-10-31-r19"
 #define APP_SUBTITLE    "六链 PoC 图形前端 · " DF_BUILD
 #define LOG_MAX_LINES   20000
 #define PTY_COLS        110
@@ -3796,6 +3796,7 @@ typedef struct {
     GtkWidget *lbl_name, *lbl_desc, *lbl_need;
     GtkWidget *entry_target, *entry_to, *entry_set, *entry_offset;
     GtkWidget *entry_krec;   /* OVS 链: 指定内核版本匹配 offset/ 表 */
+    GtkWidget *btn_vmlinux;  /* OVS 链: 解析 vmlinux (pahole/BTF 推导偏移) */
     /* 参数面板各行的标签/按钮, 便于按所选 CVE 显隐 */
     GtkWidget *lbl_t, *browse_t;
     GtkWidget *lbl_to, *browse_to;
@@ -4733,6 +4734,7 @@ static void sync_params_ui(App *a)
 
     gtk_widget_set_visible(a->lbl_krec,  all ? FALSE : c->engine == 1);
     gtk_widget_set_visible(a->entry_krec, all ? FALSE : c->engine == 1);
+    gtk_widget_set_visible(a->btn_vmlinux, all ? FALSE : c->engine == 1);
 
     if (!all) {
         /* 占位提示随链微调 */
@@ -5022,6 +5024,168 @@ static void act_write(GtkWidget *w, gpointer data)
         return;
 
     app_spawn(a, args, "通用写");
+}
+
+/*
+ * 「解析 vmlinux」(仅 OVS 链):
+ * 让内置引擎用 pahole/BTF + kallsyms/System.map 推导本机内核的
+ * 结构偏移 —— stdout 是 JSON 摘要 / target.h 文本, 诊断走 stderr。
+ * 解析出的 target.h 落到 <程序目录>/offset/<release>/, 以后没装
+ * pahole 的机器也能直接命中配置表。
+ */
+static void act_vmlinux(GtkWidget *w, gpointer data)
+{
+    App *a = data;
+    const Chain *c = cur_chain(a);
+    char *argv[6];
+    int argc;
+    char *json = NULL, *th = NULL, *err1 = NULL, *err2 = NULL;
+    gint st;
+    GError *ge = NULL;
+    char msg[PATH_BUF], exe[512], exdir[512], offdir[600], sub[640], path[760];
+    const char *rel = NULL, *p, *q;
+    ssize_t rl;
+
+    (void)w;
+    if (!c || c->engine != 1)
+        return;
+    if (!a->poc_path) {
+        log_append_plain(a, "[!] 找不到内置引擎，无法解析 vmlinux。\n");
+        log_flush(a);
+        return;
+    }
+    if (a->running) {
+        gtk_label_set_text(GTK_LABEL(a->status_lbl), "已有任务在运行");
+        return;
+    }
+
+    ansi_feed(a, "\n\033[2m══ 解析 vmlinux：pahole/BTF 推导本机内核偏移 ══\n\033[0m\n",
+              strlen("\n\033[2m══ 解析 vmlinux：pahole/BTF 推导本机内核偏移 ══\n\033[0m\n"));
+    log_flush(a);
+    gtk_label_set_text(GTK_LABEL(a->status_lbl), "正在解析 vmlinux …");
+    gtk_widget_set_name(a->status_lbl, "status-run");
+
+    /* 第 1 步: -dump-krec, stdout 是 JSON, 诊断在 stderr */
+    argc = 0;
+    argv[argc++] = a->poc_path;
+    if (a->poc_builtin)
+        argv[argc++] = "--ovs";
+    argv[argc++] = "-dump-krec";
+    argv[argc] = NULL;
+
+    if (!g_spawn_sync(NULL, argv, NULL, G_SPAWN_SEARCH_PATH,
+                      NULL, NULL, &json, &err1, &st, &ge)) {
+        g_snprintf(msg, sizeof(msg), "[!] 启动引擎失败: %s\n", ge->message);
+        log_append_plain(a, msg);
+        log_flush(a);
+        g_error_free(ge);
+        return;
+    }
+    if (err1 && *err1)
+        log_append_plain(a, err1);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+        log_append_plain(a,
+            "[!] 解析失败。确认已装 pahole (sudo apt install dwarves)，\n"
+            "    且 /boot/System.map-$(uname -r) 或 /proc/kallsyms (root) 可读；\n"
+            "    卡在 ovs_conntrack_info 就先 sudo modprobe openvswitch。\n");
+        log_flush(a);
+        gtk_label_set_text(GTK_LABEL(a->status_lbl), "vmlinux 解析失败");
+        g_free(json);
+        g_free(err1);
+        return;
+    }
+    if (json && *json) {
+        log_append_plain(a, json);
+        if (*(json) && json[strlen(json) - 1] != '\n')
+            log_append_plain(a, "\n");
+    }
+
+    /* 从 JSON 里抠 release */
+    if (json && (p = strstr(json, "\"release\"")) != NULL &&
+        (p = strchr(p + 9, '"')) != NULL) {
+        p++;
+        if ((q = strchr(p, '"')) != NULL)
+            rel = g_strndup(p, (gsize)(q - p));
+    }
+    if (!rel) {
+        log_append_plain(a, "[!] 解析成功，但拿不到内核版本号，跳过落盘。\n");
+        log_flush(a);
+        g_free(json);
+        g_free(err1);
+        return;
+    }
+
+    /* 第 2 步: -dump-target 生成 target.h 文本 */
+    argc = 0;
+    argv[argc++] = a->poc_path;
+    if (a->poc_builtin)
+        argv[argc++] = "--ovs";
+    argv[argc++] = "-dump-target";
+    argv[argc] = NULL;
+
+    if (!g_spawn_sync(NULL, argv, NULL, G_SPAWN_SEARCH_PATH,
+                      NULL, NULL, &th, &err2, &st, &ge) ||
+        !WIFEXITED(st) || WEXITSTATUS(st) != 0 || !th || !*th) {
+        g_snprintf(msg, sizeof(msg),
+                   "[!] 生成 target.h 失败 (%s)。\n",
+                   ge ? ge->message : "引擎返回非 0");
+        log_append_plain(a, msg);
+        log_flush(a);
+        if (ge)
+            g_error_free(ge);
+        g_free(json);
+        g_free((char *)rel);
+        g_free(err1);
+        g_free(err2);
+        return;
+    }
+
+    /* 落盘: <程序目录>/offset/<release>/target.h */
+    rl = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (rl <= 0) {
+        log_append_plain(a, "[!] 读不到程序路径，跳过落盘。\n");
+        log_flush(a);
+        g_free(json);
+        g_free(th);
+        g_free((char *)rel);
+        g_free(err1);
+        g_free(err2);
+        return;
+    }
+    exe[rl] = '\0';
+    g_strlcpy(exdir, exe, sizeof(exdir));
+    {
+        char *slash = strrchr(exdir, '/');
+
+        if (slash)
+            *slash = '\0';
+    }
+    g_snprintf(offdir, sizeof(offdir), "%s/offset", exdir);
+    g_snprintf(sub, sizeof(sub), "%s/%s", offdir, rel);
+    g_snprintf(path, sizeof(path), "%s/target.h", sub);
+
+    if (g_mkdir_with_parents(sub, 0755) != 0 ||
+        g_file_set_contents(path, th, -1, NULL) == FALSE) {
+        g_snprintf(msg, sizeof(msg),
+                   "[!] 写入 %s 失败: %s\n", path, strerror(errno));
+        log_append_plain(a, msg);
+    } else {
+        g_snprintf(msg, sizeof(msg),
+                   "\033[32m[+] 已写入 %s (%ld 字节)。\033[0m\n"
+                   "    之后 OVS 链在这台机器上会直接命中配置表，"
+                   "不再需要 pahole/BTF。\n",
+                   path, (long)strlen(th));
+        log_append_plain(a, msg);
+        g_snprintf(msg, sizeof(msg), "vmlinux 解析完成: %s", rel);
+        gtk_label_set_text(GTK_LABEL(a->status_lbl), msg);
+    }
+    log_flush(a);
+
+    g_free(json);
+    g_free(th);
+    g_free((char *)rel);
+    g_free(err1);
+    g_free(err2);
 }
 
 static void on_toggle_expand(GtkWidget *w, gpointer data)
@@ -5395,7 +5559,14 @@ static GtkWidget *build_params(App *a)
                                 "传给 OVS 链的 -krec 参数，强制匹配 offset/ 下"
                                 "指定内核版本的偏移表；留空则按运行内核自动选。");
     gtk_widget_set_hexpand(a->entry_krec, TRUE);
-    gtk_grid_attach(GTK_GRID(grid), a->entry_krec, 1, 4, 2, 1);
+    gtk_grid_attach(GTK_GRID(grid), a->entry_krec, 1, 4, 1, 1);
+
+    a->btn_vmlinux = gtk_button_new_with_label("解析 vmlinux");
+    gtk_widget_set_tooltip_text(a->btn_vmlinux,
+                                "用 pahole/BTF 解析本机内核结构偏移并生成 target.h，"
+                                "写入程序目录的 offset/<内核版本>/ 供以后离线使用。\n"
+                                "需要 pahole (sudo apt install dwarves)。");
+    gtk_grid_attach(GTK_GRID(grid), a->btn_vmlinux, 2, 4, 1, 1);
 
     return grid;
 }
@@ -6095,6 +6266,7 @@ static void build_window(App *a)
     g_signal_connect(a->btn_find, "clicked", G_CALLBACK(act_find), a);
     g_signal_connect(a->btn_lpe, "clicked", G_CALLBACK(act_lpe), a);
     g_signal_connect(a->btn_write, "clicked", G_CALLBACK(act_write), a);
+    g_signal_connect(a->btn_vmlinux, "clicked", G_CALLBACK(act_vmlinux), a);
     g_signal_connect(a->btn_stop, "clicked", G_CALLBACK(act_stop), a);
     g_signal_connect(a->btn_send, "clicked", G_CALLBACK(act_send), a);
     g_signal_connect(a->btn_ctrlc, "clicked", G_CALLBACK(act_ctrlc), a);
