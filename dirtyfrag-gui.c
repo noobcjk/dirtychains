@@ -3693,7 +3693,7 @@ int ovswrap_main(int argc, char **argv)
 
 #define APP_TITLE       "DirtyChains · 页缓存提权"
 /* 构建标识: 标题栏副标题上直接显示, 用来确认跑的是不是最新这份 */
-#define DF_BUILD        "2026-10-31-r16"
+#define DF_BUILD        "2026-10-31-r17"
 #define APP_SUBTITLE    "六链 PoC 图形前端 · " DF_BUILD
 #define LOG_MAX_LINES   20000
 #define PTY_COLS        110
@@ -3749,7 +3749,8 @@ static const Chain chains[] = {
  * 侧栏类别表。单链类 (members == NULL) 点击直接切链;
  * 多链类点击后弹窗, 让用户在同一类里挑具体漏洞。
  */
-static const int cat_oob_members[] = { 2, 4, 5 };   /* 43500 / 46331 / 64531 */
+static const int cat_write_members[] = { 0, 1 };    /* 31431 / 43284 */
+static const int cat_oob_members[]   = { 2, 4, 5 }; /* 43500 / 46331 / 64531 */
 
 static const struct {
     const char *name;        /* 侧栏条目 */
@@ -3757,11 +3758,11 @@ static const struct {
     const int  *members;     /* 多链类: chains 下标数组 */
     int         n;
 } side_cats[] = {
-    { "AEAD类",        0, NULL,             0 },
-    { "ESP类",         1, NULL,             0 },
-    { "UAF类",         3, NULL,             0 },
-    { "OOB/越界写类", -1, cat_oob_members, (int)(sizeof(cat_oob_members) /
-                                                 sizeof(cat_oob_members[0])) },
+    { "原地写类",      -1, cat_write_members,
+      (int)(sizeof(cat_write_members) / sizeof(cat_write_members[0])) },
+    { "UAF类",          3, NULL,             0 },
+    { "OOB/越界写类",  -1, cat_oob_members,
+      (int)(sizeof(cat_oob_members) / sizeof(cat_oob_members[0])) },
 };
 #define N_CATS ((int)(sizeof(side_cats) / sizeof(side_cats[0])))
 
@@ -3780,6 +3781,7 @@ typedef struct {
     GtkWidget *cve_revealer; /* 多链类别的「漏洞选择」框 (配置区上方) */
     GtkWidget *cve_combo;
     gulong      cve_combo_sig;
+    GtkWidget *cve_hint_lbl; /* 右上角: 当前选择的 CVE / 暂未选择CVE */
     GtkWidget *banner, *banner_lbl;
     GtkWidget *combo;
     GtkWidget *lbl_name, *lbl_desc, *lbl_need;
@@ -4561,9 +4563,18 @@ static const Chain *cur_chain(App *a)
 
 static void update_desc(App *a)
 {
-    const Chain *c = cur_chain(a);
+    int idx = gtk_combo_box_get_active(GTK_COMBO_BOX(a->combo));
 
-    if (!c) {
+    if (idx < 0) {
+        gtk_label_set_markup(GTK_LABEL(a->lbl_name), "<b>暂未选择CVE</b>");
+        gtk_label_set_text(GTK_LABEL(a->lbl_desc),
+                           "点左上角「展开」，从类别面板选择漏洞类别；"
+                           "同一类别里有多个漏洞时再在「漏洞选择」里挑。");
+        gtk_label_set_text(GTK_LABEL(a->lbl_need), "");
+        return;
+    }
+
+    if (idx == 0) {
         gtk_label_set_markup(GTK_LABEL(a->lbl_name),
                              "<b>全部（dirtychains 五链）</b>");
         gtk_label_set_text(GTK_LABEL(a->lbl_desc),
@@ -4573,32 +4584,48 @@ static void update_desc(App *a)
     }
 
     {
+        const Chain *c = &chains[idx - 1];
         char *mk = g_markup_printf_escaped("<b>%s</b>", c->name);
+
         gtk_label_set_markup(GTK_LABEL(a->lbl_name), mk);
         g_free(mk);
+        gtk_label_set_text(GTK_LABEL(a->lbl_desc), c->desc);
+        gtk_label_set_text(GTK_LABEL(a->lbl_need), c->need);
     }
-    gtk_label_set_text(GTK_LABEL(a->lbl_desc), c->desc);
-    gtk_label_set_text(GTK_LABEL(a->lbl_need), c->need);
+}
+
+/* 动作按钮的前置校验: 还没选 CVE 时拒绝执行 */
+static gboolean require_chain(App *a)
+{
+    if (gtk_combo_box_get_active(GTK_COMBO_BOX(a->combo)) >= 0)
+        return TRUE;
+    gtk_label_set_text(GTK_LABEL(a->status_lbl),
+                       "暂未选择CVE：请先在左侧类别面板选择");
+    gtk_widget_set_name(a->status_lbl, "status-warn");
+    return FALSE;
 }
 
 /* 当前链是否属于多链类别; 是则返回成员表 */
-static const int *chain_multi_members(int chain_idx)
+static const int *chain_multi_members(int chain_idx, int *n_out)
 {
     int c, i;
 
     for (c = 0; c < N_CATS; c++) {
         if (side_cats[c].members) {
             for (i = 0; i < side_cats[c].n; i++)
-                if (side_cats[c].members[i] == chain_idx)
+                if (side_cats[c].members[i] == chain_idx) {
+                    if (n_out)
+                        *n_out = side_cats[c].n;
                     return side_cats[c].members;
+                }
         }
     }
     return NULL;
 }
 
 /*
- * 「漏洞选择」框 (配置区上方): 只有当前链属于多链类别 (OOB/越界写类) 时
- * 才显示, 里面只列该类的成员漏洞。
+ * 「漏洞选择」框 (配置区上方): 只有当前链属于多链类别
+ * (原地写类 / OOB/越界写类) 时才显示, 里面只列该类的成员漏洞。
  */
 static void sync_cve_box(App *a)
 {
@@ -4609,19 +4636,11 @@ static void sync_cve_box(App *a)
     if (!a->cve_revealer || !a->cve_combo)
         return;
 
-    m = idx > 0 ? chain_multi_members(idx - 1) : NULL;
+    m = idx > 0 ? chain_multi_members(idx - 1, &n) : NULL;
     if (!m) {
         gtk_revealer_set_reveal_child(GTK_REVEALER(a->cve_revealer), FALSE);
         return;
     }
-
-    /* 数一下成员数 (members 以 -1 结尾没有约定, 这里靠类别表查) */
-    for (n = 0; n < N_CATS; n++)
-        if (side_cats[n].members == m)
-            break;
-    if (n >= N_CATS)
-        return;
-    n = side_cats[n].n;
 
     g_signal_handler_block(a->cve_combo, a->cve_combo_sig);
     gtk_combo_box_text_remove_all(GTK_COMBO_BOX_TEXT(a->cve_combo));
@@ -4637,18 +4656,36 @@ static void sync_cve_box(App *a)
     gtk_revealer_set_reveal_child(GTK_REVEALER(a->cve_revealer), TRUE);
 }
 
-/* 「漏洞选择」框里换漏洞 -> 同步主下拉框 */
+/* 「漏洞选择」框里换漏洞 -> 按当前所属类别映射回链 */
 static void on_cve_combo_changed(GtkComboBox *box, gpointer data)
 {
     App *a = data;
-    int k = gtk_combo_box_get_active(box);
+    int cur = gtk_combo_box_get_active(GTK_COMBO_BOX(a->combo));
+    const int *m;
+    int n = 0, k = gtk_combo_box_get_active(box);
 
-    if (k < 0 || k >= side_cats[N_CATS - 1].n)
+    m = cur > 0 ? chain_multi_members(cur - 1, &n) : NULL;
+    if (!m || k < 0 || k >= n)
         return;
-    if (gtk_combo_box_get_active(GTK_COMBO_BOX(a->combo)) !=
-        cat_oob_members[k] + 1)
-        gtk_combo_box_set_active(GTK_COMBO_BOX(a->combo),
-                                 cat_oob_members[k] + 1);
+    if (cur != m[k] + 1)
+        gtk_combo_box_set_active(GTK_COMBO_BOX(a->combo), m[k] + 1);
+}
+
+/* 右上角的当前 CVE 状态 */
+static void update_cve_hint(App *a)
+{
+    int idx = gtk_combo_box_get_active(GTK_COMBO_BOX(a->combo));
+    const char *txt;
+
+    if (!a->cve_hint_lbl)
+        return;
+    if (idx < 0)
+        txt = "暂未选择CVE";
+    else if (idx == 0)
+        txt = "全部类 · 检查 / 自测";
+    else
+        txt = chains[idx - 1].name;
+    gtk_label_set_text(GTK_LABEL(a->cve_hint_lbl), txt);
 }
 
 static void side_select(App *a, int idx);
@@ -4662,6 +4699,7 @@ static void on_combo_changed(GtkComboBox *box, gpointer data)
     /* 下拉框改了, 抽屉列表跟着选中 (side_sync 防止回环) */
     side_select(a, gtk_combo_box_get_active(GTK_COMBO_BOX(a->combo)));
     sync_cve_box(a);
+    update_cve_hint(a);
 }
 
 /* 简易提示对话框 */
@@ -4722,6 +4760,8 @@ static void act_check(GtkWidget *w, gpointer data)
 
     (void)w;
 
+    if (!require_chain(a))
+        return;
     const Chain *c = cur_chain(a);
     char *args[3];
 
@@ -4748,6 +4788,8 @@ static void act_test(GtkWidget *w, gpointer data)
 
     (void)w;
 
+    if (!require_chain(a))
+        return;
     const Chain *c = cur_chain(a);
     char *args[3];
 
@@ -4785,6 +4827,8 @@ static void act_lpe(GtkWidget *w, gpointer data)
 
     (void)w;
 
+    if (!require_chain(a))
+        return;
     const Chain *c = cur_chain(a);
     char *args[8];
     int n = 0;
@@ -4856,6 +4900,8 @@ static void act_write(GtkWidget *w, gpointer data)
     const char *to, *set, *off;
     char cmd[700];
 
+    if (!require_chain(a))
+        return;
     if (!c) {
         show_info(a, GTK_MESSAGE_INFO, "需要选择一条链",
                   "请先在上方选择具体的 CVE。",
@@ -5335,9 +5381,19 @@ static int cat_row_for_chain(int chain_idx)
 static void side_select(App *a, int combo_idx)
 {
     GtkListBoxRow *row;
-    int row_idx = combo_idx > 0 ? cat_row_for_chain(combo_idx - 1) : 0;
+    int row_idx;
 
-    if (!a->task_list || row_idx < 0)
+    if (!a->task_list)
+        return;
+    if (combo_idx < 0) {
+        /* 暂未选择 CVE: 清掉侧栏选中 */
+        a->side_sync = TRUE;
+        gtk_list_box_unselect_all(GTK_LIST_BOX(a->task_list));
+        a->side_sync = FALSE;
+        return;
+    }
+    row_idx = cat_row_for_chain(combo_idx - 1);
+    if (row_idx < 0)
         return;
     row = gtk_list_box_get_row_at_index(GTK_LIST_BOX(a->task_list), row_idx);
     if (!row)
@@ -5695,6 +5751,13 @@ static GtkWidget *build_header(App *a)
     gtk_menu_button_set_popup(GTK_MENU_BUTTON(mb), menu);
     gtk_header_bar_pack_end(GTK_HEADER_BAR(hb), mb);
 
+    /* 右上角: 当前选中的 CVE (未选时提示) */
+    a->cve_hint_lbl = gtk_label_new("暂未选择CVE");
+    gtk_widget_set_name(a->cve_hint_lbl, "cvehint");
+    gtk_widget_set_valign(a->cve_hint_lbl, GTK_ALIGN_CENTER);
+    gtk_widget_set_margin_end(a->cve_hint_lbl, 8);
+    gtk_header_bar_pack_end(GTK_HEADER_BAR(hb), a->cve_hint_lbl);
+
     return hb;
 }
 
@@ -5749,6 +5812,11 @@ static void build_window(App *a)
     gtk_widget_set_margin_end(head, 12);
     gtk_widget_set_margin_top(head, 8);
 
+    /*
+     * 主链下拉框已从界面上移除: 链的状态仍存在 a->combo 里,
+     * 由侧栏类别和「漏洞选择」框驱动, 但控件本身不再显示。
+     * 初始 active = -1 表示"暂未选择CVE"。
+     */
     a->combo = gtk_combo_box_text_new();
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(a->combo),
                                    "全部（dirtychains 五链，仅检查 / 自测）");
@@ -5760,9 +5828,8 @@ static void build_window(App *a)
             gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(a->combo), label);
         }
     }
-    gtk_combo_box_set_active(GTK_COMBO_BOX(a->combo), 0);
-    gtk_widget_set_size_request(a->combo, 260, -1);
-    gtk_widget_set_halign(a->combo, GTK_ALIGN_START);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(a->combo), -1);
+    gtk_widget_set_no_show_all(a->combo, TRUE);
     gtk_box_pack_start(GTK_BOX(chainbox), a->combo, FALSE, FALSE, 0);
 
     a->lbl_name = gtk_label_new(NULL);
