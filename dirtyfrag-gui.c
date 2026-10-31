@@ -3693,7 +3693,7 @@ int ovswrap_main(int argc, char **argv)
 
 #define APP_TITLE       "DirtyChains · 页缓存提权"
 /* 构建标识: 标题栏副标题上直接显示, 用来确认跑的是不是最新这份 */
-#define DF_BUILD        "2026-10-31-r14"
+#define DF_BUILD        "2026-10-31-r16"
 #define APP_SUBTITLE    "六链 PoC 图形前端 · " DF_BUILD
 #define LOG_MAX_LINES   20000
 #define PTY_COLS        110
@@ -3710,47 +3710,60 @@ typedef struct {
     const char *desc;    /* 说明 */
     const char *need;    /* 前提 */
     int         engine;  /* 0 = 内置 dirtychains 引擎, 1 = ovswrap 引擎 */
-    const char *cls;     /* 侧栏里显示的类别名 */
 } Chain;
 
 static const Chain chains[] = {
     { "-2026-31431", "31431 · Copy Fail",
       "CVE-2026-31431  AF_ALG / AEAD",
       "splice 文件页进 AEAD, 原地解密写 4 字节",
-      "需 authencesn(hmac(sha256),cbc(aes)) + algif_aead", 0,
-      "AEAD类" },
+      "需 authencesn(hmac(sha256),cbc(aes)) + algif_aead", 0 },
 
     { "-2026-43284", "43284 · XFRM/ESP",
       "CVE-2026-43284  XFRM / ESP",
       "splice + esp_input 原地解密, 写 ESN 高 32 位",
-      "需非特权 userns + XFRM + ESP", 0,
-      "ESP类" },
+      "需非特权 userns + XFRM + ESP", 0 },
 
     { "-2026-43500", "43500 · RxRPC",
       "CVE-2026-43500  RxRPC / RXKAD",
       "8 字节 pcbc(fcrypt) 原地解密, 改 /etc/passwd 首行",
-      "需 AF_RXRPC + RXKAD, 写位置固定", 0,
-      "RxRPC类" },
+      "需 AF_RXRPC + RXKAD, 写位置固定", 0 },
 
     { "-2026-43494", "43494 · io_uring",
       "CVE-2026-43494  io_uring + RDS",
       "页引用计数劫持, 整页替换 setuid 文件",
-      "需 IORING_REGISTER_CLONE_BUFFERS (6.12+)", 0,
-      "UAF类" },
+      "需 IORING_REGISTER_CLONE_BUFFERS (6.12+)", 0 },
 
     { "-2026-46331", "46331 · act_pedit",
       "CVE-2026-46331  net/sched act_pedit",
       "sendfile 进 loopback, pedit 改 TCP 头, 写穿页缓存",
-      "需 act_pedit + clsact + userns", 0,
-      "pedit类" },
+      "需 act_pedit + clsact + userns", 0 },
 
     { "-2026-64531", "64531 · OVS CT",
       "CVE-2026-64531  net/openvswitch CT action",
       "伪造 SET action 越界读内核内存, dst_release 递减改 cred",
-      "需 openvswitch + userns，偏移读 offset/ 配置表", 1,
-      "OVS类" },
+      "需 openvswitch + userns，偏移读 offset/ 配置表", 1 },
 };
 #define N_CHAINS ((int)(sizeof(chains) / sizeof(chains[0])))
+
+/*
+ * 侧栏类别表。单链类 (members == NULL) 点击直接切链;
+ * 多链类点击后弹窗, 让用户在同一类里挑具体漏洞。
+ */
+static const int cat_oob_members[] = { 2, 4, 5 };   /* 43500 / 46331 / 64531 */
+
+static const struct {
+    const char *name;        /* 侧栏条目 */
+    int         first;       /* 单链类: chains 下标 */
+    const int  *members;     /* 多链类: chains 下标数组 */
+    int         n;
+} side_cats[] = {
+    { "AEAD类",        0, NULL,             0 },
+    { "ESP类",         1, NULL,             0 },
+    { "UAF类",         3, NULL,             0 },
+    { "OOB/越界写类", -1, cat_oob_members, (int)(sizeof(cat_oob_members) /
+                                                 sizeof(cat_oob_members[0])) },
+};
+#define N_CATS ((int)(sizeof(side_cats) / sizeof(side_cats[0])))
 
 /* ---------------------------------------------------------------------------
  * 应用状态
@@ -3764,6 +3777,9 @@ typedef struct {
     GtkWidget *revealer;     /* 展开后的左侧任务抽屉 */
     GtkWidget *task_list;    /* 抽屉里的任务列表 (GtkListBox) */
     gboolean    side_sync;   /* 列表 <-> 下拉框同步中, 防止互相触发 */
+    GtkWidget *cve_revealer; /* 多链类别的「漏洞选择」框 (配置区上方) */
+    GtkWidget *cve_combo;
+    gulong      cve_combo_sig;
     GtkWidget *banner, *banner_lbl;
     GtkWidget *combo;
     GtkWidget *lbl_name, *lbl_desc, *lbl_need;
@@ -4565,6 +4581,76 @@ static void update_desc(App *a)
     gtk_label_set_text(GTK_LABEL(a->lbl_need), c->need);
 }
 
+/* 当前链是否属于多链类别; 是则返回成员表 */
+static const int *chain_multi_members(int chain_idx)
+{
+    int c, i;
+
+    for (c = 0; c < N_CATS; c++) {
+        if (side_cats[c].members) {
+            for (i = 0; i < side_cats[c].n; i++)
+                if (side_cats[c].members[i] == chain_idx)
+                    return side_cats[c].members;
+        }
+    }
+    return NULL;
+}
+
+/*
+ * 「漏洞选择」框 (配置区上方): 只有当前链属于多链类别 (OOB/越界写类) 时
+ * 才显示, 里面只列该类的成员漏洞。
+ */
+static void sync_cve_box(App *a)
+{
+    int idx = gtk_combo_box_get_active(GTK_COMBO_BOX(a->combo));
+    const int *m;
+    int n = 0, k, cur = -1;
+
+    if (!a->cve_revealer || !a->cve_combo)
+        return;
+
+    m = idx > 0 ? chain_multi_members(idx - 1) : NULL;
+    if (!m) {
+        gtk_revealer_set_reveal_child(GTK_REVEALER(a->cve_revealer), FALSE);
+        return;
+    }
+
+    /* 数一下成员数 (members 以 -1 结尾没有约定, 这里靠类别表查) */
+    for (n = 0; n < N_CATS; n++)
+        if (side_cats[n].members == m)
+            break;
+    if (n >= N_CATS)
+        return;
+    n = side_cats[n].n;
+
+    g_signal_handler_block(a->cve_combo, a->cve_combo_sig);
+    gtk_combo_box_text_remove_all(GTK_COMBO_BOX_TEXT(a->cve_combo));
+    for (k = 0; k < n; k++) {
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(a->cve_combo),
+                                       chains[m[k]].tag);
+        if (m[k] == idx - 1)
+            cur = k;
+    }
+    gtk_combo_box_set_active(GTK_COMBO_BOX(a->cve_combo), cur < 0 ? 0 : cur);
+    g_signal_handler_unblock(a->cve_combo, a->cve_combo_sig);
+
+    gtk_revealer_set_reveal_child(GTK_REVEALER(a->cve_revealer), TRUE);
+}
+
+/* 「漏洞选择」框里换漏洞 -> 同步主下拉框 */
+static void on_cve_combo_changed(GtkComboBox *box, gpointer data)
+{
+    App *a = data;
+    int k = gtk_combo_box_get_active(box);
+
+    if (k < 0 || k >= side_cats[N_CATS - 1].n)
+        return;
+    if (gtk_combo_box_get_active(GTK_COMBO_BOX(a->combo)) !=
+        cat_oob_members[k] + 1)
+        gtk_combo_box_set_active(GTK_COMBO_BOX(a->combo),
+                                 cat_oob_members[k] + 1);
+}
+
 static void side_select(App *a, int idx);
 
 static void on_combo_changed(GtkComboBox *box, gpointer data)
@@ -4575,6 +4661,7 @@ static void on_combo_changed(GtkComboBox *box, gpointer data)
     update_desc(a);
     /* 下拉框改了, 抽屉列表跟着选中 (side_sync 防止回环) */
     side_select(a, gtk_combo_box_get_active(GTK_COMBO_BOX(a->combo)));
+    sync_cve_box(a);
 }
 
 /* 简易提示对话框 */
@@ -5222,18 +5309,37 @@ static GtkWidget *build_actions(App *a)
 /*
  * 左上角「展开」拉开的任务抽屉。
  *
- * 纯列表版式: 每个条目是一类漏洞 (UAF类 / ESP类 / ...), 点条目等于选链,
- * 与顶部下拉框双向联动。对应链的全名放在条目 tooltip 里。
+ * 条目按漏洞类别组织 (AEAD类 / ESP类 / UAF类 / OOB/越界写类)。
+ * 单链类点击直接切链; OOB/越界写类聚合三条链, 点击后弹窗让用户挑。
+ * 列表与顶部下拉框双向联动。
  */
 #define SIDEBAR_W 268
 
-static void side_select(App *a, int idx)
+/* chains 下标 -> 侧栏行号 (0 = 全部类); 多链类选中父行 */
+static int cat_row_for_chain(int chain_idx)
+{
+    int c, i;
+
+    for (c = 0; c < N_CATS; c++) {
+        if (side_cats[c].members) {
+            for (i = 0; i < side_cats[c].n; i++)
+                if (side_cats[c].members[i] == chain_idx)
+                    return c + 1;
+        } else if (side_cats[c].first == chain_idx) {
+            return c + 1;
+        }
+    }
+    return -1;
+}
+
+static void side_select(App *a, int combo_idx)
 {
     GtkListBoxRow *row;
+    int row_idx = combo_idx > 0 ? cat_row_for_chain(combo_idx - 1) : 0;
 
-    if (!a->task_list)
+    if (!a->task_list || row_idx < 0)
         return;
-    row = gtk_list_box_get_row_at_index(GTK_LIST_BOX(a->task_list), idx);
+    row = gtk_list_box_get_row_at_index(GTK_LIST_BOX(a->task_list), row_idx);
     if (!row)
         return;
     a->side_sync = TRUE;
@@ -5244,16 +5350,38 @@ static void side_select(App *a, int idx)
 static void on_task_row_selected(GtkListBox *lb, GtkListBoxRow *row, gpointer data)
 {
     App *a = data;
-    int idx;
+    int idx, cat;
 
     (void)lb;
     if (a->side_sync || !row)
         return;
     idx = gtk_list_box_row_get_index(row);
-    if (idx < 0 || idx > N_CHAINS)
+    if (idx < 0 || idx > N_CATS)
         return;
-    if (gtk_combo_box_get_active(GTK_COMBO_BOX(a->combo)) != idx)
-        gtk_combo_box_set_active(GTK_COMBO_BOX(a->combo), idx);
+
+    if (idx == 0) {
+        gtk_combo_box_set_active(GTK_COMBO_BOX(a->combo), 0);
+        return;
+    }
+
+    cat = idx - 1;
+    if (side_cats[cat].members) {
+        /* 多链类: 当前链已在类里就保持, 否则落到位成员第一个,
+         * 具体选哪个漏洞交给配置区上方的「漏洞选择」下拉框 */
+        const int *m = side_cats[cat].members;
+        int cur = gtk_combo_box_get_active(GTK_COMBO_BOX(a->combo)) - 1;
+        int k, in = -1;
+
+        for (k = 0; k < side_cats[cat].n; k++)
+            if (m[k] == cur)
+                in = k;
+        if (in < 0)
+            gtk_combo_box_set_active(GTK_COMBO_BOX(a->combo), m[0] + 1);
+    } else if (gtk_combo_box_get_active(GTK_COMBO_BOX(a->combo)) !=
+               side_cats[cat].first + 1) {
+        gtk_combo_box_set_active(GTK_COMBO_BOX(a->combo),
+                                 side_cats[cat].first + 1);
+    }
 }
 
 static GtkWidget *build_task_sidebar(App *a)
@@ -5277,16 +5405,34 @@ static GtkWidget *build_task_sidebar(App *a)
     gtk_list_box_set_selection_mode(GTK_LIST_BOX(list), GTK_SELECTION_SINGLE);
     gtk_list_box_set_activate_on_single_click(GTK_LIST_BOX(list), TRUE);
 
-    for (i = 0; i <= N_CHAINS; i++) {
+    for (i = 0; i <= N_CATS; i++) {
         GtkWidget *row = gtk_list_box_row_new();
         GtkWidget *l = gtk_label_new(i == 0 ? "全部类 · 检查 / 自测"
-                                            : chains[i - 1].cls);
+                                            : side_cats[i - 1].name);
+        GString *tip;
 
         gtk_label_set_xalign(GTK_LABEL(l), 0.0f);
         gtk_widget_set_halign(l, GTK_ALIGN_START);
         gtk_widget_set_valign(l, GTK_ALIGN_CENTER);
-        if (i > 0)
-            gtk_widget_set_tooltip_text(row, chains[i - 1].name);
+
+        tip = g_string_new(NULL);
+        if (i == 0) {
+            g_string_assign(tip, "依次检查 / 自测 dirtychains 五链");
+        } else if (side_cats[i - 1].members) {
+            const int *m = side_cats[i - 1].members;
+            int k;
+
+            g_string_assign(tip, "包含: ");
+            for (k = 0; k < side_cats[i - 1].n; k++)
+                g_string_append_printf(tip, "%s%s", k ? " / " : "",
+                                       chains[m[k]].name);
+            g_string_append(tip, "\n在配置区上方的「漏洞选择」框里挑具体漏洞");
+        } else {
+            g_string_assign(tip, chains[side_cats[i - 1].first].name);
+        }
+        gtk_widget_set_tooltip_text(row, tip->str);
+        g_string_free(tip, TRUE);
+
         gtk_container_add(GTK_CONTAINER(row), l);
         gtk_container_add(GTK_CONTAINER(list), row);
     }
@@ -5715,6 +5861,50 @@ static void build_window(App *a)
     gtk_widget_set_vexpand(a->revealer, TRUE);
     gtk_widget_set_valign(a->revealer, GTK_ALIGN_FILL);
     gtk_container_add(GTK_CONTAINER(a->revealer), build_task_sidebar(a));
+
+    /* ── 「漏洞选择」框: 选中多链类别 (OOB/越界写类) 时才滑出 ── */
+    {
+        GtkWidget *frame = gtk_frame_new(NULL);
+        GtkWidget *inner = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+        GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+        GtkWidget *lbl = gtk_label_new(NULL);
+
+        gtk_style_context_add_class(gtk_widget_get_style_context(frame),
+                                    "card");
+        gtk_label_set_markup(GTK_LABEL(lbl), "<b>漏洞选择</b>");
+        gtk_widget_set_halign(lbl, GTK_ALIGN_START);
+        gtk_widget_set_tooltip_text(lbl, "同一类别里有多个漏洞时, 在这里挑具体用哪个");
+
+        a->cve_combo = gtk_combo_box_text_new();
+        gtk_widget_set_size_request(a->cve_combo, 240, -1);
+        gtk_widget_set_halign(a->cve_combo, GTK_ALIGN_START);
+        a->cve_combo_sig = g_signal_connect(a->cve_combo, "changed",
+                                            G_CALLBACK(on_cve_combo_changed), a);
+        gtk_box_pack_start(GTK_BOX(row), lbl, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(row), a->cve_combo, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(inner), row, FALSE, FALSE, 0);
+
+        gtk_widget_set_margin_start(inner, 10);
+        gtk_widget_set_margin_end(inner, 10);
+        gtk_widget_set_margin_top(inner, 8);
+        gtk_widget_set_margin_bottom(inner, 8);
+        gtk_container_add(GTK_CONTAINER(frame), inner);
+
+        a->cve_revealer = gtk_revealer_new();
+        gtk_revealer_set_transition_type(GTK_REVEALER(a->cve_revealer),
+                                         GTK_REVEALER_TRANSITION_TYPE_SLIDE_DOWN);
+        gtk_revealer_set_transition_duration(GTK_REVEALER(a->cve_revealer), 160);
+        gtk_revealer_set_reveal_child(GTK_REVEALER(a->cve_revealer), FALSE);
+        gtk_container_add(GTK_CONTAINER(a->cve_revealer), frame);
+    }
+    {
+        GtkWidget *cve = a->cve_revealer;
+
+        gtk_widget_set_margin_start(cve, 12);
+        gtk_widget_set_margin_end(cve, 12);
+        gtk_widget_set_margin_top(cve, 8);
+    }
+    gtk_box_pack_start(GTK_BOX(vbox), a->cve_revealer, FALSE, FALSE, 0);
 
     gtk_box_pack_start(GTK_BOX(vbox), frame_params, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(vbox), frame_actions, FALSE, FALSE, 0);
