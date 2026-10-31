@@ -18,7 +18,6 @@ GTK_LIBS   := $(shell pkg-config --libs $(PKG))
 
 PREFIX  ?= /usr/local
 BINDIR  ?= $(PREFIX)/bin
-APPDIR  ?= $(PREFIX)/share/applications
 DATADIR ?= $(PREFIX)/share/dirtychains
 
 TARGET     := dirtychains
@@ -75,7 +74,7 @@ offset-sync:
 	python3 tools/mk_offset.py --from-json krec-808.json --root offset
 
 install: $(TARGET)
-	install -d $(DESTDIR)$(BINDIR) $(DESTDIR)$(APPDIR)
+	install -d $(DESTDIR)$(BINDIR)
 	install -m 755 $(TARGET) $(DESTDIR)$(BINDIR)/$(TARGET)
 	@if [ -f $(ENGINE) ]; then \
 		install -m 755 $(ENGINE) $(DESTDIR)$(BINDIR)/$(ENGINE); \
@@ -88,7 +87,6 @@ install: $(TARGET)
 	else \
 		echo "提示: 没有 $(BGIMG)，界面使用纯色底"; \
 	fi
-	install -m 644 dirtyfrag-gui.desktop $(DESTDIR)$(APPDIR)/
 	@if [ -d offset ]; then \
 		install -d $(DESTDIR)$(DATADIR)/offset; \
 		cp -r offset/. $(DESTDIR)$(DATADIR)/offset/; \
@@ -98,7 +96,6 @@ install: $(TARGET)
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/$(TARGET)
 	rm -f $(DESTDIR)$(BINDIR)/$(ENGINE)
-	rm -f $(DESTDIR)$(APPDIR)/dirtyfrag-gui.desktop
 	rm -f $(DESTDIR)$(DATADIR)/$(BGIMG)
 	rm -rf $(DESTDIR)$(DATADIR)/offset
 

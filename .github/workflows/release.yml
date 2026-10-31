@@ -136,7 +136,7 @@ jobs:
           cp -r offset "$D/offset"
           # GUI 及其配套（背景图、桌面项）只在编出来时才放进去
           if [ -f dirtychains ]; then
-            cp dirtychains dirtyfrag-gui.desktop bg.png "$D/"
+            cp dirtychains bg.png "$D/"
           fi
 
           {
