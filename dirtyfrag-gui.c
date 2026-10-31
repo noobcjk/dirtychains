@@ -3693,7 +3693,7 @@ int ovswrap_main(int argc, char **argv)
 
 #define APP_TITLE       "DirtyChains · 页缓存提权"
 /* 构建标识: 标题栏副标题上直接显示, 用来确认跑的是不是最新这份 */
-#define DF_BUILD        "2026-10-31-r25"
+#define DF_BUILD        "2026-10-31-r26"
 #define APP_SUBTITLE    "六链 PoC 图形前端 · " DF_BUILD
 #define LOG_MAX_LINES   20000
 #define PTY_COLS        110
@@ -4096,6 +4096,33 @@ static gboolean on_bg_draw(GtkWidget *w, cairo_t *cr, gpointer data)
 /* ---------------------------------------------------------------------------
  * 日志区
  * ------------------------------------------------------------------------ */
+
+/*
+ * 兜底填色: 在控件自己的绘制之前, 先把整块画成不透明底色。
+ *
+ * GtkTextView / GtkScrolledWindow 各带一个 GdkWindow。没有合成器时, 若
+ * 样式里没有不透明背景, GTK 的默认 draw handler 不会清屏, 这块窗口就
+ * 保留 X 服务器的未定义内容 —— 表现为日志区一片黑 (root window) 或透出
+ * 桌面壁纸, 而且拖动窗口时不会自己刷新。
+ *
+ * draw 信号是 RUN_LAST, 普通 connect 排在默认 handler 之前, 所以这里填的
+ * 底色会留下, 随后默认 handler 只往上画文字/滚动条。这样即使系统主题或
+ * CSS 选择器没命中 (深色主题、精简主题、旧 GTK), 也不会露出黑块。
+ */
+static gboolean on_panel_draw(GtkWidget *w, cairo_t *cr, gpointer data)
+{
+    GdkRGBA c;
+    const char *hex = data;
+
+    (void)w;
+    if (hex && gdk_rgba_parse(&c, hex))
+        gdk_cairo_set_source_rgba(cr, &c);
+    else
+        cairo_set_source_rgb(cr, 0.984, 0.992, 1.0);
+    cairo_paint(cr);
+    return FALSE;
+}
+
 static void log_scroll_bottom(App *a)
 {
     GtkTextIter end;
@@ -7271,6 +7298,9 @@ static GtkWidget *build_log_pane(App *a)
                                    GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
     gtk_widget_set_vexpand(scroller, TRUE);
     gtk_container_add(GTK_CONTAINER(card), scroller);
+    /* 两个控件各有独立 GdkWindow, 都要自己保证底色 (见 on_panel_draw) */
+    g_signal_connect(scroller, "draw", G_CALLBACK(on_panel_draw),
+                     (gpointer)"#fbfdff");
 
     a->logview = gtk_text_view_new();
     a->logbuf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(a->logview));
@@ -7286,6 +7316,8 @@ static GtkWidget *build_log_pane(App *a)
     gtk_text_view_set_bottom_margin(GTK_TEXT_VIEW(a->logview), 6);
     gtk_widget_set_name(a->logview, "logview");
     gtk_container_add(GTK_CONTAINER(scroller), a->logview);
+    g_signal_connect(a->logview, "draw", G_CALLBACK(on_panel_draw),
+                     (gpointer)"#fbfdff");
 
     {
         GtkTextIter end;
