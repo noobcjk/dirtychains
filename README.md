@@ -1,5 +1,6 @@
 # DirtyFrag
 
+!此项目由AI编写!
 Linux 页缓存写原语 / 本地提权 PoC 合集，带一个 GTK3 图形前端和一个 Open vSwitch 独立引擎。
 
 > **免责声明**
