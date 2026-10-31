@@ -8,6 +8,8 @@
 /dirtychains
 /poc
 /ovswrap
+/rootmgr-gui
+*.cmd
 .gccver-gui
 
 # 打包与历史归档

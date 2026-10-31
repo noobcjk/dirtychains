@@ -14,7 +14,13 @@
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD  := $(shell pwd)
 
+# 两个独立模块，同一份 Makefile 里靠 ROOTMGR 切换目标。
+# 用 := 而不是 +=，否则命令行传 obj-m= 时会被这里的追加弄成两个模块。
+ifdef ROOTMGR
+obj-m := rootmgr.o
+else
 obj-m += krec_dump.o
+endif
 
 all:
 	@if [ ! -d "$(KDIR)" ]; then \
@@ -47,9 +53,9 @@ rootmgr:
 		echo "  RHEL/CentOS:   sudo dnf install kernel-devel-\$$(uname -r)"; \
 		exit 1; \
 	fi
-	$(MAKE) -C $(KDIR) M=$(PWD) obj-m=rootmgr.o modules
+	$(MAKE) -C $(KDIR) M=$(PWD) ROOTMGR=1 modules
 
 rootmgr-clean:
-	$(MAKE) -C $(KDIR) M=$(PWD) obj-m=rootmgr.o clean
+	$(MAKE) -C $(KDIR) M=$(PWD) ROOTMGR=1 clean
 
 .PHONY: all clean rootmgr rootmgr-clean

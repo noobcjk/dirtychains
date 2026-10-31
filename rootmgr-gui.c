@@ -24,6 +24,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #define PROC_PATH   "/proc/rootmgr"
@@ -341,12 +342,75 @@ static void run_priv(App *a, const char *const *argv, const char *what)
     g_free(err);
 }
 
+/* 在常见 sbin 目录里找可执行文件，PATH 里通常不含 /usr/sbin */
+static char *find_tool(const char *name)
+{
+    static const char *dirs[] = {
+        "/usr/sbin", "/sbin", "/usr/bin", "/bin",
+        "/usr/local/sbin", "/usr/local/bin"
+    };
+    size_t i;
+
+    for (i = 0; i < G_N_ELEMENTS(dirs); i++) {
+        char *p = g_build_filename(dirs[i], name, NULL);
+
+        if (g_file_test(p, G_FILE_TEST_IS_EXECUTABLE))
+            return p;
+        g_free(p);
+    }
+    return g_strdup(name);
+}
+
+/*
+ * 统一执行 insmod / rmmod。
+ *
+ * 身份为 root 时直接跑，不再套 pkexec —— 否则在没有 polkit 的机器上
+ * 会先报 "Failed to execute child process"，明明已经有权限却跑不动。
+ */
+static void do_module_op(App *a, const char *op, const char *arg)
+{
+    const char *av[6];
+    char *tool = find_tool(op);
+    char *pkexec = find_tool("pkexec");
+    char *sudo = find_tool("sudo");
+    char *what = NULL;
+    int n = 0;
+
+    if (geteuid() == 0) {
+        av[n++] = tool;
+        av[n++] = arg;
+        what = g_strdup_printf("%s %s  (root 直接执行)", op, arg);
+    } else if (g_file_test(pkexec, G_FILE_TEST_IS_EXECUTABLE)) {
+        av[n++] = pkexec;
+        av[n++] = tool;
+        av[n++] = arg;
+        what = g_strdup_printf("%s %s  (pkexec)", op, arg);
+    } else if (g_file_test(sudo, G_FILE_TEST_IS_EXECUTABLE)) {
+        av[n++] = sudo;
+        av[n++] = "-n";
+        av[n++] = tool;
+        av[n++] = arg;
+        what = g_strdup_printf("%s %s  (sudo -n)", op, arg);
+    } else {
+        log_line(a, "当前不是 root，也找不到 pkexec / sudo\n"
+                    "  可以先切到 root 再运行本程序，或在终端执行：\n"
+                    "    sudo %s %s\n", tool, arg);
+        goto out;
+    }
+    av[n] = NULL;
+
+    run_priv(a, av, what);
+
+out:
+    g_free(what);
+    g_free(tool);
+    g_free(pkexec);
+    g_free(sudo);
+}
+
 static void on_load(GtkWidget *w, gpointer data)
 {
     App *a = data;
-    const char *argv[4] = { NULL, NULL, NULL, NULL };
-    char *sudo_argv[4];
-    gboolean has_pkexec = g_file_test("/usr/bin/pkexec", G_FILE_TEST_EXISTS);
 
     (void)w;
     log_reset(a);
@@ -357,22 +421,7 @@ static void on_load(GtkWidget *w, gpointer data)
         return;
     }
 
-    if (has_pkexec) {
-        argv[0] = "pkexec";
-    } else {
-        sudo_argv[0] = "sudo";
-        sudo_argv[1] = "-n";
-        sudo_argv[2] = "insmod";
-        sudo_argv[3] = (char *)a->ko_path;
-        run_priv(a, (const char *const *)sudo_argv, "sudo -n insmod rootmgr.ko");
-        refresh_state(a);
-        refresh_procs(a);
-        return;
-    }
-
-    argv[1] = "insmod";
-    argv[2] = a->ko_path;
-    run_priv(a, argv, "pkexec insmod rootmgr.ko");
+    do_module_op(a, "insmod", a->ko_path);
 
     refresh_state(a);
     refresh_procs(a);
@@ -390,13 +439,7 @@ static void on_unload(GtkWidget *w, gpointer data)
         return;
     }
 
-    if (g_file_test("/usr/bin/pkexec", G_FILE_TEST_EXISTS)) {
-        const char *argv[] = { "pkexec", "rmmod", "rootmgr", NULL };
-        run_priv(a, argv, "pkexec rmmod rootmgr");
-    } else {
-        const char *argv[] = { "sudo", "-n", "rmmod", "rootmgr", NULL };
-        run_priv(a, argv, "sudo -n rmmod rootmgr");
-    }
+    do_module_op(a, "rmmod", "rootmgr");
 
     refresh_state(a);
     refresh_procs(a);
@@ -415,7 +458,8 @@ static void on_give(GtkWidget *w, gpointer data)
 {
     App *a = data;
     char cmd[64];
-    gboolean ok;
+    int fd;
+    ssize_t wr;
 
     (void)w;
     log_reset(a);
@@ -430,12 +474,25 @@ static void on_give(GtkWidget *w, gpointer data)
     }
 
     g_snprintf(cmd, sizeof(cmd), "give %d", a->sel_pid);
-    ok = g_file_set_contents(PROC_PATH, cmd, -1, NULL);
-    if (!ok)
-        log_line(a, "写 %s 失败: %s\n", PROC_PATH, g_strerror(errno));
-    else
-        log_line(a, "已提交: %s\n"
-                    "  到那个进程的终端里执行 id，应看到 uid=0(root)\n", cmd);
+
+    /* proc 文件不能用 g_file_set_contents: 它带 O_CREAT|O_TRUNC，procfs 会拒绝 */
+    fd = open(PROC_PATH, O_WRONLY);
+    if (fd < 0) {
+        log_line(a, "打开 %s 失败: %s\n", PROC_PATH, g_strerror(errno));
+        return;
+    }
+
+    wr = write(fd, cmd, strlen(cmd));
+    if (wr < 0 || (size_t)wr != strlen(cmd)) {
+        int e = errno;
+        close(fd);
+        log_line(a, "写 %s 失败: %s\n", PROC_PATH, g_strerror(e));
+        return;
+    }
+    close(fd);
+
+    log_line(a, "已提交: %s\n"
+                "  到那个进程的终端里执行 id，应看到 uid=0(root)\n", cmd);
 
     refresh_state(a);
 }
