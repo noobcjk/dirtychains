@@ -1,0 +1,231 @@
+name: build
+
+# 推 v* 标签 → 四架构交叉编译并发布到 Releases
+# 手动触发   → 只构建；填了 tag 才发布
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "发布到哪个 tag（如 v1.6）。留空则只构建，产物只在 Actions 页面"
+        required: false
+        default: ""
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 矩阵：ubuntu-22.04 runner（x86_64）上交叉编译出四个架构
+  #   x86_64  原生 gcc        GUI + 命令行（GUI 需要 GTK3 开发包，只有这一项有）
+  #   x86     gcc-i686-linux-gnu        命令行
+  #   aarch64 gcc-aarch64-linux-gnu     命令行
+  #   armhf   gcc-arm-linux-gnueabihf   命令行
+  # 命令行两个二进制（poc / ovswrap）静态链接，不挑目标机 glibc；
+  # GUI 必须动态链 GTK3，所以只在 x86_64 上出。
+  # ---------------------------------------------------------------------------
+  build:
+    name: ${{ matrix.arch }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            cc: gcc
+            pkgs: ""
+            gui: true
+          - arch: x86
+            cc: i686-linux-gnu-gcc
+            pkgs: "gcc-i686-linux-gnu libc6-dev-i386-cross linux-libc-dev-i386-cross"
+            gui: false
+          - arch: aarch64
+            cc: aarch64-linux-gnu-gcc
+            pkgs: "gcc-aarch64-linux-gnu libc6-dev-arm64-cross linux-libc-dev-arm64-cross"
+            gui: false
+          - arch: armhf
+            cc: arm-linux-gnueabihf-gcc
+            pkgs: "gcc-arm-linux-gnueabihf libc6-dev-armhf-cross linux-libc-dev-armhf-cross"
+            gui: false
+    steps:
+      - name: 取源码
+        uses: actions/checkout@v4
+
+      - name: 计算版本号
+        id: ver
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            v="${GITHUB_REF_NAME#v}"
+          elif [ -n "$INPUT_TAG" ]; then
+            v="${INPUT_TAG#v}"
+          else
+            v="dev-$(date -u +%Y%m%d)-${GITHUB_SHA:0:7}"
+          fi
+          echo "ver=$v" >> "$GITHUB_OUTPUT"
+          echo "版本：$v"
+
+      - name: 装工具链
+        env:
+          PKGS: ${{ matrix.pkgs }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends file
+          # 逐个装：某些发行版镜像里个别 -cross 包名可能不存在，缺一个不影响其余
+          for p in $PKGS; do
+            echo "::group::apt install $p"
+            sudo apt-get install -y --no-install-recommends "$p" \
+              || echo "::warning::装不上 $p，编译时如果缺头文件会直接报错"
+            echo "::endgroup::"
+          done
+          "${{ matrix.cc }}" --version | head -1
+
+      - name: 交叉编译命令行版
+        env:
+          CC: ${{ matrix.cc }}
+        run: |
+          set -euo pipefail
+          # -static -no-pie：目标机不需要对应 glibc，老内核也能加载
+          # _FILE_OFFSET_BITS=64：32 位构建下让 off_t 与 splice() 的 loff_t* 对齐
+          CFLAGS="-O2 -Wall -Wextra -static -no-pie -D_FILE_OFFSET_BITS=64"
+          make -s clean
+          make CC="$CC" CFLAGS="$CFLAGS" poc
+          make CC="$CC" CFLAGS="$CFLAGS" ovswrap
+          file poc ovswrap
+
+      - name: 编译 GTK3 前端
+        if: matrix.gui
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libgtk-3-dev pkg-config
+          make dirtyfrag-gui
+          file dirtyfrag-gui
+
+      - name: 打包
+        env:
+          VER: ${{ steps.ver.outputs.ver }}
+          ARCH: ${{ matrix.arch }}
+          CC: ${{ matrix.cc }}
+        run: |
+          set -euo pipefail
+          NAME="dirtyfrag-${VER}-${ARCH}"
+          D="pkg/${NAME}"
+          mkdir -p "$D"
+
+          cp poc ovswrap "$D/"
+          cp README.md LICENSE "$D/"
+          cp -r offset "$D/offset"
+          # GUI 及其配套（背景图、桌面项）只在编出来时才放进去
+          if [ -f dirtyfrag-gui ]; then
+            cp dirtyfrag-gui dirtyfrag-gui.desktop bg.png "$D/"
+          fi
+
+          {
+            echo "DirtyFrag ${VER}"
+            echo "架构     : ${ARCH}"
+            echo "编译器   : $("$CC" --version | head -1)"
+            echo "提交     : ${GITHUB_SHA}"
+            echo "构建时间 : $(date -u +%FT%TZ)"
+            echo "链接方式 : poc / ovswrap 静态链接（不依赖目标机 glibc）"
+            if [ -f "$D/dirtyfrag-gui" ]; then
+              echo "           dirtyfrag-gui 动态链接 GTK3"
+            fi
+            echo
+            echo "顶层内容 :"
+            ls -1 "$D" | grep -v '^BUILD.txt$'
+          } > "$D/BUILD.txt"
+
+          tar -C pkg -czf "pkg/${NAME}.tar.gz" "${NAME}"
+          rm -rf "$D"
+          ls -lh pkg/*.tar.gz
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: dirtyfrag-${{ matrix.arch }}
+          path: pkg/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # 汇总四个包，算校验和，挂到 Release
+  # ---------------------------------------------------------------------------
+  release:
+    name: 发布
+    needs: build
+    if: >-
+      startsWith(github.ref, 'refs/tags/') ||
+      (github.event_name == 'workflow_dispatch' && inputs.tag != '')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: 取回全部产物
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 生成校验和
+        run: |
+          cd dist
+          ls -lh
+          sha256sum *.tar.gz | tee SHA256SUMS.txt
+
+      - name: 确定 tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            t="$GITHUB_REF_NAME"
+          else
+            t="$INPUT_TAG"
+          fi
+          echo "tag=$t" >> "$GITHUB_OUTPUT"
+          echo "发布到 $t"
+
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: DirtyFrag ${{ steps.tag.outputs.tag }}
+          generate_release_notes: true
+          body: |
+            ## 预编译包
+
+            | 包 | 架构 | 内容 |
+            |---|---|---|
+            | `dirtyfrag-*-x86_64.tar.gz` | x86_64 | `dirtyfrag-gui` + `poc` + `ovswrap` |
+            | `dirtyfrag-*-x86.tar.gz` | i686 | `poc` + `ovswrap` |
+            | `dirtyfrag-*-aarch64.tar.gz` | ARM64 | `poc` + `ovswrap` |
+            | `dirtyfrag-*-armhf.tar.gz` | ARMv7 硬浮点 | `poc` + `ovswrap` |
+
+            `poc` 与 `ovswrap` 是 `-static -no-pie` 静态链接，拷到目标机直接跑，
+            不挑 glibc 版本；`dirtyfrag-gui` 需要 GTK3（Ubuntu 22.04 上
+            `apt install libgtk-3-dev` 即可自行编译）。
+
+            每个包内都有 `offset/`（740 个内核 release 的偏移表），程序运行时按
+            `<exe目录>/offset` → `./offset` → `/usr/share/dirtyfrag/offset` 的顺序查找。
+            换内核不用重编，往 `offset/<N>系/<uname -r>/target.h` 加文件即可。
+
+            ```bash
+            tar xzf dirtyfrag-*-x86_64.tar.gz
+            cd dirtyfrag-*-x86_64
+            ./poc -h          # 六链命令行版
+            ./ovswrap -h      # CVE-2026-64531 单独实现
+            ./dirtyfrag-gui   # 图形界面
+            ```
+
+            校验：`sha256sum -c SHA256SUMS.txt`
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS.txt

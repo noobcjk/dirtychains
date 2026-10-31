@@ -64,6 +64,37 @@ make kmod            # 需要目标机的 linux-headers-$(uname -r)
 
 ---
 
+## 预编译包
+
+推一个 `v*` 标签，GitHub Actions 会在 `ubuntu-22.04` 上交叉编译四个架构并挂到 Releases：
+
+```bash
+git tag v1.6
+git push origin v1.6
+```
+
+| 包 | 架构 | 交叉编译器 | 内容 |
+|---|---|---|---|
+| `dirtyfrag-<ver>-x86_64.tar.gz` | x86_64 | `gcc` | `dirtyfrag-gui` + `poc` + `ovswrap` |
+| `dirtyfrag-<ver>-x86.tar.gz` | i686 | `gcc-i686-linux-gnu` | `poc` + `ovswrap` |
+| `dirtyfrag-<ver>-aarch64.tar.gz` | ARM64 | `gcc-aarch64-linux-gnu` | `poc` + `ovswrap` |
+| `dirtyfrag-<ver>-armhf.tar.gz` | ARMv7 硬浮点 | `gcc-arm-linux-gnueabihf` | `poc` + `ovswrap` |
+
+- `poc` / `ovswrap` 用 `-static -no-pie` 静态链接，目标机不需要对应版本的 glibc，老内核也能加载
+- `dirtyfrag-gui` 必须动态链 GTK3，交叉编译要拉整条 arm64 桌面栈，所以只在 x86_64 包里提供
+- 每个包都带 `offset/`（740 个 release 的表）和 `BUILD.txt`（编译器、提交、构建时间）
+
+在 Actions 页面也能手动触发（`workflow_dispatch`）：填 tag 就发布到 Releases，留空只构建、
+产物留在 workflow 的 Artifacts 里。工作流在 `.github/workflows/release.yml`。
+
+本地想自己交叉编译命令行版，和 CI 用同一条命令：
+
+```bash
+make CC=aarch64-linux-gnu-gcc CFLAGS="-O2 -Wall -static -no-pie -D_FILE_OFFSET_BITS=64" poc
+```
+
+---
+
 ## 使用
 
 ### GUI
@@ -172,6 +203,8 @@ python3 tools/mk_offset.py rec.json --root offset    # 直接写成 offset/<N>�
 ├── tools/
 │   ├── mk_offset.py         把记录写成 offset/<N>系/<release>/target.h
 │   └── kmod/krec_dump.c     没 BTF 时用内核模块直接读偏移
+├── .github/workflows/
+│   └── release.yml          四架构交叉编译 + 发布到 Releases
 └── Makefile
 ```
 

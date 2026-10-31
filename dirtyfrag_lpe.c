@@ -1,4 +1,10 @@
 #define _GNU_SOURCE
+/* 32 位构建时 off_t 默认是 32 位，而 splice() 的参数是 loff_t*（64 位）。
+ * 不统一的话编译器只会给个 incompatible-pointer 警告，运行时内核往 4 字节
+ * 变量里写 8 字节，会踩坏相邻栈变量。这里统一成 64 位，64 位平台本来如此。 */
+#ifndef _FILE_OFFSET_BITS
+#define _FILE_OFFSET_BITS 64
+#endif
 #include <dirent.h>
 #include <elf.h>
 #include <limits.h>
