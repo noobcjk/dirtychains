@@ -3693,7 +3693,7 @@ int ovswrap_main(int argc, char **argv)
 
 #define APP_TITLE       "DirtyChains · 页缓存提权"
 /* 构建标识: 标题栏副标题上直接显示, 用来确认跑的是不是最新这份 */
-#define DF_BUILD        "2026-10-31-r20"
+#define DF_BUILD        "2026-10-31-r22"
 #define APP_SUBTITLE    "六链 PoC 图形前端 · " DF_BUILD
 #define LOG_MAX_LINES   20000
 #define PTY_COLS        110
@@ -5196,9 +5196,14 @@ typedef struct {
     App        *a;
     GtkWidget  *dlg;
     GtkWidget  *list;       /* GtkListBox */
+    GtkWidget  *search;     /* 过滤输入框 */
     GPtrArray  *names;      /* 配置名 = target.h 上一级目录名 */
+    GPtrArray  *rows;       /* 与 names 平行的行 widget */
+    GPtrArray  *nos;        /* 与 names 平行的序号 label */
     char       *sel;        /* 当前选中的名字 */
 } PickCtx;
+
+static void pick_apply_filter(PickCtx *c);
 
 /* offset/ 目录里找 target.h: 名字取它上一级目录名, 去重后收集 */
 static void scan_target_hs(const char *base, int depth, GPtrArray *out)
@@ -5276,6 +5281,8 @@ static void pick_reload(PickCtx *c)
     g_list_free(children);
 
     g_ptr_array_set_size(c->names, 0);
+    g_ptr_array_set_size(c->rows, 0);
+    g_ptr_array_set_size(c->nos, 0);
     g_free(c->sel);
     c->sel = NULL;
 
@@ -5308,8 +5315,68 @@ static void pick_reload(PickCtx *c)
         gtk_widget_set_margin_bottom(h, 3);
         gtk_container_add(GTK_CONTAINER(row), h);
         gtk_container_add(GTK_CONTAINER(c->list), row);
+
+        g_ptr_array_add(c->rows, row);
+        g_ptr_array_add(c->nos, no);
     }
+    /* 先让新行进入"已显示"状态, 再按关键字过滤隐藏 */
     gtk_widget_show_all(c->list);
+    if (c->search)
+        pick_apply_filter(c);
+}
+
+/*
+ * 过滤: 关键字(不分大小写)匹配配置名, 只显示命中行;
+ * 显示出来的行按 1..N 重新编号。清空关键字恢复全量。
+ */
+static void pick_apply_filter(PickCtx *c)
+{
+    const char *raw = gtk_entry_get_text(GTK_ENTRY(c->search));
+    char *q = g_ascii_strdown(raw, -1);
+    guint i;
+    int seq = 0;
+    gboolean sel_hit = FALSE;
+
+    for (i = 0; i < c->names->len; i++) {
+        const char *nm = g_ptr_array_index(c->names, i);
+        char *ln = g_ascii_strdown(nm, -1);
+        gboolean hit = (*q == '\0') || strstr(ln, q) != NULL;
+        GtkWidget *row = g_ptr_array_index(c->rows, i);
+        char buf[16];
+
+        gtk_widget_set_visible(row, hit);
+        if (hit) {
+            g_snprintf(buf, sizeof(buf), "%d", ++seq);
+            gtk_label_set_text(GTK_LABEL(g_ptr_array_index(c->nos, i)), buf);
+            if (c->sel && !strcmp(nm, c->sel))
+                sel_hit = TRUE;
+        }
+        g_free(ln);
+    }
+    g_free(q);
+
+    /* 选中项被过滤掉了: 取消选中, 免得确认到看不见的项 */
+    if (c->sel && !sel_hit) {
+        g_free(c->sel);
+        c->sel = NULL;
+        gtk_list_box_unselect_all(GTK_LIST_BOX(c->list));
+    }
+}
+
+static void on_pick_search_changed(GtkEditable *ed, gpointer data)
+{
+    (void)ed;
+    pick_apply_filter(data);
+}
+
+/* 输入框右侧的小叉: 一键清空关键字 */
+static void on_pick_search_clear(GtkEntry *e, GtkEntryIconPosition pos,
+                                 GdkEventButton *ev, gpointer data)
+{
+    (void)ev;
+    (void)data;
+    if (pos == GTK_ENTRY_ICON_SECONDARY)
+        gtk_entry_set_text(e, "");
 }
 
 static void pick_free(PickCtx *c)
@@ -5319,6 +5386,8 @@ static void pick_free(PickCtx *c)
     for (i = 0; i < c->names->len; i++)
         g_free(g_ptr_array_index(c->names, i));
     g_ptr_array_free(c->names, TRUE);
+    g_ptr_array_free(c->rows, TRUE);   /* 行 widget 随窗口销毁, 只放数组 */
+    g_ptr_array_free(c->nos, TRUE);
     g_free(c->sel);
 }
 
@@ -5359,7 +5428,16 @@ static char *ask_name(GtkWidget *parent, const char *prefill)
 
 static void pick_confirm(PickCtx *c)
 {
-    if (c->sel) {
+    if (!c->sel) {
+        /* 没选任何一项: 留在窗口里, 到主窗口给个提示 */
+        gtk_label_set_text(GTK_LABEL(c->a->status_lbl),
+                           "请先在列表里选一项 target.h");
+        gtk_widget_set_name(c->a->status_lbl, "status-warn");
+        log_append_plain(c->a, "[!] 未选择 target.h：请在列表中点选一项后再确认。\n");
+        log_flush(c->a);
+        return;
+    }
+    {
         gtk_entry_set_text(GTK_ENTRY(c->a->entry_krec), c->sel);
         gtk_label_set_text(GTK_LABEL(c->a->status_lbl), "已选择 offset 表");
         gtk_widget_set_name(c->a->status_lbl, "status-ok");
@@ -5446,7 +5524,8 @@ static void on_pick_import(GtkWidget *w, gpointer data)
                     g_snprintf(msg, sizeof(msg),
                                "\033[32m[+] 已导入配置表 %s (%ld 字节)。\033[0m\n",
                                path, (long)strlen(content));
-                    log_append_plain(c->a, msg);
+                    log_flush(c->a);
+                    ansi_feed(c->a, msg, strlen(msg));
                     log_flush(c->a);
                 } else {
                     log_append_plain(c->a, "[!] 写入 offset/ 失败。\n");
@@ -5481,18 +5560,6 @@ static void on_pick_import(GtkWidget *w, gpointer data)
     }
 }
 
-static void on_pick_response(GtkDialog *dlg, gint resp, gpointer data)
-{
-    PickCtx *c = data;
-
-    (void)dlg;
-    if (resp == GTK_RESPONSE_OK)
-        pick_confirm(c);
-    else if (resp == GTK_RESPONSE_NONE + 1)
-        on_pick_import(NULL, c);
-    /* 其余 (删除窗口事件) 直接关 */
-}
-
 /* 弹窗销毁时释放上下文 (ctx 是静态的, 关掉后再点按钮会重建) */
 static void pick_dlg_destroy(GtkWidget *w, gpointer data)
 {
@@ -5504,13 +5571,48 @@ static void pick_dlg_destroy(GtkWidget *w, gpointer data)
     c->list = NULL;
 }
 
-/* 「选择 offset」: 开窗口遍历程序目录下的 offset/, 名字用 target.h
- * 上一级目录名; 确认后把名字填进内核版本框 (OVS 链的 -krec)。 */
+static void on_pick_confirm_btn(GtkWidget *w, gpointer data)
+{
+    (void)w;
+    pick_confirm(data);
+}
+
+/* Esc 关窗 */
+static gboolean on_pick_key(GtkWidget *w, GdkEventKey *ev, gpointer data)
+{
+    PickCtx *c = data;
+
+    (void)w;
+    if (ev->keyval == GDK_KEY_Escape) {
+        gtk_widget_destroy(c->dlg);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/* 无边框窗口: 按住标题行拖动 */
+static gboolean on_pick_drag(GtkWidget *w, GdkEventButton *ev, gpointer data)
+{
+    PickCtx *c = data;
+
+    (void)w;
+    if (ev->button != 1)
+        return FALSE;
+    gtk_window_begin_move_drag(GTK_WINDOW(c->dlg), (gint)ev->button,
+                               (gint)ev->x_root, (gint)ev->y_root, ev->time);
+    return TRUE;
+}
+
+/*
+ * 「选择 offset」: 圆角卡片窗口, 遍历程序目录下的 offset/,
+ * 名字用 target.h 上一级目录名; 确认后把名字填进内核版本框 (-krec)。
+ * 窗口本身透明 + RGBA visual, 圆角由 #pickinner 卡片画出。
+ */
 static void act_pick_offset(GtkWidget *w, gpointer data)
 {
     App *a = data;
     static PickCtx ctx;
-    GtkWidget *box, *lbl, *scroller;
+    GtkWidget *lbl, *scroller, *btns, *inner;
 
     (void)w;
     if (ctx.dlg) {   /* 已经开着, 提到前台即可 */
@@ -5520,22 +5622,87 @@ static void act_pick_offset(GtkWidget *w, gpointer data)
 
     ctx.a = a;
     ctx.names = g_ptr_array_new();
+    ctx.rows = g_ptr_array_new();
+    ctx.nos = g_ptr_array_new();
     ctx.sel = NULL;
 
-    ctx.dlg = gtk_dialog_new();
+    ctx.dlg = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(ctx.dlg), "请选择 target.h");
     gtk_window_set_transient_for(GTK_WINDOW(ctx.dlg), GTK_WINDOW(a->window));
     gtk_window_set_modal(GTK_WINDOW(ctx.dlg), TRUE);
-    gtk_window_set_default_size(GTK_WINDOW(ctx.dlg), 380, 430);
+    gtk_window_set_default_size(GTK_WINDOW(ctx.dlg), 390, 460);
+    gtk_window_set_resizable(GTK_WINDOW(ctx.dlg), FALSE);
+    /* 去掉系统边框: 圆角完全由 #pickinner 卡片呈现 */
+    gtk_window_set_decorated(GTK_WINDOW(ctx.dlg), FALSE);
+    g_signal_connect(ctx.dlg, "key-press-event", G_CALLBACK(on_pick_key), &ctx);
     g_signal_connect(ctx.dlg, "destroy", G_CALLBACK(pick_dlg_destroy), &ctx);
 
-    box = gtk_dialog_get_content_area(GTK_DIALOG(ctx.dlg));
-    gtk_container_set_border_width(GTK_CONTAINER(box), 10);
+    {
+        GdkScreen *scr = gtk_widget_get_screen(ctx.dlg);
+        GdkVisual *vis = gdk_screen_get_rgba_visual(scr);
+
+        if (vis)
+            gtk_widget_set_visual(ctx.dlg, vis);
+    }
+    gtk_widget_set_app_paintable(ctx.dlg, TRUE);
+    gtk_widget_set_name(ctx.dlg, "pickdlg");
+
+    /* 圆角卡片本体 */
+    inner = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_name(inner, "pickinner");
+    gtk_widget_set_margin_top(inner, 12);
+    gtk_widget_set_margin_bottom(inner, 12);
+    gtk_widget_set_margin_start(inner, 12);
+    gtk_widget_set_margin_end(inner, 12);
+    gtk_container_add(GTK_CONTAINER(ctx.dlg), inner);
 
     lbl = gtk_label_new(NULL);
     gtk_label_set_markup(GTK_LABEL(lbl), "<b>请选择 target.h</b>");
     gtk_widget_set_halign(lbl, GTK_ALIGN_CENTER);
-    gtk_box_pack_start(GTK_BOX(box), lbl, FALSE, FALSE, 6);
+
+    /* 标题行: 标题居中, 右上角圆形关闭; 整行可拖动窗口 */
+    {
+        GtkWidget *head = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+        GtkWidget *sp = gtk_label_new("");
+        GtkWidget *x = gtk_button_new();
+
+        gtk_widget_set_size_request(sp, 26, -1);
+        gtk_box_pack_start(GTK_BOX(head), sp, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(head), lbl, TRUE, TRUE, 0);
+
+        gtk_widget_set_name(x, "pickclose");
+        gtk_button_set_relief(GTK_BUTTON(x), GTK_RELIEF_NONE);
+        gtk_widget_set_valign(x, GTK_ALIGN_CENTER);
+        gtk_widget_set_tooltip_text(x, "关闭 (Esc)");
+        gtk_container_add(GTK_CONTAINER(x),
+                          gtk_image_new_from_icon_name("window-close-symbolic",
+                                                       GTK_ICON_SIZE_MENU));
+        g_signal_connect_swapped(x, "clicked", G_CALLBACK(gtk_widget_destroy),
+                                 ctx.dlg);
+        gtk_box_pack_end(GTK_BOX(head), x, FALSE, FALSE, 0);
+
+        gtk_widget_add_events(head, GDK_BUTTON_PRESS_MASK);
+        g_signal_connect(head, "button-press-event",
+                         G_CALLBACK(on_pick_drag), &ctx);
+        gtk_box_pack_start(GTK_BOX(inner), head, FALSE, FALSE, 2);
+    }
+
+    /* 过滤框: 实时按关键字过滤并重新编号 */
+    ctx.search = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(ctx.search),
+                                   "过滤：输入版本号关键字，如 6.6");
+    gtk_entry_set_icon_from_icon_name(GTK_ENTRY(ctx.search),
+                                      GTK_ENTRY_ICON_PRIMARY,
+                                      "edit-find-symbolic");
+    gtk_entry_set_icon_from_icon_name(GTK_ENTRY(ctx.search),
+                                      GTK_ENTRY_ICON_SECONDARY,
+                                      "edit-clear-symbolic");
+    gtk_widget_set_name(ctx.search, "picksearch");
+    g_signal_connect(ctx.search, "changed",
+                     G_CALLBACK(on_pick_search_changed), &ctx);
+    g_signal_connect(ctx.search, "icon-press",
+                     G_CALLBACK(on_pick_search_clear), &ctx);
+    gtk_box_pack_start(GTK_BOX(inner), ctx.search, FALSE, FALSE, 0);
 
     scroller = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroller),
@@ -5550,16 +5717,46 @@ static void act_pick_offset(GtkWidget *w, gpointer data)
     g_signal_connect(ctx.list, "row-activated",
                      G_CALLBACK(on_pick_row_activated), &ctx);
     gtk_container_add(GTK_CONTAINER(scroller), ctx.list);
-    gtk_box_pack_start(GTK_BOX(box), scroller, TRUE, TRUE, 4);
+    gtk_widget_set_name(scroller, "pickscroll");
+    gtk_box_pack_start(GTK_BOX(inner), scroller, TRUE, TRUE, 0);
 
-    /* 双击条目 = 确认; 下面两个按钮: 导入自定义 / 确认 */
-    gtk_dialog_add_button(GTK_DIALOG(ctx.dlg), "导入自定义 target.h",
-                          GTK_RESPONSE_NONE + 1);
-    gtk_dialog_add_button(GTK_DIALOG(ctx.dlg), "确认", GTK_RESPONSE_OK);
-    g_signal_connect(ctx.dlg, "response", G_CALLBACK(on_pick_response), &ctx);
+    /* 底部两个按钮: 导入自定义 / 确认 (双击条目 = 确认) */
+    btns = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    gtk_widget_set_halign(btns, GTK_ALIGN_CENTER);
+
+    gtk_box_pack_start(GTK_BOX(btns),
+                       gtk_label_new(""), FALSE, FALSE, 0);
+    {
+        GtkWidget *b = gtk_button_new_with_label("导入自定义 target.h");
+
+        g_signal_connect(b, "clicked", G_CALLBACK(on_pick_import), &ctx);
+        gtk_box_pack_start(GTK_BOX(btns), b, FALSE, FALSE, 0);
+    }
+    {
+        GtkWidget *b = gtk_button_new_with_label("确认");
+
+        gtk_widget_set_name(b, "pickok");
+        g_signal_connect(b, "clicked", G_CALLBACK(on_pick_confirm_btn), &ctx);
+        gtk_box_pack_start(GTK_BOX(btns), b, FALSE, FALSE, 0);
+    }
+    gtk_box_pack_start(GTK_BOX(inner), btns, FALSE, FALSE, 2);
 
     pick_reload(&ctx);
     gtk_widget_show_all(ctx.dlg);
+
+    /* 居中到主窗口 (无窗口管理器时也能摆正) */
+    {
+        GdkWindow *pw = gtk_widget_get_window(a->window);
+
+        if (pw) {
+            gint px = 0, py = 0;
+
+            gdk_window_get_origin(pw, &px, &py);
+            gtk_window_move(GTK_WINDOW(ctx.dlg),
+                            px + (gdk_window_get_width(pw) - 390) / 2,
+                            py + (gdk_window_get_height(pw) - 460) / 2);
+        }
+    }
 }
 
 static void on_toggle_expand(GtkWidget *w, gpointer data)
@@ -5792,6 +5989,42 @@ static void install_css(void)
         "#mainwin #title-name  { color: #1b3a57; }\n"
         "#mainwin #hint { color: #5f7d99; font-size: 9pt; }\n"
         "dialog #pickno { color: #8a97a5; }\n"
+        "/* 「选择 offset」弹窗: 透明窗口 + 圆角卡片 + 过滤框 */\n"
+        "#pickdlg { background-color: transparent; }\n"
+        "#pickinner {\n"
+        "  background-color: #f8fbff;\n"
+        "  border: 1px solid #c9d9ea;\n"
+        "  border-radius: 16px;\n"
+        "}\n"
+        "#picksearch {\n"
+        "  background-color: #ffffff;\n"
+        "  border: 1px solid #c5d5e4;\n"
+        "  border-radius: 14px;\n"
+        "  padding: 4px 10px;\n"
+        "}\n"
+        "#picksearch:focus { border-color: #7fb3e3; }\n"
+        "#pickclose {\n"
+        "  background-image: none;\n"
+        "  background-color: transparent;\n"
+        "  border: none;\n"
+        "  box-shadow: none;\n"
+        "  border-radius: 100px;\n"
+        "  padding: 2px;\n"
+        "  min-width: 22px;\n"
+        "  min-height: 22px;\n"
+        "  color: #6b8099;\n"
+        "}\n"
+        "#pickclose:hover { background-color: #e8eff7; }\n"
+        "#pickok {\n"
+        "  background-image: none;\n"
+        "  background-color: #2f7fd0;\n"
+        "  color: #ffffff;\n"
+        "  border: 1px solid #2a72bc;\n"
+        "  border-radius: 8px;\n"
+        "  padding: 5px 18px;\n"
+        "}\n"
+        "#pickok:hover { background-color: #3a8ade; }\n"
+        "#pickscroll, #pickscroll viewport { background-color: transparent; }\n"
         "#mainwin #banner-warn {\n"
         "  background-color: #fdecea;\n"
         "  color: #9c1c16;\n"
