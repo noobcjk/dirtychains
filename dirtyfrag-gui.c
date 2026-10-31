@@ -3693,7 +3693,7 @@ int ovswrap_main(int argc, char **argv)
 
 #define APP_TITLE       "DirtyChains · 页缓存提权"
 /* 构建标识: 标题栏副标题上直接显示, 用来确认跑的是不是最新这份 */
-#define DF_BUILD        "2026-10-31-r19"
+#define DF_BUILD        "2026-10-31-r20"
 #define APP_SUBTITLE    "六链 PoC 图形前端 · " DF_BUILD
 #define LOG_MAX_LINES   20000
 #define PTY_COLS        110
@@ -3797,6 +3797,7 @@ typedef struct {
     GtkWidget *entry_target, *entry_to, *entry_set, *entry_offset;
     GtkWidget *entry_krec;   /* OVS 链: 指定内核版本匹配 offset/ 表 */
     GtkWidget *btn_vmlinux;  /* OVS 链: 解析 vmlinux (pahole/BTF 推导偏移) */
+    GtkWidget *btn_pick_offset; /* OVS 链: 浏览 offset/ 里已有的 target.h */
     /* 参数面板各行的标签/按钮, 便于按所选 CVE 显隐 */
     GtkWidget *lbl_t, *browse_t;
     GtkWidget *lbl_to, *browse_to;
@@ -4735,6 +4736,7 @@ static void sync_params_ui(App *a)
     gtk_widget_set_visible(a->lbl_krec,  all ? FALSE : c->engine == 1);
     gtk_widget_set_visible(a->entry_krec, all ? FALSE : c->engine == 1);
     gtk_widget_set_visible(a->btn_vmlinux, all ? FALSE : c->engine == 1);
+    gtk_widget_set_visible(a->btn_pick_offset, all ? FALSE : c->engine == 1);
 
     if (!all) {
         /* 占位提示随链微调 */
@@ -5188,6 +5190,378 @@ static void act_vmlinux(GtkWidget *w, gpointer data)
     g_free(err2);
 }
 
+/* ===================== 「选择 offset」窗口 ===================== */
+
+typedef struct {
+    App        *a;
+    GtkWidget  *dlg;
+    GtkWidget  *list;       /* GtkListBox */
+    GPtrArray  *names;      /* 配置名 = target.h 上一级目录名 */
+    char       *sel;        /* 当前选中的名字 */
+} PickCtx;
+
+/* offset/ 目录里找 target.h: 名字取它上一级目录名, 去重后收集 */
+static void scan_target_hs(const char *base, int depth, GPtrArray *out)
+{
+    GDir *d = g_dir_open(base, 0, NULL);
+    const char *e;
+
+    if (!d)
+        return;
+    while ((e = g_dir_read_name(d)) != NULL) {
+        char path[760];
+
+        if (e[0] == '.')
+            continue;
+        g_snprintf(path, sizeof(path), "%s/%s", base, e);
+        if (g_file_test(path, G_FILE_TEST_IS_DIR)) {
+            if (depth < 3)
+                scan_target_hs(path, depth + 1, out);
+        } else if (!strcmp(e, "target.h")) {
+            char *dir = g_path_get_dirname(path);
+            char *name = g_path_get_basename(dir);
+            guint i;
+            gboolean dup = FALSE;
+
+            for (i = 0; i < out->len; i++)
+                if (!strcmp(g_ptr_array_index(out, i), name)) {
+                    dup = TRUE;
+                    break;
+                }
+            if (!dup)
+                g_ptr_array_add(out, g_strdup(name));
+            g_free(dir);
+            g_free(name);
+        }
+    }
+    g_dir_close(d);
+}
+
+static int pick_cmp(gconstpointer pa, gconstpointer pb)
+{
+    const char *a = *(const char *const *)pa;
+    const char *b = *(const char *const *)pb;
+
+    return strcmp(a, b);
+}
+
+/* 取程序目录下的 offset/; 找不到返回 FALSE */
+static gboolean ovs_offset_dir(char *out, size_t n)
+{
+    char exe[512], exdir[512];
+    ssize_t rl = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    char *slash;
+
+    if (rl <= 0)
+        return FALSE;
+    exe[rl] = '\0';
+    g_strlcpy(exdir, exe, sizeof(exdir));
+    slash = strrchr(exdir, '/');
+    if (!slash)
+        return FALSE;
+    *slash = '\0';
+    g_snprintf(out, n, "%s/offset", exdir);
+    return TRUE;
+}
+
+static void pick_reload(PickCtx *c)
+{
+    GList *children, *it;
+    guint i;
+
+    /* 清空旧行 */
+    children = gtk_container_get_children(GTK_CONTAINER(c->list));
+    for (it = children; it; it = it->next)
+        gtk_widget_destroy(GTK_WIDGET(it->data));
+    g_list_free(children);
+
+    g_ptr_array_set_size(c->names, 0);
+    g_free(c->sel);
+    c->sel = NULL;
+
+    {
+        char offdir[600];
+
+        if (ovs_offset_dir(offdir, sizeof(offdir)))
+            scan_target_hs(offdir, 0, c->names);
+    }
+    g_ptr_array_sort(c->names, pick_cmp);
+
+    for (i = 0; i < c->names->len; i++) {
+        GtkWidget *row = gtk_list_box_row_new();
+        GtkWidget *h = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+        GtkWidget *no = gtk_label_new(NULL);
+        GtkWidget *nm = gtk_label_new(g_ptr_array_index(c->names, i));
+        char buf[16];
+
+        g_snprintf(buf, sizeof(buf), "%u", i + 1);
+        gtk_label_set_text(GTK_LABEL(no), buf);
+        gtk_widget_set_size_request(no, 30, -1);
+        gtk_widget_set_halign(no, GTK_ALIGN_END);
+        gtk_widget_set_name(no, "pickno");
+
+        gtk_widget_set_halign(nm, GTK_ALIGN_START);
+        gtk_box_pack_start(GTK_BOX(h), no, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(h), nm, FALSE, FALSE, 0);
+        gtk_widget_set_margin_start(h, 12);
+        gtk_widget_set_margin_top(h, 3);
+        gtk_widget_set_margin_bottom(h, 3);
+        gtk_container_add(GTK_CONTAINER(row), h);
+        gtk_container_add(GTK_CONTAINER(c->list), row);
+    }
+    gtk_widget_show_all(c->list);
+}
+
+static void pick_free(PickCtx *c)
+{
+    guint i;
+
+    for (i = 0; i < c->names->len; i++)
+        g_free(g_ptr_array_index(c->names, i));
+    g_ptr_array_free(c->names, TRUE);
+    g_free(c->sel);
+}
+
+/* 弹一个小输入框问配置名, 返回堆上的字符串 (调用者负责释放) 或 NULL */
+static char *ask_name(GtkWidget *parent, const char *prefill)
+{
+    GtkWidget *dlg = gtk_dialog_new_with_buttons("配置名",
+                      GTK_WINDOW(parent),
+                      GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+                      "取消", GTK_RESPONSE_CANCEL,
+                      "导入", GTK_RESPONSE_OK,
+                      NULL);
+    GtkWidget *box = gtk_dialog_get_content_area(GTK_DIALOG(dlg));
+    GtkWidget *lbl = gtk_label_new("将把该表存为 offset/<配置名>/target.h (同名覆盖)。"
+                                   "配置名：");
+    GtkWidget *entry = gtk_entry_new();
+    char *ret = NULL;
+
+    gtk_container_set_border_width(GTK_CONTAINER(box), 12);
+    gtk_box_pack_start(GTK_BOX(box), lbl, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(box), entry, FALSE, FALSE, 4);
+    gtk_entry_set_text(GTK_ENTRY(entry), prefill);
+    gtk_entry_set_activates_default(GTK_ENTRY(entry), TRUE);
+    gtk_dialog_set_default_response(GTK_DIALOG(dlg), GTK_RESPONSE_OK);
+    gtk_widget_show_all(dlg);
+
+    if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_OK) {
+        const char *s = gtk_entry_get_text(GTK_ENTRY(entry));
+
+        while (*s == '/')
+            s++;
+        if (*s)
+            ret = g_strdup(s);
+    }
+    gtk_widget_destroy(dlg);
+    return ret;
+}
+
+static void pick_confirm(PickCtx *c)
+{
+    if (c->sel) {
+        gtk_entry_set_text(GTK_ENTRY(c->a->entry_krec), c->sel);
+        gtk_label_set_text(GTK_LABEL(c->a->status_lbl), "已选择 offset 表");
+        gtk_widget_set_name(c->a->status_lbl, "status-ok");
+        log_append_plain(c->a, "[+] 已选择 offset 配置表: ");
+        log_append_plain(c->a, c->sel);
+        log_append_plain(c->a, "\n");
+        log_flush(c->a);
+    }
+    if (c->dlg)
+        gtk_widget_destroy(c->dlg);
+}
+
+static void on_pick_row_activated(GtkListBox *lb, GtkListBoxRow *row,
+                                  gpointer data)
+{
+    PickCtx *c = data;
+    int idx = gtk_list_box_row_get_index(row);
+
+    (void)lb;
+    if (idx < 0 || (guint)idx >= c->names->len)
+        return;
+    g_free(c->sel);
+    c->sel = g_strdup(g_ptr_array_index(c->names, idx));
+    pick_confirm(c);
+}
+
+static void on_pick_row_selected(GtkListBox *lb, GtkListBoxRow *row,
+                                 gpointer data)
+{
+    PickCtx *c = data;
+    int idx;
+
+    (void)lb;
+    g_free(c->sel);
+    c->sel = NULL;
+    if (!row)
+        return;
+    idx = gtk_list_box_row_get_index(row);
+    if (idx >= 0 && (guint)idx < c->names->len)
+        c->sel = g_strdup(g_ptr_array_index(c->names, idx));
+}
+
+static void on_pick_import(GtkWidget *w, gpointer data)
+{
+    PickCtx *c = data;
+    GtkWidget *fc;
+    char *fn = NULL;
+
+    (void)w;
+    fc = gtk_file_chooser_dialog_new("导入自定义 target.h",
+                                     GTK_WINDOW(c->dlg),
+                                     GTK_FILE_CHOOSER_ACTION_OPEN,
+                                     "取消", GTK_RESPONSE_CANCEL,
+                                     "打开", GTK_RESPONSE_OK,
+                                     NULL);
+    if (gtk_dialog_run(GTK_DIALOG(fc)) == GTK_RESPONSE_OK)
+        fn = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(fc));
+    gtk_widget_destroy(fc);
+
+    if (fn) {
+        char *content = NULL, *name;
+        char defname[160];
+
+        /* 预填: 源文件上一级目录名; 不像版本号就让用户改 */
+        {
+            char *dir = g_path_get_dirname(fn);
+
+            g_strlcpy(defname, g_path_get_basename(dir), sizeof(defname));
+            g_free(dir);
+        }
+        name = ask_name(c->dlg, defname);
+        if (name) {
+            char offdir[600], sub[640], path[760];
+            const char *cur;
+
+            if (ovs_offset_dir(offdir, sizeof(offdir)) &&
+                g_file_get_contents(fn, &content, NULL, NULL)) {
+                g_snprintf(sub, sizeof(sub), "%s/%s", offdir, name);
+                g_snprintf(path, sizeof(path), "%s/target.h", sub);
+                if (g_mkdir_with_parents(sub, 0755) == 0 &&
+                    g_file_set_contents(path, content, -1, NULL)) {
+                    char msg[900];
+
+                    g_snprintf(msg, sizeof(msg),
+                               "\033[32m[+] 已导入配置表 %s (%ld 字节)。\033[0m\n",
+                               path, (long)strlen(content));
+                    log_append_plain(c->a, msg);
+                    log_flush(c->a);
+                } else {
+                    log_append_plain(c->a, "[!] 写入 offset/ 失败。\n");
+                    log_flush(c->a);
+                }
+                g_free(content);
+
+                /* 导入后刷新列表并选中它 */
+                pick_reload(c);
+                cur = name;
+                {
+                    guint i;
+
+                    for (i = 0; i < c->names->len; i++) {
+                        if (!strcmp(g_ptr_array_index(c->names, i), cur)) {
+                            GtkListBoxRow *r = gtk_list_box_get_row_at_index(
+                                GTK_LIST_BOX(c->list), (int)i);
+
+                            if (r)
+                                gtk_list_box_select_row(
+                                    GTK_LIST_BOX(c->list), r);
+                            break;
+                        }
+                    }
+                }
+                g_free(c->sel);
+                c->sel = g_strdup(cur);
+            }
+            g_free(name);
+        }
+        g_free(fn);
+    }
+}
+
+static void on_pick_response(GtkDialog *dlg, gint resp, gpointer data)
+{
+    PickCtx *c = data;
+
+    (void)dlg;
+    if (resp == GTK_RESPONSE_OK)
+        pick_confirm(c);
+    else if (resp == GTK_RESPONSE_NONE + 1)
+        on_pick_import(NULL, c);
+    /* 其余 (删除窗口事件) 直接关 */
+}
+
+/* 弹窗销毁时释放上下文 (ctx 是静态的, 关掉后再点按钮会重建) */
+static void pick_dlg_destroy(GtkWidget *w, gpointer data)
+{
+    PickCtx *c = data;
+
+    (void)w;
+    pick_free(c);
+    c->dlg = NULL;
+    c->list = NULL;
+}
+
+/* 「选择 offset」: 开窗口遍历程序目录下的 offset/, 名字用 target.h
+ * 上一级目录名; 确认后把名字填进内核版本框 (OVS 链的 -krec)。 */
+static void act_pick_offset(GtkWidget *w, gpointer data)
+{
+    App *a = data;
+    static PickCtx ctx;
+    GtkWidget *box, *lbl, *scroller;
+
+    (void)w;
+    if (ctx.dlg) {   /* 已经开着, 提到前台即可 */
+        gtk_window_present(GTK_WINDOW(ctx.dlg));
+        return;
+    }
+
+    ctx.a = a;
+    ctx.names = g_ptr_array_new();
+    ctx.sel = NULL;
+
+    ctx.dlg = gtk_dialog_new();
+    gtk_window_set_title(GTK_WINDOW(ctx.dlg), "请选择 target.h");
+    gtk_window_set_transient_for(GTK_WINDOW(ctx.dlg), GTK_WINDOW(a->window));
+    gtk_window_set_modal(GTK_WINDOW(ctx.dlg), TRUE);
+    gtk_window_set_default_size(GTK_WINDOW(ctx.dlg), 380, 430);
+    g_signal_connect(ctx.dlg, "destroy", G_CALLBACK(pick_dlg_destroy), &ctx);
+
+    box = gtk_dialog_get_content_area(GTK_DIALOG(ctx.dlg));
+    gtk_container_set_border_width(GTK_CONTAINER(box), 10);
+
+    lbl = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(lbl), "<b>请选择 target.h</b>");
+    gtk_widget_set_halign(lbl, GTK_ALIGN_CENTER);
+    gtk_box_pack_start(GTK_BOX(box), lbl, FALSE, FALSE, 6);
+
+    scroller = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroller),
+                                   GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_vexpand(scroller, TRUE);
+    ctx.list = gtk_list_box_new();
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(ctx.list),
+                                    GTK_SELECTION_SINGLE);
+    gtk_list_box_set_activate_on_single_click(GTK_LIST_BOX(ctx.list), FALSE);
+    g_signal_connect(ctx.list, "row-selected",
+                     G_CALLBACK(on_pick_row_selected), &ctx);
+    g_signal_connect(ctx.list, "row-activated",
+                     G_CALLBACK(on_pick_row_activated), &ctx);
+    gtk_container_add(GTK_CONTAINER(scroller), ctx.list);
+    gtk_box_pack_start(GTK_BOX(box), scroller, TRUE, TRUE, 4);
+
+    /* 双击条目 = 确认; 下面两个按钮: 导入自定义 / 确认 */
+    gtk_dialog_add_button(GTK_DIALOG(ctx.dlg), "导入自定义 target.h",
+                          GTK_RESPONSE_NONE + 1);
+    gtk_dialog_add_button(GTK_DIALOG(ctx.dlg), "确认", GTK_RESPONSE_OK);
+    g_signal_connect(ctx.dlg, "response", G_CALLBACK(on_pick_response), &ctx);
+
+    pick_reload(&ctx);
+    gtk_widget_show_all(ctx.dlg);
+}
+
 static void on_toggle_expand(GtkWidget *w, gpointer data)
 {
     App *a = data;
@@ -5417,6 +5791,7 @@ static void install_css(void)
         "#mainwin #status-run  { color: #1f5fa8; font-weight: bold; }\n"
         "#mainwin #title-name  { color: #1b3a57; }\n"
         "#mainwin #hint { color: #5f7d99; font-size: 9pt; }\n"
+        "dialog #pickno { color: #8a97a5; }\n"
         "#mainwin #banner-warn {\n"
         "  background-color: #fdecea;\n"
         "  color: #9c1c16;\n"
@@ -5561,12 +5936,23 @@ static GtkWidget *build_params(App *a)
     gtk_widget_set_hexpand(a->entry_krec, TRUE);
     gtk_grid_attach(GTK_GRID(grid), a->entry_krec, 1, 4, 1, 1);
 
+    a->btn_pick_offset = gtk_button_new_with_label("选择 offset");
+    gtk_widget_set_tooltip_text(a->btn_pick_offset,
+                                "浏览 offset/ 目录下已有的 target.h 配置表，"
+                                "选中后自动填进左侧内核版本框；也可在这里导入自定义表。");
+
     a->btn_vmlinux = gtk_button_new_with_label("解析 vmlinux");
     gtk_widget_set_tooltip_text(a->btn_vmlinux,
                                 "用 pahole/BTF 解析本机内核结构偏移并生成 target.h，"
                                 "写入程序目录的 offset/<内核版本>/ 供以后离线使用。\n"
                                 "需要 pahole (sudo apt install dwarves)。");
-    gtk_grid_attach(GTK_GRID(grid), a->btn_vmlinux, 2, 4, 1, 1);
+    {
+        GtkWidget *hb = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+
+        gtk_box_pack_start(GTK_BOX(hb), a->btn_pick_offset, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(hb), a->btn_vmlinux, FALSE, FALSE, 0);
+        gtk_grid_attach(GTK_GRID(grid), hb, 2, 4, 1, 1);
+    }
 
     return grid;
 }
@@ -6267,6 +6653,7 @@ static void build_window(App *a)
     g_signal_connect(a->btn_lpe, "clicked", G_CALLBACK(act_lpe), a);
     g_signal_connect(a->btn_write, "clicked", G_CALLBACK(act_write), a);
     g_signal_connect(a->btn_vmlinux, "clicked", G_CALLBACK(act_vmlinux), a);
+    g_signal_connect(a->btn_pick_offset, "clicked", G_CALLBACK(act_pick_offset), a);
     g_signal_connect(a->btn_stop, "clicked", G_CALLBACK(act_stop), a);
     g_signal_connect(a->btn_send, "clicked", G_CALLBACK(act_send), a);
     g_signal_connect(a->btn_ctrlc, "clicked", G_CALLBACK(act_ctrlc), a);
