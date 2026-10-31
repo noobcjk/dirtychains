@@ -149,7 +149,9 @@ jobs:
             echo "链接方式 : poc / ovswrap 静态链接（不依赖目标机 glibc）"
             if [ -f "$D/dirtychains" ]; then
               echo "           dirtychains 动态链接 GTK3（实测需 glibc >= 2.28，GTK3 >= 3.24）"
-              [ -f .gccver-gui ] && echo "GUI 编译器: $(cat .gccver-gui)（ubuntu:20.04 容器）"
+              if [ -f .gccver-gui ]; then
+                echo "GUI 编译器: $(cat .gccver-gui)（ubuntu:20.04 容器）"
+              fi
             fi
             echo
             echo "顶层内容 :"
