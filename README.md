@@ -18,8 +18,6 @@
 | `dirtyfrag-gui.c` | **单文件主程序**：GTK3 前端 + 内置 OVS 引擎（原 `ovswrap.c` 已并入） |
 | `dirtyfrag_lpe.c` | 五链引擎实现，也可单独编成命令行 `poc` |
 
-仓库只保留主干这两份源码。43284 的早期单版本 PoC（`dirtyfrag.c`）、43500 的原语验证与探测
-（`rxrpc_primitive.c`、`cve_2026_43500_recon.c`）、43499 的独立验证（`ghostlock.c`）不在本仓库。
 
 内置的漏洞链：
 
