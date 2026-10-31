@@ -17,10 +17,9 @@ Linux 页缓存写原语 / 本地提权 PoC 合集，带一个 GTK3 图形前端
 |---|---|
 | `dirtyfrag-gui.c` | **单文件主程序**：GTK3 前端 + 内置 OVS 引擎 + 808 条内嵌偏移表（原 `ovswrap.c` 已并入） |
 | `dirtyfrag_lpe.c` | 五链引擎实现，也可单独编成命令行 `poc` |
-| `dirtyfrag.c` | CVE-2026-43284 早期单版本 PoC（针对 4.14.186 逐行对齐） |
-| `rxrpc_primitive.c` | CVE-2026-43500 写原语最小验证，不需要 root、不改磁盘 |
-| `cve_2026_43500_recon.c` | CVE-2026-43500 环境可达性探测 |
-| `ghostlock.c` | CVE-2026-43499（rtmutex `remove_waiter()`）独立验证 |
+
+仓库只保留主干这两份源码。43284 的早期单版本 PoC（`dirtyfrag.c`）、43500 的原语验证与探测
+（`rxrpc_primitive.c`、`cve_2026_43500_recon.c`）、43499 的独立验证（`ghostlock.c`）不在本仓库。
 
 内置的漏洞链：
 
@@ -94,12 +93,10 @@ make kmod            # 需要目标机的 linux-headers-$(uname -r)
 必须以**普通用户**运行（root 会被拒绝），且 `openvswitch` 模块已加载。
 跑完记得删掉写入的 sudoers 规则；如果追加进了 `/etc/sudoers`，重启前先 `visudo -c`。
 
-### 其它单文件 PoC
+### 命令行版
 
 ```bash
-make poc && ./poc                # 五链命令行版
-gcc -O2 -o recon cve_2026_43500_recon.c && ./recon
-gcc -O2 -o primitive rxrpc_primitive.c && ./primitive
+make poc && ./poc                # 五链引擎，不带 GTK
 ```
 
 ---
@@ -169,10 +166,6 @@ python3 tools/mk_offset.py rec.json --root offset # 或只写进 offset/
 .
 ├── dirtyfrag-gui.c          单文件主程序：GTK3 前端 + OVS 引擎 + 内嵌偏移表
 ├── dirtyfrag_lpe.c          五链引擎（亦可单独编 poc）
-├── dirtyfrag.c              43284 单版本 PoC
-├── rxrpc_primitive.c        43500 原语验证
-├── cve_2026_43500_recon.c   43500 可达性探测
-├── ghostlock.c              43499 独立验证
 ├── offset/                  内核偏移配置表（740 个 release）
 ├── krec-808.json            内嵌表完整导出（808 条）
 ├── tools/
