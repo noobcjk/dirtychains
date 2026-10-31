@@ -88,7 +88,7 @@ def render(rec, source=""):
 
     out = []
     out.append("/*")
-    out.append(" * target.h - dirtyfrag OVS (CVE-2026-64531) kernel offsets")
+    out.append(" * target.h - dirtychains OVS (CVE-2026-64531) kernel offsets")
     out.append(" *")
     out.append(" * 放这里：offset/<N>系/<release>/target.h")
     out.append(" * 例：    offset/5系/5.8.0-59-generic/target.h")
@@ -98,8 +98,8 @@ def render(rec, source=""):
     out.append(" *")
     out.append(" * 生成: tools/mk_offset.py" + (f"（{source}）" if source else ""))
     out.append(" */")
-    out.append("#ifndef DIRTYFRAG_TARGET_H")
-    out.append("#define DIRTYFRAG_TARGET_H")
+    out.append("#ifndef DIRTYCHAINS_TARGET_H")
+    out.append("#define DIRTYCHAINS_TARGET_H")
     out.append("")
     out.append("#define KREC_FORMAT        1")
     out.append(f'#define KREC_RELEASE       "{rel}"')
@@ -124,7 +124,7 @@ def render(rec, source=""):
                f'"{rec.get("write_carrier", rec.get("read_carrier", "timeout"))}"')
     out.append(f'#define KREC_READ_LANES    "{lanes}"')
     out.append("")
-    out.append("#endif /* DIRTYFRAG_TARGET_H */")
+    out.append("#endif /* DIRTYCHAINS_TARGET_H */")
     out.append("")
     return "\n".join(out)
 

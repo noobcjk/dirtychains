@@ -1,12 +1,12 @@
-# DirtyFrag GUI —— GTK3 / XFCE 前端（引擎已内嵌，单文件）
+# DirtyChains —— GTK3 / XFCE 前端（引擎已内嵌，单文件）
 #
-#   make                编译 dirtyfrag-gui（前端 + 五链引擎 + OVS 引擎）
+#   make                编译 dirtychains（前端 + 五链引擎 + OVS 引擎）
 #   make poc            另外编一个独立的命令行引擎
 #   make ovswrap        用同一个源编出不含 GTK 的 OVS 命令行版
 #   make offset-add REC=rec.json 把一条记录写成 offset/<N>系/<release>/target.h
 #   make offset-sync     从 krec-808.json 整批重建 offset/ 目录树
 #   make kmod            编译 tools/kmod 的偏移提取模块
-#   sudo make install   装到 /usr/local/bin，背景图与 offset/ 进 share/dirtyfrag
+#   sudo make install   装到 /usr/local/bin，背景图与 offset/ 进 share/dirtychains
 #   make clean
 
 CC     ?= gcc
@@ -19,18 +19,19 @@ GTK_LIBS   := $(shell pkg-config --libs $(PKG))
 PREFIX  ?= /usr/local
 BINDIR  ?= $(PREFIX)/bin
 APPDIR  ?= $(PREFIX)/share/applications
-DATADIR ?= $(PREFIX)/share/dirtyfrag
+DATADIR ?= $(PREFIX)/share/dirtychains
 
-TARGET     := dirtyfrag-gui
+TARGET     := dirtychains
 # 单文件：GTK 前端 + ovswrap 引擎都在这里（偏移表在 offset/，运行时读）
+# 源文件名保留 dirtyfrag-gui.c / dirtyfrag_lpe.c：记录实现来路，不随项目名改
 SRC        := dirtyfrag-gui.c
 ENGINE_SRC := dirtyfrag_lpe.c
 ENGINE     := poc
 REC        ?= rec.json
 BGIMG      := bg.png
 
-GUI_OBJ := dirtyfrag-gui.o
-ENG_OBJ := dirtyfrag-engine.o
+GUI_OBJ := dirtychains.o
+ENG_OBJ := dirtychains-engine.o
 
 # 引擎里有若干 (void)write 的 unused-result 警告，与功能无关，统一压掉
 ENGINE_CFLAGS := $(CFLAGS) -Wno-unused-result
@@ -43,7 +44,7 @@ $(GUI_OBJ): $(SRC)
 
 # 五链引擎侧：把 main 改名，免得和 GUI 的 main 撞车
 $(ENG_OBJ): $(ENGINE_SRC)
-	$(CC) $(ENGINE_CFLAGS) -Dmain=dirtyfrag_poc_main -c -o $@ $<
+	$(CC) $(ENGINE_CFLAGS) -Dmain=dirtychains_poc_main -c -o $@ $<
 
 $(TARGET): $(GUI_OBJ) $(ENG_OBJ)
 	$(CC) -o $@ $(GUI_OBJ) $(ENG_OBJ) $(GTK_LIBS) -lutil

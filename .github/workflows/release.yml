@@ -105,8 +105,8 @@ jobs:
           set -euo pipefail
           sudo apt-get install -y --no-install-recommends \
             build-essential libgtk-3-dev pkg-config
-          make dirtyfrag-gui
-          file dirtyfrag-gui
+          make dirtychains
+          file dirtychains
 
       - name: 打包
         env:
@@ -115,7 +115,7 @@ jobs:
           CC: ${{ matrix.cc }}
         run: |
           set -euo pipefail
-          NAME="dirtyfrag-${VER}-${ARCH}"
+          NAME="dirtychains-${VER}-${ARCH}"
           D="pkg/${NAME}"
           mkdir -p "$D"
 
@@ -123,19 +123,19 @@ jobs:
           cp README.md LICENSE "$D/"
           cp -r offset "$D/offset"
           # GUI 及其配套（背景图、桌面项）只在编出来时才放进去
-          if [ -f dirtyfrag-gui ]; then
-            cp dirtyfrag-gui dirtyfrag-gui.desktop bg.png "$D/"
+          if [ -f dirtychains ]; then
+            cp dirtychains dirtyfrag-gui.desktop bg.png "$D/"
           fi
 
           {
-            echo "DirtyFrag ${VER}"
+            echo "DirtyChains ${VER}"
             echo "架构     : ${ARCH}"
             echo "编译器   : $("$CC" --version | head -1)"
             echo "提交     : ${GITHUB_SHA}"
             echo "构建时间 : $(date -u +%FT%TZ)"
             echo "链接方式 : poc / ovswrap 静态链接（不依赖目标机 glibc）"
-            if [ -f "$D/dirtyfrag-gui" ]; then
-              echo "           dirtyfrag-gui 动态链接 GTK3"
+            if [ -f "$D/dirtychains" ]; then
+              echo "           dirtychains 动态链接 GTK3"
             fi
             echo
             echo "顶层内容 :"
@@ -149,7 +149,7 @@ jobs:
       - name: 上传产物
         uses: actions/upload-artifact@v7
         with:
-          name: dirtyfrag-${{ matrix.arch }}
+          name: dirtychains-${{ matrix.arch }}
           path: pkg/*.tar.gz
           if-no-files-found: error
           retention-days: 14
@@ -197,32 +197,32 @@ jobs:
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           target_commitish: ${{ github.sha }}
-          name: DirtyFrag ${{ steps.tag.outputs.tag }}
+          name: DirtyChains ${{ steps.tag.outputs.tag }}
           generate_release_notes: true
           body: |
             ## 预编译包
 
             | 包 | 架构 | 内容 |
             |---|---|---|
-            | `dirtyfrag-*-x86_64.tar.gz` | x86_64 | `dirtyfrag-gui` + `poc` + `ovswrap` |
-            | `dirtyfrag-*-x86.tar.gz` | i686 | `poc` + `ovswrap` |
-            | `dirtyfrag-*-aarch64.tar.gz` | ARM64 | `poc` + `ovswrap` |
-            | `dirtyfrag-*-armhf.tar.gz` | ARMv7 硬浮点 | `poc` + `ovswrap` |
+            | `dirtychains-*-x86_64.tar.gz` | x86_64 | `dirtychains` + `poc` + `ovswrap` |
+            | `dirtychains-*-x86.tar.gz` | i686 | `poc` + `ovswrap` |
+            | `dirtychains-*-aarch64.tar.gz` | ARM64 | `poc` + `ovswrap` |
+            | `dirtychains-*-armhf.tar.gz` | ARMv7 硬浮点 | `poc` + `ovswrap` |
 
             `poc` 与 `ovswrap` 是 `-static -no-pie` 静态链接，拷到目标机直接跑，
-            不挑 glibc 版本；`dirtyfrag-gui` 需要 GTK3（Ubuntu 22.04 上
+            不挑 glibc 版本；`dirtychains` 需要 GTK3（Ubuntu 22.04 上
             `apt install libgtk-3-dev` 即可自行编译）。
 
             每个包内都有 `offset/`（740 个内核 release 的偏移表），程序运行时按
-            `<exe目录>/offset` → `./offset` → `/usr/share/dirtyfrag/offset` 的顺序查找。
+            `<exe目录>/offset` → `./offset` → `/usr/share/dirtychains/offset` 的顺序查找。
             换内核不用重编，往 `offset/<N>系/<uname -r>/target.h` 加文件即可。
 
             ```bash
-            tar xzf dirtyfrag-*-x86_64.tar.gz
-            cd dirtyfrag-*-x86_64
+            tar xzf dirtychains-*-x86_64.tar.gz
+            cd dirtychains-*-x86_64
             ./poc -h          # 六链命令行版
             ./ovswrap -h      # CVE-2026-64531 单独实现
-            ./dirtyfrag-gui   # 图形界面
+            ./dirtychains     # 图形界面
             ```
 
             校验：`sha256sum -c SHA256SUMS.txt`

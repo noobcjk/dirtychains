@@ -14,9 +14,9 @@
  *   sudo insmod krec_dump.ko
  *   cat /proc/krec_dump > rec.json
  *   sudo rmmod krec_dump
- *   python3 tools/add_krec.py rec.json dirtyfrag-gui.c
+ *   python3 tools/mk_offset.py rec.json --root offset
  *
- * 输出与 `ovswrap -dump-krec` 完全同构，可以直接喂给 add_krec.py。
+ * 输出与 `ovswrap -dump-krec` 完全同构，可以直接喂给 mk_offset.py。
  *
  * 注意：read_carrier / write_carrier / read_lanes 是**实测出来的行为参数**，
  *      不是结构体偏移，模块推不出来，这里输出默认值（timeout / 全量 14 lane）。
@@ -480,4 +480,4 @@ module_exit(krec_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Dump CVE-2026-64531 kernel offsets for ovswrap");
-MODULE_AUTHOR("dirtyfrag");
+MODULE_AUTHOR("dirtychains");

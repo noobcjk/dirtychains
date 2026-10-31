@@ -38,7 +38,8 @@ offset/
 
 ```
 -offset <dir>  →  $OVSWRAP_OFFSET_DIR  →  <可执行文件目录>/offset
-               →  ./offset  →  /usr/share/dirtyfrag/offset
+               →  ./offset  →  /usr/share/dirtychains/offset
+               →  /usr/share/dirtyfrag/offset（1.6 及更早的安装位置，兜底）
                →  BTF / pahole / System.map 推导
 ```
 

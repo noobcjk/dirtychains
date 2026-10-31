@@ -5,7 +5,7 @@
 *.mod.c
 *.symvers
 *.order
-/dirtyfrag-gui
+/dirtychains
 /poc
 /ovswrap
 

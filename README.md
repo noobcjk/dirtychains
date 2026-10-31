@@ -1,8 +1,8 @@
-# DirtyFrag
+# DirtyChains
 
 !此项目由AI编写!
 
-Linux 页缓存写原语 / 本地提权 PoC 合集，带一个 GTK3 图形前端和一个 Open vSwitch 独立引擎。
+六条 CVE 链的页缓存写原语 / 本地提权 PoC 合集，带一个 GTK3 图形前端和一个 Open vSwitch 独立引擎。
 
 > **免责声明**
 > 本项目仅用于**自有设备**或**已获得书面授权的渗透测试**。
@@ -40,21 +40,22 @@ Linux 页缓存写原语 / 本地提权 PoC 合集，带一个 GTK3 图形前端
 # 依赖：gtk+-3.0 开发包
 sudo apt install build-essential libgtk-3-dev pkg-config
 
-make                 # GUI 单二进制（前端 + 五链引擎 + 内置 OVS 引擎）
+make                 # GUI 单二进制 dirtychains（前端 + 五链引擎 + 内置 OVS 引擎）
 make poc             # 独立的命令行引擎
 make ovswrap         # 独立的 OVS 命令行版（不含 GTK）
-sudo make install    # 装到 /usr/local/bin，背景图与 offset/ 进 share/dirtyfrag
+sudo make install    # 装到 /usr/local/bin，背景图与 offset/ 进 share/dirtychains
 ```
 
 `dirtyfrag-gui.c` 是**自包含单文件**：GTK 前端和 OVS 引擎都在里面，
 只编一个 `.c` 就能出完整程序（偏移表在 `offset/`，运行时读取，不编进二进制）：
 
 ```bash
-gcc -O2 -Wall -o dirtyfrag-gui dirtyfrag-gui.c $(pkg-config --cflags --libs gtk+-3.0) -lutil
+gcc -O2 -Wall -o dirtychains dirtyfrag-gui.c $(pkg-config --cflags --libs gtk+-3.0) -lutil
 gcc -O2 -Wall -DOVSWRAP_STANDALONE -o ovswrap dirtyfrag-gui.c -lutil   # 只要 OVS 命令行版
 ```
 
-五链引擎仍来自 `dirtyfrag_lpe.c`，编译时用 `-Dmain=dirtyfrag_poc_main` 改名后与前端链接。
+五链引擎仍来自 `dirtyfrag_lpe.c`，编译时用 `-Dmain=dirtychains_poc_main` 改名后与前端链接。
+两个源文件名保留 `dirtyfrag` 前缀，记录实现来路；产物二进制叫 `dirtychains`。
 
 内核模块（可选，见下）：
 
@@ -75,13 +76,13 @@ git push origin v1.6
 
 | 包 | 架构 | 交叉编译器 | 内容 |
 |---|---|---|---|
-| `dirtyfrag-<ver>-x86_64.tar.gz` | x86_64 | `gcc` | `dirtyfrag-gui` + `poc` + `ovswrap` |
-| `dirtyfrag-<ver>-x86.tar.gz` | i686 | `gcc-i686-linux-gnu` | `poc` + `ovswrap` |
-| `dirtyfrag-<ver>-aarch64.tar.gz` | ARM64 | `gcc-aarch64-linux-gnu` | `poc` + `ovswrap` |
-| `dirtyfrag-<ver>-armhf.tar.gz` | ARMv7 硬浮点 | `gcc-arm-linux-gnueabihf` | `poc` + `ovswrap` |
+| `dirtychains-<ver>-x86_64.tar.gz` | x86_64 | `gcc` | `dirtychains` + `poc` + `ovswrap` |
+| `dirtychains-<ver>-x86.tar.gz` | i686 | `gcc-i686-linux-gnu` | `poc` + `ovswrap` |
+| `dirtychains-<ver>-aarch64.tar.gz` | ARM64 | `gcc-aarch64-linux-gnu` | `poc` + `ovswrap` |
+| `dirtychains-<ver>-armhf.tar.gz` | ARMv7 硬浮点 | `gcc-arm-linux-gnueabihf` | `poc` + `ovswrap` |
 
 - `poc` / `ovswrap` 用 `-static -no-pie` 静态链接，目标机不需要对应版本的 glibc，老内核也能加载
-- `dirtyfrag-gui` 必须动态链 GTK3，交叉编译要拉整条 arm64 桌面栈，所以只在 x86_64 包里提供
+- `dirtychains` 必须动态链 GTK3，交叉编译要拉整条 arm64 桌面栈，所以只在 x86_64 包里提供
 - 每个包都带 `offset/`（740 个 release 的表）和 `BUILD.txt`（编译器、提交、构建时间）
 
 在 Actions 页面也能手动触发（`workflow_dispatch`）：填 tag 就发布到 Releases，留空只构建、
@@ -100,7 +101,7 @@ make CC=aarch64-linux-gnu-gcc CFLAGS="-O2 -Wall -static -no-pie -D_FILE_OFFSET_B
 ### GUI
 
 ```bash
-./dirtyfrag-gui          # 或安装后直接 dirtyfrag-gui
+./dirtychains            # 或安装后直接 dirtychains
 ```
 
 下拉框选链 → 填目标用户名 → 运行。前端用 pty 启动引擎，所以引擎里的 `isatty()` 判断、
@@ -153,7 +154,7 @@ offset/
 2. 环境变量 `$OVSWRAP_OFFSET_DIR`
 3. `<exe 目录>/offset`
 4. `./offset`
-5. `/usr/share/dirtyfrag/offset`
+5. `/usr/share/dirtychains/offset`（旧安装路径 `/usr/share/dirtyfrag/offset` 仍作兜底）
 6. 本机推导（BTF / pahole / System.map）
 
 前 5 个是同一份表的不同根目录，全部落空才走推导。**没有内嵌兜底**——拷走二进制时
@@ -196,7 +197,7 @@ python3 tools/mk_offset.py rec.json --root offset    # 直接写成 offset/<N>�
 
 ```
 .
-├── dirtyfrag-gui.c          单文件主程序：GTK3 前端 + OVS 引擎
+├── dirtyfrag-gui.c          单文件主程序：GTK3 前端 + OVS 引擎 → 编出 dirtychains
 ├── dirtyfrag_lpe.c          五链引擎（亦可单独编 poc）
 ├── offset/                  内核偏移配置表（740 个 release）
 ├── krec-808.json            历史内嵌表的完整导出（808 条，可选，用于重建 offset/）
