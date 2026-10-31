@@ -15,9 +15,8 @@ Linux 页缓存写原语 / 本地提权 PoC 合集，带一个 GTK3 图形前端
 
 | 文件 | 说明 |
 |---|---|
-| `dirtyfrag-gui.c` | GTK3 前端（XFCE 适配）。负责拼命令行、在 pty 里跑引擎、渲染彩色日志 |
-| `dirtyfrag_lpe.c` | 主引擎，五条链的实现，也可单独编成命令行 `poc` |
-| `ovswrap.c` | CVE-2026-64531（net/openvswitch CT action 越界）独立实现 + 内嵌内核偏移表 |
+| `dirtyfrag-gui.c` | **单文件主程序**：GTK3 前端 + 内置 OVS 引擎 + 808 条内嵌偏移表（原 `ovswrap.c` 已并入） |
+| `dirtyfrag_lpe.c` | 五链引擎实现，也可单独编成命令行 `poc` |
 | `dirtyfrag.c` | CVE-2026-43284 早期单版本 PoC（针对 4.14.186 逐行对齐） |
 | `rxrpc_primitive.c` | CVE-2026-43500 写原语最小验证，不需要 root、不改磁盘 |
 | `cve_2026_43500_recon.c` | CVE-2026-43500 环境可达性探测 |
@@ -42,13 +41,21 @@ Linux 页缓存写原语 / 本地提权 PoC 合集，带一个 GTK3 图形前端
 # 依赖：gtk+-3.0 开发包
 sudo apt install build-essential libgtk-3-dev pkg-config
 
-make                 # GUI 单二进制（GUI + 五链引擎 + OVS 引擎）
+make                 # GUI 单二进制（前端 + 五链引擎 + 内置 OVS 引擎）
 make poc             # 独立的命令行引擎
-make ovswrap         # 独立的 OVS 引擎
+make ovswrap         # 独立的 OVS 命令行版（不含 GTK）
 sudo make install    # 装到 /usr/local/bin，背景图与 offset/ 进 share/dirtyfrag
 ```
 
-`make` 会把两个引擎的 `main` 改名（`-Dmain=dirtyfrag_poc_main` / `-Dmain=ovswrap_main`）后链进同一个可执行文件。
+`dirtyfrag-gui.c` 是**自包含单文件**：GTK 前端、OVS 引擎、808 条内嵌偏移表都在里面，
+只编一个 `.c` 就能出完整程序：
+
+```bash
+gcc -O2 -Wall -o dirtyfrag-gui dirtyfrag-gui.c $(pkg-config --cflags --libs gtk+-3.0) -lutil
+gcc -O2 -Wall -DOVSWRAP_STANDALONE -o ovswrap dirtyfrag-gui.c -lutil   # 只要 OVS 命令行版
+```
+
+五链引擎仍来自 `dirtyfrag_lpe.c`，编译时用 `-Dmain=dirtyfrag_poc_main` 改名后与前端链接。
 
 内核模块（可选，见下）：
 
@@ -70,6 +77,8 @@ make kmod            # 需要目标机的 linux-headers-$(uname -r)
 彩色输出、成功后的交互式 root shell 都正常。
 
 ### OVS 引擎（CVE-2026-64531）
+
+`make ovswrap` 会从 `dirtyfrag-gui.c` 编出独立的命令行版（GTK 段被 `-DOVSWRAP_STANDALONE` 裁掉）：
 
 ```bash
 ./ovswrap -check                 # 前置条件：配置表 / openvswitch 模块 / BTF / userns
@@ -117,7 +126,7 @@ offset/
 3. `<exe 目录>/offset`
 4. `./offset`
 5. `/usr/share/dirtyfrag/offset`
-6. 内嵌表（`ovswrap.c` 里的 808 条记录，去重后 739 个 release）
+6. 内嵌表（`dirtyfrag-gui.c` 里的 808 条记录，去重后 739 个 release）
 7. 本机推导（BTF / pahole / System.map）
 
 **当前内容**：740 个 release —— 739 个由内嵌表导出（`make offset-sync`），
@@ -142,7 +151,7 @@ mkdir -p offset/6系/$(uname -r) && cp /tmp/target.h offset/6系/$(uname -r)/
 make kmod && sudo insmod tools/kmod/krec_dump.ko
 cat /proc/krec_dump > rec.json
 sudo rmmod krec_dump
-python3 tools/add_krec.py rec.json ovswrap.c      # 并进内嵌表
+python3 tools/add_krec.py rec.json dirtyfrag-gui.c      # 并进内嵌表
 python3 tools/mk_offset.py rec.json --root offset # 或只写进 offset/
 ```
 
@@ -158,9 +167,8 @@ python3 tools/mk_offset.py rec.json --root offset # 或只写进 offset/
 
 ```
 .
-├── dirtyfrag-gui.c          图形前端
+├── dirtyfrag-gui.c          单文件主程序：GTK3 前端 + OVS 引擎 + 内嵌偏移表
 ├── dirtyfrag_lpe.c          五链引擎（亦可单独编 poc）
-├── ovswrap.c                OVS 引擎 + 内嵌偏移表
 ├── dirtyfrag.c              43284 单版本 PoC
 ├── rxrpc_primitive.c        43500 原语验证
 ├── cve_2026_43500_recon.c   43500 可达性探测
@@ -169,7 +177,7 @@ python3 tools/mk_offset.py rec.json --root offset # 或只写进 offset/
 ├── krec-808.json            内嵌表完整导出（808 条）
 ├── tools/
 │   ├── gen_krec_table.py    内嵌表的解码 / 打包 / 导出
-│   ├── add_krec.py          把一条记录并进 ovswrap.c 的表
+│   ├── add_krec.py          把一条记录并进 dirtyfrag-gui.c 的表
 │   ├── mk_offset.py         把记录写成 offset/<N>系/<release>/target.h
 │   └── kmod/krec_dump.c     没 BTF 时用内核模块直接读偏移
 └── Makefile

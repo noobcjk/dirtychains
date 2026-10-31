@@ -1,8 +1,8 @@
-# DirtyFrag GUI —— GTK3 / XFCE 前端（引擎已内嵌）
+# DirtyFrag GUI —— GTK3 / XFCE 前端（引擎已内嵌，单文件）
 #
-#   make                编译单文件 dirtyfrag-gui（GUI + 五链引擎）
-#   make poc            另外编一个独立的命令行 poc
-#   make ovswrap        编译 CVE-2026-64531 (OVS) 独立验证程序
+#   make                编译 dirtyfrag-gui（前端 + 五链引擎 + OVS 引擎）
+#   make poc            另外编一个独立的命令行引擎
+#   make ovswrap        用同一个源编出不含 GTK 的 OVS 命令行版
 #   make krec           从原版 ovswrap-poc.py 重新生成预置内核表
 #   make krec-add REC=rec.json   把一条记录并进表
 #   make offset-add REC=rec.json 把一条记录写成 offset/<N>系/<release>/target.h
@@ -25,49 +25,46 @@ APPDIR  ?= $(PREFIX)/share/applications
 DATADIR ?= $(PREFIX)/share/dirtyfrag
 
 TARGET     := dirtyfrag-gui
+# 单文件：GTK 前端 + ovswrap 引擎 + 内嵌内核偏移表都在这里
 SRC        := dirtyfrag-gui.c
 ENGINE_SRC := dirtyfrag_lpe.c
 ENGINE     := poc
-OVS_SRC    := ovswrap.c
+KREC_SRC   := $(SRC)
 KREC_PY    ?= ovswrap-poc.py
 REC        ?= rec.json
 BGIMG      := bg.png
 
 GUI_OBJ := dirtyfrag-gui.o
 ENG_OBJ := dirtyfrag-engine.o
-OVS_OBJ := ovswrap-engine.o
 
 # 引擎里有若干 (void)write 的 unused-result 警告，与功能无关，统一压掉
 ENGINE_CFLAGS := $(CFLAGS) -Wno-unused-result
 
 all: $(TARGET)
 
-# GUI 侧：main 保持原名
+# 前端侧（含内置 OVS 引擎）：main 保持原名
 $(GUI_OBJ): $(SRC)
 	$(CC) $(CFLAGS) $(GTK_CFLAGS) -c -o $@ $<
 
-# 引擎侧：把 main 改名，免得和 GUI 的 main 撞车
+# 五链引擎侧：把 main 改名，免得和 GUI 的 main 撞车
 $(ENG_OBJ): $(ENGINE_SRC)
 	$(CC) $(ENGINE_CFLAGS) -Dmain=dirtyfrag_poc_main -c -o $@ $<
 
-# OVS 引擎：同样把 main 改名，避免和 GUI 的 main 撞车
-$(OVS_OBJ): $(OVS_SRC)
-	$(CC) $(CFLAGS) -Dmain=ovswrap_main -c -o $@ $<
-
-$(TARGET): $(GUI_OBJ) $(ENG_OBJ) $(OVS_OBJ)
-	$(CC) -o $@ $(GUI_OBJ) $(ENG_OBJ) $(OVS_OBJ) $(GTK_LIBS) -lutil
+$(TARGET): $(GUI_OBJ) $(ENG_OBJ)
+	$(CC) -o $@ $(GUI_OBJ) $(ENG_OBJ) $(GTK_LIBS) -lutil
 
 # 独立的命令行版本，可单独拷走使用
 poc: $(ENGINE_SRC)
 	$(CC) $(ENGINE_CFLAGS) -o $@ $<
 
-# CVE-2026-64531 (net/openvswitch CT action 越界) 独立验证程序
-ovswrap: ovswrap.c
-	$(CC) $(CFLAGS) -o $@ $<
+# CVE-2026-64531 (net/openvswitch CT action 越界) 命令行版
+# 源码就在 dirtyfrag-gui.c 里，用 OVSWRAP_STANDALONE 把 GTK 段裁掉
+ovswrap: $(SRC)
+	$(CC) $(CFLAGS) -DOVSWRAP_STANDALONE -o $@ $<
 
-# 预置内核表：把原版 base85+zlib 表去重打包后写回 ovswrap.c
+# 预置内核表：把原版 base85+zlib 表去重打包后写回源文件
 krec:
-	python3 tools/gen_krec_table.py $(KREC_PY) $(OVS_SRC)
+	python3 tools/gen_krec_table.py $(KREC_PY) $(KREC_SRC)
 
 # 编译偏移提取模块（目标机需要 linux-headers-$(uname -r)）
 kmod:
@@ -75,7 +72,7 @@ kmod:
 
 # 把一条记录并进表（rec.json 由 `ovswrap -dump-krec` 生成）
 krec-add:
-	python3 tools/add_krec.py $(REC) $(OVS_SRC)
+	python3 tools/add_krec.py $(REC) $(KREC_SRC)
 
 # 外部配置表：一条记录写成一个目录
 offset-add:
@@ -83,12 +80,12 @@ offset-add:
 
 # 外部配置表：内嵌表整表导出（739 个 release 目录）
 offset-sync:
-	python3 tools/mk_offset.py --from-c $(OVS_SRC) --root offset
+	python3 tools/mk_offset.py --from-c $(KREC_SRC) --root offset
 
 # 提取内嵌表：JSON 全集 + 目录树，直接落到 offset/
 krec-export:
-	python3 tools/gen_krec_table.py --dump $(OVS_SRC) > krec-808.json
-	python3 tools/mk_offset.py --from-c $(OVS_SRC) --root offset
+	python3 tools/gen_krec_table.py --dump $(KREC_SRC) > krec-808.json
+	python3 tools/mk_offset.py --from-c $(KREC_SRC) --root offset
 	@python3 -c 'import json;print("records:", len(json.load(open("krec-808.json"))))'
 
 install: $(TARGET)
@@ -120,6 +117,6 @@ uninstall:
 	rm -rf $(DESTDIR)$(DATADIR)/offset
 
 clean:
-	rm -f $(TARGET) $(GUI_OBJ) $(ENG_OBJ) $(OVS_OBJ)
+	rm -f $(TARGET) $(GUI_OBJ) $(ENG_OBJ) $(ENGINE) ovswrap
 
 .PHONY: all install uninstall clean poc ovswrap krec krec-add offset-add offset-sync krec-export kmod

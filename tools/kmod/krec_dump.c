@@ -14,7 +14,7 @@
  *   sudo insmod krec_dump.ko
  *   cat /proc/krec_dump > rec.json
  *   sudo rmmod krec_dump
- *   python3 tools/add_krec.py rec.json ovswrap.c
+ *   python3 tools/add_krec.py rec.json dirtyfrag-gui.c
  *
  * 输出与 `ovswrap -dump-krec` 完全同构，可以直接喂给 add_krec.py。
  *

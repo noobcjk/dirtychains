@@ -7,7 +7,7 @@
 两种输入：
 
     python3 tools/mk_offset.py rec.json              # 一条（ovswrap -dump-krec 的输出）
-    python3 tools/mk_offset.py --from-c ovswrap.c    # 内嵌表里的 808 条全导出来
+    python3 tools/mk_offset.py --from-c dirtyfrag-gui.c    # 内嵌表里的 808 条全导出来
 
 target.h 是一组 #define，ovswrap 启动时按 `uname -r` 找到对应目录直接读，
 不再需要重新编译。它同时是合法 C 头文件，可以 #include 静态编译。
@@ -26,7 +26,7 @@ import json
 import sys
 from pathlib import Path
 
-# 与 ovswrap.c 的 struct th_key / print_target 一一对应
+# 与 dirtyfrag-gui.c 的 struct th_key / print_target 一一对应
 FIELDS = [
     ("NF_CONNTRACK_HELPER_ME", "nf_conntrack_helper_me"),
     ("MODULE_KOBJ_KTYPE", "module_kobj_ktype"),
@@ -63,7 +63,7 @@ DEFAULT_LANES = "tos,ttl,tp_src_0,tp_src_1,tp_dst_0,tp_dst_1," \
 
 
 def fnv1a(text):
-    """与 ovswrap.c 的 fnv1a32 一致：用于 KREC_VERSION_HASH。"""
+    """与 dirtyfrag-gui.c 的 fnv1a32 一致：用于 KREC_VERSION_HASH。"""
     h = 0x811C9DC5
     for b in text.encode():
         h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
@@ -174,7 +174,7 @@ def main():
         description="把内核偏移记录写成 offset/<N>系/<release>/target.h")
     ap.add_argument("rec", nargs="?", help="rec.json（ovswrap -dump-krec 输出）")
     ap.add_argument("--from-c", metavar="OVSWRAP_C",
-                    help="从内嵌表批量导出（传 ovswrap.c）")
+                    help="从内嵌表批量导出（传 dirtyfrag-gui.c）")
     ap.add_argument("--root", default="offset", help="配置表根目录，默认 offset")
     ap.add_argument("--force", action="store_true", help="覆盖已存在且内容不同的表")
     ap.add_argument("--dry-run", action="store_true", help="只统计不写盘")
@@ -195,7 +195,7 @@ def main():
         rec = json.loads(Path(args.rec).read_text(encoding="utf-8"))
         write_one(args.root, rec, args.force, args.dry_run, stats, args.rec)
     else:
-        ap.error("需要 rec.json 或 --from-c ovswrap.c")
+        ap.error("需要 rec.json 或 --from-c dirtyfrag-gui.c")
 
     print(f"新增 {stats['new']}，覆盖 {stats['update']}，"
           f"未变 {stats['same']}，冲突 {stats['conflict']}"

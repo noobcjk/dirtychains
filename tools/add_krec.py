@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""把一条内核记录合并进 ovswrap.c 里的预置表。
+"""把一条内核记录合并进 dirtyfrag-gui.c 里的预置表。
 
 用法:
-    python3 tools/add_krec.py rec.json ovswrap.c [--dry-run]
+    python3 tools/add_krec.py rec.json dirtyfrag-gui.c [--dry-run]
 
 rec.json 就是 `ovswrap -dump-krec` 打出来的那种 JSON（单条对象或数组）:
 
     ovswrap -dump-krec > rec.json
-    python3 tools/add_krec.py rec.json ovswrap.c
+    python3 tools/add_krec.py rec.json dirtyfrag-gui.c
 
 合并规则:
     * 同 release 且 version 哈希相同  -> 覆盖那一条（改错重来很方便）

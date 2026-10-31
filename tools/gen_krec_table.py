@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""把 ovswrap-poc.py 里的 base85+zlib 内核记录表转成 ovswrap.c 能直接吃的紧凑二进制块。
+"""把 ovswrap-poc.py 里的 base85+zlib 内核记录表转成 dirtyfrag-gui.c 能直接吃的紧凑二进制块。
 
 用法:
-    python3 tools/gen_krec_table.py <ovswrap-poc.py> <ovswrap.c>
-    python3 tools/gen_krec_table.py --dump <ovswrap.c>      # 反解成 JSON 看看表里有什么
+    python3 tools/gen_krec_table.py <ovswrap-poc.py> <dirtyfrag-gui.c>
+    python3 tools/gen_krec_table.py --dump <dirtyfrag-gui.c>      # 反解成 JSON 看看表里有什么
 
 做的事情:
   1. 解出原版 _KERNEL_RECORDS_B85 (b85 -> zlib -> JSON, 808 条)。
   2. 去重: offsets / carrier+tunnel+lanes 组合 / release 字符串池。
   3. 打包成固定小端二进制, 再用 base85 编码成 C 字符串字面量。
-  4. 重写 ovswrap.c 里 BEGIN KREC / END KREC 之间的内容。
+  4. 重写 dirtyfrag-gui.c 里 BEGIN KREC / END KREC 之间的内容。
 
 二进制格式 (全部小端):
     char  magic[4]      "OKR1"
@@ -35,7 +35,7 @@ import struct
 import sys
 import zlib
 
-# 与 ovswrap.c 里 struct koffs 的字段顺序严格一致（ref_kind 单独占 1 字节）
+# 与 dirtyfrag-gui.c 里 struct koffs 的字段顺序严格一致（ref_kind 单独占 1 字节）
 LAYOUT_FIELDS = [
     "nf_conntrack_helper_me",
     "module_kobj_ktype",
@@ -118,7 +118,7 @@ def version_hash(record) -> int:
 def extract_b85_text(src: str) -> str:
     m = BLOCK_RE.search(src)
     if not m:
-        raise SystemExit("ovswrap.c 里没有 BEGIN KREC / END KREC 标记块")
+        raise SystemExit("dirtyfrag-gui.c 里没有 BEGIN KREC / END KREC 标记块")
     return "".join(re.findall(r'"([^"]*)"', m.group(0)))
 
 
@@ -280,7 +280,7 @@ def emit_c(blob: bytes) -> str:
 
 def replace_block(src: str, block: str) -> str:
     if not BLOCK_RE.search(src):
-        raise SystemExit("ovswrap.c 里没有 KREC 标记块")
+        raise SystemExit("dirtyfrag-gui.c 里没有 KREC 标记块")
     return BLOCK_RE.sub(lambda _: block, src, count=1)
 
 
