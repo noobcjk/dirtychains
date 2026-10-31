@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=DirtyFrag
+Name[zh_CN]=DirtyFrag 页缓存提权
+GenericName=Page-cache exploit frontend
+GenericName[zh_CN]=页缓存提权前端
+Comment=Five-chain page-cache exploit PoC with a GUI
+Comment[zh_CN]=五链页缓存提权 PoC 图形界面
+Exec=dirtyfrag-gui
+TryExec=dirtyfrag-gui
+Icon=security-high
+Terminal=false
+Categories=System;Security;
+Keywords=cve;exploit;security;dirtyfrag;
+StartupNotify=true

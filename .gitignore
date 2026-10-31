@@ -1,0 +1,21 @@
+# 构建产物
+*.o
+*.ko
+*.mod
+*.mod.c
+*.symvers
+*.order
+/dirtyfrag-gui
+/poc
+/ovswrap
+
+# 打包与历史归档
+*.tar.gz
+/archive/
+
+# Python
+__pycache__/
+*.pyc
+
+# 工具链缓存
+.codebuddy/
