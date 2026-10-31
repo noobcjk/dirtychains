@@ -8,6 +8,7 @@
 /dirtychains
 /poc
 /ovswrap
+.gccver-gui
 
 # 打包与历史归档
 *.tar.gz

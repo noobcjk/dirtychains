@@ -115,6 +115,7 @@ jobs:
             apt-get install -y --no-install-recommends \
               build-essential libgtk-3-dev pkg-config
             make dirtychains
+            gcc --version | head -1 > .gccver-gui
           '
           file dirtychains
           echo "最高所需 glibc：$(objdump -T dirtychains | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"
@@ -147,7 +148,8 @@ jobs:
             echo "构建时间 : $(date -u +%FT%TZ)"
             echo "链接方式 : poc / ovswrap 静态链接（不依赖目标机 glibc）"
             if [ -f "$D/dirtychains" ]; then
-              echo "           dirtychains 动态链接 GTK3（glibc >= 2.31，GTK3 >= 3.24）"
+              echo "           dirtychains 动态链接 GTK3（实测需 glibc >= 2.28，GTK3 >= 3.24）"
+              [ -f .gccver-gui ] && echo "GUI 编译器: $(cat .gccver-gui)（ubuntu:20.04 容器）"
             fi
             echo
             echo "顶层内容 :"
@@ -225,9 +227,10 @@ jobs:
             完全不挑 glibc 版本。
 
             `dirtychains`（GUI）动态链 GTK3，在 `ubuntu:20.04` 容器里编译，
-            最低要求 **glibc 2.31 + GTK 3.24**：Ubuntu 20.04 及以上、Debian 11 及以上、
-            UOS 20 都能直接跑；22.04/24.04 上同样正常（向前兼容）。
-            比这更老的系统请用 `poc`（同功能，纯命令行，静态链接）。
+            实测最低要求 **glibc 2.28 + GTK 3.24**：Debian 10、Ubuntu 18.10 及以上、
+            UOS 20、CentOS 8 都能直接跑；更新的系统同样正常（向前兼容）。
+            比这更老的系统（如 CentOS 7，glibc 2.17）请用 `poc`——
+            同功能、纯命令行、静态链接。
 
             每个包内都有 `offset/`（740 个内核 release 的偏移表），程序运行时按
             `<exe目录>/offset` → `./offset` → `/usr/share/dirtychains/offset` 的顺序查找。

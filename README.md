@@ -81,10 +81,10 @@ git push origin v1.6
 
 - `poc` / `ovswrap` 用 `-static -no-pie` 静态链接，目标机不需要对应版本的 glibc，老内核也能加载
 - `dirtychains` 必须动态链 GTK3，交叉编译要拉整条 arm64 桌面栈，所以只在 x86_64 包里提供
-  - 它是在 `ubuntu:20.04` 容器里编的，最低只要 **glibc 2.31 / GTK 3.24**（Ubuntu 20.04+、
-    Debian 11+、UOS 20 都够）。在 22.04/24.04 上照常运行
-  - 如果目标机更老（glibc < 2.31），用同包里的 `poc` / `ovswrap`——它们是静态链接，
-    只依赖内核，不依赖发行版
+  - 它是在 `ubuntu:20.04` 容器里编的，实测最低只要 **glibc 2.28 / GTK 3.24**：
+    Debian 10、Ubuntu 18.10+、UOS 20、CentOS 8 都够用；22.04/24.04 上照常运行
+  - 如果目标机更老（如 CentOS 7，glibc 2.17），用同包里的 `poc` / `ovswrap`——
+    它们是静态链接，只依赖内核，不依赖发行版
 - 每个包都带 `offset/`（740 个 release 的表）和 `BUILD.txt`（编译器、提交、构建时间）
 
 在 Actions 页面也能手动触发（`workflow_dispatch`）：填 tag 就发布到 Releases，留空只构建、
