@@ -62,15 +62,12 @@ krec:
 	python3 tools/gen_krec_table.py $(KREC_PY) $(KREC_SRC)
 
 # 编译偏移提取模块（目标机需要 linux-headers-$(uname -r)）
-# root 管理器界面（独立程序，配合 tools/kmod/rootmgr.ko）
+# root 管理器界面（独立程序，命令直接调 /bin/sh）
 rootmgr-gui: rootmgr-gui.c
 	$(CC) $(CFLAGS) $(GTK_CFLAGS) -o $@ $< $(GTK_LIBS)
 
 kmod:
 	$(MAKE) -C tools/kmod
-
-rootmgr-ko:
-	$(MAKE) -C tools/kmod rootmgr
 
 # 外部配置表：一条记录写成一个目录（rec.json 由 `ovswrap -dump-krec` 生成）
 offset-add:
@@ -125,4 +122,4 @@ uninstall:
 clean:
 	rm -f $(TARGET) $(GUI_OBJ) $(ENG_OBJ) $(ENGINE) ovswrap rootmgr-gui
 
-.PHONY: all install uninstall clean poc ovswrap offset-add offset-sync kmod rootmgr-ko rootmgr-gui
+.PHONY: all install uninstall clean poc ovswrap offset-add offset-sync kmod rootmgr-gui

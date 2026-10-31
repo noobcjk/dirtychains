@@ -1,15 +1,13 @@
 /*
- * rootmgr-gui.c —— 常驻 root 管理器的图形界面
+ * rootmgr-gui.c —— root 管理器的图形界面
  *
  * 版式参照 KernelSU（Material 3）：浅灰底、大标题、白色圆角卡片。
- * 窗口默认 960x600 横屏；卡片在宽屏下分左右两列，底部是四格切换栏：
- *   主页 / 超级用户 / 模块 / 设置
+ * 窗口默认 960x600 横屏，卡片在宽屏下分左右两列，底部是四格切换栏：
+ *   主页 / 超级用户 / 终端 / 设置
  *
- * 配合 tools/kmod/rootmgr.c 使用：
- *   1) 把 rootmgr.ko 放到本程序同目录（或 tools/kmod/ 下）；
- *   2) 「模块」页点「加载模块」，root 身份直跑 insmod，否则走 pkexec / sudo -n；
- *   3) 「超级用户」页列出当前用户自己的 shell 进程；
- *   4) 选中一个点「提权选中进程」，该进程的 uid 立刻变成 0。
+ * 终端页直接调 /bin/sh -c 执行命令：
+ *   - 程序本身以 root 运行时，命令就是 root 权限；
+ *   - 否则先试 sudo -n（免密），再退到 pkexec（弹密码框）。
  *
  * 构建：
  *   make rootmgr-gui
@@ -20,20 +18,16 @@
 #include <dirent.h>
 #include <errno.h>
 #include <pwd.h>
-#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
-#include <fcntl.h>
 #include <unistd.h>
 
-#define PROC_PATH   "/proc/rootmgr"
 #define APP_TITLE   "RootMgr"
-#define MGR_VERSION "1.0"
+#define MGR_VERSION "1.1"
 
 /* 图标种类：全部用 cairo 画，不依赖图标字体 / 主题 */
 typedef enum {
@@ -45,12 +39,11 @@ typedef enum {
     IC_FILTER,      /* 三条横线 */
     IC_T_HOME,      /* 底部栏：房子 */
     IC_T_SHIELD,    /* 底部栏：盾牌（超级用户） */
-    IC_T_PUZZLE,    /* 底部栏：拼图（模块） */
+    IC_T_TERM,      /* 底部栏：终端 */
     IC_T_GEAR       /* 底部栏：齿轮（设置） */
 } IconKind;
 
 #define TAB_COUNT 4
-#define LOG_VIEWS 2
 
 /* 进程列表的三列 */
 enum { COL_PID, COL_USER, COL_CMD, COL_N };
@@ -68,44 +61,26 @@ typedef struct {
     GtkWidget *val_selinux;
     GtkWidget *val_seccomp;
 
-    /* 超级用户 / 模块 / 设置页 */
-    GtkWidget *ko_label;
-    GtkWidget *lbl_mod;     /* 模块页的「已加载 / 未加载」 */
-    GtkWidget *tree;        /* 进程列表 */
+    /* 超级用户页 */
+    GtkWidget *tree;
     GtkListStore *store;
-    GtkWidget *btn_give;
-    GtkWidget *logviews[LOG_VIEWS];
-    int        nlog;
-    GtkTextBuffer *logbuf;
+
+    /* 终端页 */
+    GtkWidget *termview;
+    GtkTextBuffer *termbuf;
+    GtkWidget *entry;
+    GtkWidget *prompt;
+    GPid run_pid;
 
     /* 底部切换栏 */
     GtkWidget *tab_ico[TAB_COUNT];
     GtkWidget *tab_lbl[TAB_COUNT];
     int        cur;
-
-    char *ko_path;
-    int   sel_pid;
 } App;
 
 /* --------------------------------------------------------------------------
  * 小工具
  * ----------------------------------------------------------------------- */
-
-static char *exe_dir(void)
-{
-    char buf[4096];
-    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-
-    if (n <= 0)
-        return g_strdup(".");
-    buf[n] = '\0';
-    return g_path_get_dirname(buf);
-}
-
-static gboolean module_loaded(void)
-{
-    return g_file_test(PROC_PATH, G_FILE_TEST_EXISTS);
-}
 
 static const char *user_name(uid_t uid)
 {
@@ -116,6 +91,11 @@ static const char *user_name(uid_t uid)
         return pw->pw_name;
     g_snprintf(buf, sizeof(buf), "%u", (unsigned)uid);
     return buf;
+}
+
+static gboolean is_root(void)
+{
+    return geteuid() == 0;
 }
 
 static const char *selinux_text(void)
@@ -174,6 +154,68 @@ static const char *kernel_release(void)
         done = TRUE;
     }
     return u.release;
+}
+
+/* 在常见 sbin 目录里找可执行文件，PATH 里通常不含 /usr/sbin */
+static char *find_tool(const char *name)
+{
+    static const char *dirs[] = {
+        "/usr/sbin", "/sbin", "/usr/bin", "/bin",
+        "/usr/local/sbin", "/usr/local/bin"
+    };
+    size_t i;
+
+    for (i = 0; i < G_N_ELEMENTS(dirs); i++) {
+        char *p = g_build_filename(dirs[i], name, NULL);
+
+        if (g_file_test(p, G_FILE_TEST_IS_EXECUTABLE))
+            return p;
+        g_free(p);
+    }
+    return g_strdup(name);
+}
+
+static gboolean have_tool(const char *name)
+{
+    char *p = find_tool(name);
+    gboolean ok = g_file_test(p, G_FILE_TEST_IS_EXECUTABLE);
+
+    g_free(p);
+    return ok;
+}
+
+/* 免密 sudo 是否可用（root 身份下恒为真） */
+static gboolean sudo_ready(void)
+{
+    static int cached = -1;
+    char *sudo;
+    char *av[4];
+    gint st = -1;
+    gboolean ok = FALSE;
+
+    if (cached >= 0)
+        return cached != 0;
+
+    if (is_root()) {
+        cached = 1;
+        return TRUE;
+    }
+
+    sudo = find_tool("sudo");
+    av[0] = sudo;
+    av[1] = "-n";
+    av[2] = "true";
+    av[3] = NULL;
+
+    if (g_file_test(sudo, G_FILE_TEST_IS_EXECUTABLE) &&
+        g_spawn_sync(NULL, av, NULL, G_SPAWN_SEARCH_PATH, NULL, NULL,
+                     NULL, NULL, &st, NULL) &&
+        WIFEXITED(st) && WEXITSTATUS(st) == 0)
+        ok = TRUE;
+
+    g_free(sudo);
+    cached = ok ? 1 : 0;
+    return ok;
 }
 
 /* --------------------------------------------------------------------------
@@ -323,21 +365,15 @@ static gboolean on_icon_draw(GtkWidget *w, cairo_t *cr, gpointer data)
         cairo_stroke(cr);
         break;
 
-    case IC_T_PUZZLE:
-        cairo_move_to(cr, 6.4, 6.6);
-        cairo_line_to(cr, 8.8, 6.6);
-        cairo_arc(cr, 12.0, 6.6, 3.2, G_PI, 2 * G_PI);
-        cairo_line_to(cr, 17.6, 6.6);
-        cairo_arc(cr, 17.6, 9.0, 2.4, 1.5 * G_PI, 2 * G_PI);
-        cairo_line_to(cr, 20.0, 11.0);
-        cairo_arc_negative(cr, 20.0, 13.6, 2.6, 1.5 * G_PI, 0.5 * G_PI);
-        cairo_line_to(cr, 20.0, 18.6);
-        cairo_arc(cr, 17.6, 18.6, 2.4, 0, 0.5 * G_PI);
-        cairo_line_to(cr, 6.4, 21.0);
-        cairo_arc(cr, 6.4, 18.6, 2.4, 0.5 * G_PI, G_PI);
-        cairo_line_to(cr, 4.0, 9.0);
-        cairo_arc(cr, 6.4, 9.0, 2.4, G_PI, 1.5 * G_PI);
-        cairo_close_path(cr);
+    case IC_T_TERM:
+        rounded_rect(cr, 2.6, 4.3, 18.8, 15.4, 3.2);
+        cairo_stroke(cr);
+        cairo_move_to(cr, 7.0, 9.7);
+        cairo_line_to(cr, 10.3, 12.3);
+        cairo_line_to(cr, 7.0, 14.9);
+        cairo_stroke(cr);
+        cairo_move_to(cr, 12.6, 15.2);
+        cairo_line_to(cr, 17.2, 15.2);
         cairo_stroke(cr);
         break;
 
@@ -388,75 +424,33 @@ static void icon_set_kind(GtkWidget *w, IconKind kind)
 }
 
 /* --------------------------------------------------------------------------
- * 日志
- * ----------------------------------------------------------------------- */
-
-static void log_line(App *a, const char *fmt, ...)
-{
-    GtkTextIter end;
-    va_list ap;
-    char *msg;
-    int i;
-
-    if (!a->logbuf)
-        return;
-
-    va_start(ap, fmt);
-    msg = g_strdup_vprintf(fmt, ap);
-    va_end(ap);
-
-    gtk_text_buffer_get_end_iter(a->logbuf, &end);
-    gtk_text_buffer_insert(a->logbuf, &end, msg, -1);
-    g_free(msg);
-
-    gtk_text_buffer_get_end_iter(a->logbuf, &end);
-    for (i = 0; i < a->nlog; i++)
-        if (a->logviews[i])
-            gtk_text_view_scroll_to_iter(GTK_TEXT_VIEW(a->logviews[i]),
-                                         &end, 0, FALSE, 0, 0);
-}
-
-static void log_reset(App *a)
-{
-    if (!a->logbuf)
-        return;
-    gtk_text_buffer_set_text(a->logbuf, "", -1);
-}
-
-/* --------------------------------------------------------------------------
- * 状态
+ * 首页状态
  * ----------------------------------------------------------------------- */
 
 static void refresh_home(App *a)
 {
-    gboolean on = module_loaded();
+    gboolean root = is_root();
     char buf[128];
 
-    icon_set_kind(a->ico_status, on ? IC_CHECK : IC_ERROR);
-    gtk_label_set_text(GTK_LABEL(a->lbl_status), on ? "运行中" : "尚未启动");
+    icon_set_kind(a->ico_status, root ? IC_CHECK : IC_ERROR);
+    gtk_label_set_text(GTK_LABEL(a->lbl_status), root ? "root 已就绪" : "非 root 身份");
     gtk_label_set_text(GTK_LABEL(a->lbl_status_sub),
-                       on ? "rootmgr 模块已加载，可以直接给进程提权。"
-                          : "rootmgr 模块还没加载。到下方「模块」页加载后即可使用。");
+                       root ? "当前以 root 运行，「终端」页里的命令都是 root 权限。"
+                            : "「终端」页会通过 sudo -n / pkexec 提权执行；"
+                              "也可以直接用 root 启动本程序。");
 
     g_snprintf(buf, sizeof(buf), "%s (%s)", MGR_VERSION,
-               on ? "rootmgr" : "未加载");
+               root ? "root" : user_name(getuid()));
     gtk_label_set_text(GTK_LABEL(a->val_mgr), buf);
     gtk_label_set_text(GTK_LABEL(a->val_kernel), kernel_release());
     gtk_label_set_text(GTK_LABEL(a->val_selinux), selinux_text());
     gtk_label_set_text(GTK_LABEL(a->val_seccomp), seccomp_text());
-
-    if (a->lbl_mod)
-        gtk_label_set_text(GTK_LABEL(a->lbl_mod),
-                           on ? "已加载" : "未加载");
 }
 
-static void refresh_state(App *a)
-{
-    refresh_home(a);
-    gtk_widget_set_sensitive(a->btn_give, module_loaded());
-}
+/* --------------------------------------------------------------------------
+ * 超级用户页：当前用户自己的 shell 进程
+ * ----------------------------------------------------------------------- */
 
-/* 只列出当前用户自己的、常见的 shell 进程 */
 static gboolean is_shell_name(const char *name)
 {
     static const char *ok[] = {
@@ -481,7 +475,6 @@ static void refresh_procs(App *a)
         return;
 
     gtk_list_store_clear(a->store);
-    a->sel_pid = 0;
 
     d = opendir("/proc");
     if (!d)
@@ -540,215 +533,247 @@ static void refresh_procs(App *a)
 }
 
 /* --------------------------------------------------------------------------
- * 动作
+ * 终端
  * ----------------------------------------------------------------------- */
 
-static void on_refresh(GtkWidget *w, gpointer data)
+static void term_append(App *a, const char *text, const char *tag)
 {
-    App *a = data;
+    GtkTextIter end;
+    GtkTextMark *mark;
 
-    (void)w;
-    log_reset(a);
-    refresh_state(a);
-    refresh_procs(a);
-    log_line(a, "刷新：模块%s\n", module_loaded() ? "已加载" : "未加载");
+    if (!a->termbuf)
+        return;
+
+    gtk_text_buffer_get_end_iter(a->termbuf, &end);
+    if (tag)
+        gtk_text_buffer_insert_with_tags_by_name(a->termbuf, &end, text, -1, tag, NULL);
+    else
+        gtk_text_buffer_insert(a->termbuf, &end, text, -1);
+
+    gtk_text_buffer_get_end_iter(a->termbuf, &end);
+    gtk_text_buffer_place_cursor(a->termbuf, &end);
+    mark = gtk_text_buffer_get_insert(a->termbuf);
+    gtk_text_view_scroll_mark_onscreen(GTK_TEXT_VIEW(a->termview), mark);
 }
 
-static void run_priv(App *a, const char *const *argv, const char *what)
+/* 输出没以换行结尾时补一个，避免提示符粘在结果后面 */
+static void term_ensure_nl(App *a)
 {
-    char *out = NULL, *err = NULL;
-    GError *ge = NULL;
-    gint st = -1;
-    gboolean ok;
+    GtkTextIter end;
+    gunichar ch;
 
-    log_line(a, "> %s\n", what);
-    ok = g_spawn_sync(NULL, (char **)argv, NULL, G_SPAWN_SEARCH_PATH,
-                      NULL, NULL, &out, &err, &st, &ge);
-    if (!ok) {
-        log_line(a, "  启动失败: %s\n", ge ? ge->message : "未知");
+    if (!a->termbuf)
+        return;
+    gtk_text_buffer_get_end_iter(a->termbuf, &end);
+    if (gtk_text_iter_get_offset(&end) == 0)
+        return;
+    gtk_text_buffer_get_iter_at_offset(a->termbuf, &end, gtk_text_buffer_get_char_count(a->termbuf) - 1);
+    ch = gtk_text_iter_get_char(&end);
+    if (ch != '\n')
+        term_append(a, "\n", NULL);
+}
+
+static void term_clear(App *a)
+{
+    if (a->termbuf)
+        gtk_text_buffer_set_text(a->termbuf, "", -1);
+}
+
+static const char *term_prompt_str(void)
+{
+    return is_root() ? "root@rootmgr # " : "user@rootmgr $ ";
+}
+
+static gboolean pipe_read(GIOChannel *ch, GIOCondition cond, gpointer data,
+                          const char *tag)
+{
+    App *a = data;
+    gchar buf[1024];
+    gsize n = 0;
+    GError *err = NULL;
+    GIOStatus st;
+
+    st = g_io_channel_read_chars(ch, buf, sizeof(buf) - 1, &n, &err);
+    if (n > 0) {
+        buf[n] = '\0';
+        term_append(a, buf, tag);
+    }
+    if (err)
+        g_error_free(err);
+
+    if (st == G_IO_STATUS_EOF || st == G_IO_STATUS_ERROR ||
+        ((cond & (G_IO_HUP | G_IO_ERR)) && n == 0)) {
+        g_io_channel_unref(ch);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static gboolean on_stdout(GIOChannel *ch, GIOCondition cond, gpointer data)
+{
+    return pipe_read(ch, cond, data, NULL);
+}
+
+static gboolean on_stderr(GIOChannel *ch, GIOCondition cond, gpointer data)
+{
+    return pipe_read(ch, cond, data, "err");
+}
+
+static void on_child_exit(GPid pid, gint status, gpointer data)
+{
+    App *a = data;
+    char buf[64];
+
+    g_spawn_close_pid(pid);
+    a->run_pid = 0;
+
+    term_ensure_nl(a);
+    if (!WIFEXITED(status))
+        term_append(a, "[异常终止]\n", "err");
+    else if (WEXITSTATUS(status) != 0) {
+        g_snprintf(buf, sizeof(buf), "[退出码 %d]\n", WEXITSTATUS(status));
+        term_append(a, buf, "err");
+    }
+
+    if (a->entry) {
+        gtk_widget_set_sensitive(a->entry, TRUE);
+        gtk_widget_grab_focus(a->entry);
+    }
+}
+
+/* 把命令包成一次 spawn：root 直跑，否则 sudo -n → pkexec */
+static gboolean build_argv(const char *cmd, char *argv[], int *argc)
+{
+    static char *sudo_path, *pkexec_path;
+
+    if (is_root()) {
+        argv[0] = (char *)"/bin/sh";
+        argv[1] = (char *)"-c";
+        argv[2] = (char *)cmd;
+        argv[3] = NULL;
+        *argc = 3;
+        return TRUE;
+    }
+
+    if (sudo_ready()) {
+        if (!sudo_path)
+            sudo_path = find_tool("sudo");
+        argv[0] = sudo_path;
+        argv[1] = (char *)"-n";
+        argv[2] = (char *)"/bin/sh";
+        argv[3] = (char *)"-c";
+        argv[4] = (char *)cmd;
+        argv[5] = NULL;
+        *argc = 5;
+        return TRUE;
+    }
+
+    if (have_tool("pkexec")) {
+        if (!pkexec_path)
+            pkexec_path = find_tool("pkexec");
+        argv[0] = pkexec_path;
+        argv[1] = (char *)"/bin/sh";
+        argv[2] = (char *)"-c";
+        argv[3] = (char *)cmd;
+        argv[4] = NULL;
+        *argc = 4;
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+static void term_run(App *a, const char *cmd)
+{
+    char *argv[8];
+    int argc = 0;
+    GPid pid = 0;
+    gint out_fd = -1, err_fd = -1;
+    GError *ge = NULL;
+
+    if (a->run_pid) {
+        term_append(a, "上一条命令还在跑，等它结束\n", "err");
+        return;
+    }
+
+    if (!build_argv(cmd, argv, &argc)) {
+        term_append(a, "没有 root 也不见 sudo / pkexec，"
+                       "请直接以 root 启动本程序\n", "err");
+        return;
+    }
+
+    if (!g_spawn_async_with_pipes(NULL, argv, NULL,
+                                  G_SPAWN_SEARCH_PATH | G_SPAWN_DO_NOT_REAP_CHILD,
+                                  NULL, NULL, &pid,
+                                  NULL, &out_fd, &err_fd, &ge)) {
+        term_append(a, ge ? ge->message : "启动失败", "err");
+        term_append(a, "\n", NULL);
         if (ge)
             g_error_free(ge);
-        g_free(out);
-        g_free(err);
         return;
     }
 
-    if (out && *out)
-        log_line(a, "%s", out);
-    if (err && *err)
-        log_line(a, "%s", err);
-    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0)
-        log_line(a, "  退出码 %d\n", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
-    else
-        log_line(a, "  完成\n");
+    a->run_pid = pid;
+    g_child_watch_add(pid, on_child_exit, a);
 
-    g_free(out);
-    g_free(err);
-}
+    if (out_fd >= 0) {
+        GIOChannel *ch = g_io_channel_unix_new(out_fd);
 
-/* 在常见 sbin 目录里找可执行文件，PATH 里通常不含 /usr/sbin */
-static char *find_tool(const char *name)
-{
-    static const char *dirs[] = {
-        "/usr/sbin", "/sbin", "/usr/bin", "/bin",
-        "/usr/local/sbin", "/usr/local/bin"
-    };
-    size_t i;
-
-    for (i = 0; i < G_N_ELEMENTS(dirs); i++) {
-        char *p = g_build_filename(dirs[i], name, NULL);
-
-        if (g_file_test(p, G_FILE_TEST_IS_EXECUTABLE))
-            return p;
-        g_free(p);
+        g_io_channel_set_encoding(ch, NULL, NULL);
+        g_io_add_watch(ch, G_IO_IN | G_IO_HUP | G_IO_ERR, on_stdout, a);
     }
-    return g_strdup(name);
-}
+    if (err_fd >= 0) {
+        GIOChannel *ch = g_io_channel_unix_new(err_fd);
 
-/*
- * 统一执行 insmod / rmmod。
- *
- * 身份为 root 时直接跑，不再套 pkexec —— 否则在没有 polkit 的机器上
- * 会先报 "Failed to execute child process"，明明已经有权限却跑不动。
- */
-static void do_module_op(App *a, const char *op, const char *arg)
-{
-    const char *av[6];
-    char *tool = find_tool(op);
-    char *pkexec = find_tool("pkexec");
-    char *sudo = find_tool("sudo");
-    char *what = NULL;
-    int n = 0;
-
-    if (geteuid() == 0) {
-        av[n++] = tool;
-        av[n++] = arg;
-        what = g_strdup_printf("%s %s  (root 直接执行)", op, arg);
-    } else if (g_file_test(pkexec, G_FILE_TEST_IS_EXECUTABLE)) {
-        av[n++] = pkexec;
-        av[n++] = tool;
-        av[n++] = arg;
-        what = g_strdup_printf("%s %s  (pkexec)", op, arg);
-    } else if (g_file_test(sudo, G_FILE_TEST_IS_EXECUTABLE)) {
-        av[n++] = sudo;
-        av[n++] = "-n";
-        av[n++] = tool;
-        av[n++] = arg;
-        what = g_strdup_printf("%s %s  (sudo -n)", op, arg);
-    } else {
-        log_line(a, "当前不是 root，也找不到 pkexec / sudo\n"
-                    "  可以先切到 root 再运行本程序，或在终端执行：\n"
-                    "    sudo %s %s\n", tool, arg);
-        goto out;
+        g_io_channel_set_encoding(ch, NULL, NULL);
+        g_io_add_watch(ch, G_IO_IN | G_IO_HUP | G_IO_ERR, on_stderr, a);
     }
-    av[n] = NULL;
 
-    run_priv(a, av, what);
-
-out:
-    g_free(what);
-    g_free(tool);
-    g_free(pkexec);
-    g_free(sudo);
 }
 
-static void on_load(GtkWidget *w, gpointer data)
+static void on_entry_activate(GtkWidget *w, gpointer data)
 {
     App *a = data;
+    const char *text = gtk_entry_get_text(GTK_ENTRY(w));
 
+    if (!text || !*text) {
+        term_append(a, term_prompt_str(), "cmd");
+        return;
+    }
+
+    if (!strcmp(text, "clear")) {
+        term_clear(a);
+        gtk_entry_set_text(GTK_ENTRY(w), "");
+        return;
+    }
+
+    /* 回显：提示符 + 命令 */
+    term_append(a, term_prompt_str(), "cmd");
+    term_append(a, text, "cmd");
+    term_append(a, "\n", NULL);
+
+    /* text 指向 GtkEntry 内部缓冲，必须等 spawn 完成后再清空 */
+    term_run(a, text);
+    gtk_entry_set_text(GTK_ENTRY(w), "");
+}
+
+static void on_run_clicked(GtkWidget *w, gpointer data)
+{
     (void)w;
-    log_reset(a);
-
-    if (!a->ko_path || !g_file_test(a->ko_path, G_FILE_TEST_EXISTS)) {
-        log_line(a, "找不到 rootmgr.ko\n"
-                    "  把它放到本程序同目录，或先执行 make rootmgr\n");
-        return;
-    }
-
-    do_module_op(a, "insmod", a->ko_path);
-
-    refresh_state(a);
-    refresh_procs(a);
+    on_entry_activate(((App *)data)->entry, data);
 }
 
-static void on_unload(GtkWidget *w, gpointer data)
+static void on_term_clear(GtkWidget *w, gpointer data)
 {
-    App *a = data;
-
     (void)w;
-    log_reset(a);
-
-    if (!module_loaded()) {
-        log_line(a, "模块未加载，无需卸载\n");
-        return;
-    }
-
-    do_module_op(a, "rmmod", "rootmgr");
-
-    refresh_state(a);
-    refresh_procs(a);
+    term_clear(data);
 }
 
-static void on_sel_changed(GtkTreeSelection *sel, gpointer data)
-{
-    App *a = data;
-    GtkTreeModel *model;
-    GtkTreeIter it;
-    int pid = 0;
+/* --------------------------------------------------------------------------
+ * 页面切换
+ * ----------------------------------------------------------------------- */
 
-    if (gtk_tree_selection_get_selected(sel, &model, &it))
-        gtk_tree_model_get(model, &it, COL_PID, &pid, -1);
-
-    a->sel_pid = pid;
-    gtk_widget_set_sensitive(a->btn_give, a->sel_pid > 0 && module_loaded());
-}
-
-static void on_give(GtkWidget *w, gpointer data)
-{
-    App *a = data;
-    char cmd[64];
-    int fd;
-    ssize_t wr;
-
-    (void)w;
-    log_reset(a);
-
-    if (a->sel_pid <= 0) {
-        log_line(a, "先在上面选一个进程\n");
-        return;
-    }
-    if (!module_loaded()) {
-        log_line(a, "模块未加载，先点「加载模块」\n");
-        return;
-    }
-
-    g_snprintf(cmd, sizeof(cmd), "give %d", a->sel_pid);
-
-    /* proc 文件不能用 g_file_set_contents: 它带 O_CREAT|O_TRUNC，procfs 会拒绝 */
-    fd = open(PROC_PATH, O_WRONLY);
-    if (fd < 0) {
-        log_line(a, "打开 %s 失败: %s\n", PROC_PATH, g_strerror(errno));
-        return;
-    }
-
-    wr = write(fd, cmd, strlen(cmd));
-    if (wr < 0 || (size_t)wr != strlen(cmd)) {
-        int e = errno;
-
-        close(fd);
-        log_line(a, "写 %s 失败: %s\n", PROC_PATH, g_strerror(e));
-        return;
-    }
-    close(fd);
-
-    log_line(a, "已提交: %s\n"
-                "  到那个进程的终端里执行 id，应看到 uid=0(root)\n", cmd);
-
-    refresh_state(a);
-}
-
-/* 页面切换：底部栏四页 */
-static const char *PAGE_NAMES[TAB_COUNT] = { "home", "super", "mod", "set" };
+static const char *PAGE_NAMES[TAB_COUNT] = { "home", "super", "term", "set" };
 
 static void switch_page(App *a, int idx)
 {
@@ -775,10 +800,12 @@ static void switch_page(App *a, int idx)
             gtk_style_context_remove_class(sc, "on");
     }
 
-    if (idx == 0 || idx == 2)
-        refresh_state(a);
+    if (idx == 0)
+        refresh_home(a);
     if (idx == 1)
         refresh_procs(a);
+    if (idx == 2 && a->entry)
+        gtk_widget_grab_focus(a->entry);
 }
 
 static void on_tab(GtkWidget *w, GdkEventButton *ev, gpointer data)
@@ -788,6 +815,15 @@ static void on_tab(GtkWidget *w, GdkEventButton *ev, gpointer data)
 
     (void)ev;
     switch_page(a, idx);
+}
+
+/* 点状态卡直接去终端 */
+static gboolean on_status_click(GtkWidget *w, GdkEventButton *ev, gpointer data)
+{
+    (void)w;
+    (void)ev;
+    switch_page(data, 2);
+    return TRUE;
 }
 
 /* --------------------------------------------------------------------------
@@ -820,6 +856,14 @@ static const char *CSS =
     "#tabbar { background-color: #ededf1; border-top: 1px solid rgba(0,0,0,0.075); }\n"
     "#tablbl { color: #8e8e93; font-size: 11.5px; }\n"
     "#tablbl.on { color: #1b1b1b; font-weight: 600; }\n"
+    "#term, #term text { background-color: #fafafc; color: #1f1f22;\n"
+    "         font-family: \"DejaVu Sans Mono\", \"Noto Sans Mono\", monospace;\n"
+    "         font-size: 12.5px; }\n"
+    "#termscroll, #termscroll viewport { background-color: #fafafc; }\n"
+    "#prompt { color: #1b1b1b; font-family: \"DejaVu Sans Mono\", monospace;\n"
+    "          font-size: 12.5px; font-weight: 600; }\n"
+    "#cmdline { font-family: \"DejaVu Sans Mono\", monospace; font-size: 12.5px;\n"
+    "           background-color: #f4f4f7; border-radius: 12px; padding: 6px 10px; }\n"
     "button.primary { background-color: #1b1b1b; color: #ffffff; }\n"
     "button.primary:hover { background-color: #33333a; }\n";
 
@@ -834,21 +878,13 @@ static GtkWidget *card_new(void)
     return box;
 }
 
-/* 点状态卡等同点「模块」，和 KernelSU 首页一致 */
-static gboolean on_status_click(GtkWidget *w, GdkEventButton *ev, gpointer data)
-{
-    (void)w;
-    (void)ev;
-    switch_page(data, 2);
-    return TRUE;
-}
-
 /* 状态卡：左图标 + 右两行字 */
 static GtkWidget *status_card(App *a)
 {
     GtkWidget *c = card_new();
     GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 18);
     GtkWidget *col = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+    GtkWidget *eb;
 
     gtk_widget_set_margin_start(row, 22);
     gtk_widget_set_margin_end(row, 22);
@@ -859,7 +895,7 @@ static GtkWidget *status_card(App *a)
     gtk_widget_set_valign(a->ico_status, GTK_ALIGN_START);
     gtk_widget_set_margin_top(a->ico_status, 2);
 
-    a->lbl_status = gtk_label_new("尚未启动");
+    a->lbl_status = gtk_label_new("");
     gtk_widget_set_name(a->lbl_status, "status_title");
     gtk_widget_set_halign(a->lbl_status, GTK_ALIGN_START);
 
@@ -867,7 +903,7 @@ static GtkWidget *status_card(App *a)
     gtk_widget_set_name(a->lbl_status_sub, "status_sub");
     gtk_widget_set_halign(a->lbl_status_sub, GTK_ALIGN_START);
     gtk_label_set_line_wrap(GTK_LABEL(a->lbl_status_sub), TRUE);
-    gtk_label_set_max_width_chars(GTK_LABEL(a->lbl_status_sub), 34);
+    gtk_label_set_max_width_chars(GTK_LABEL(a->lbl_status_sub), 60);
 
     gtk_box_pack_start(GTK_BOX(col), a->lbl_status, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(col), a->lbl_status_sub, FALSE, FALSE, 0);
@@ -875,14 +911,11 @@ static GtkWidget *status_card(App *a)
     gtk_box_pack_start(GTK_BOX(row), col, TRUE, TRUE, 0);
     gtk_box_pack_start(GTK_BOX(c), row, FALSE, FALSE, 0);
 
-    {
-        GtkWidget *eb = gtk_event_box_new();
-
-        gtk_event_box_set_visible_window(GTK_EVENT_BOX(eb), FALSE);
-        gtk_container_add(GTK_CONTAINER(eb), c);
-        g_signal_connect(eb, "button-press-event", G_CALLBACK(on_status_click), a);
-        return eb;
-    }
+    eb = gtk_event_box_new();
+    gtk_event_box_set_visible_window(GTK_EVENT_BOX(eb), FALSE);
+    gtk_container_add(GTK_CONTAINER(eb), c);
+    g_signal_connect(eb, "button-press-event", G_CALLBACK(on_status_click), a);
+    return eb;
 }
 
 /* 信息行：左图标 + 标题 + 值 */
@@ -907,7 +940,7 @@ static GtkWidget *info_row(IconKind kind, const char *label, GtkWidget **val_out
     gtk_widget_set_name(val, "cardvalue");
     gtk_widget_set_halign(val, GTK_ALIGN_START);
     gtk_label_set_line_wrap(GTK_LABEL(val), TRUE);
-    gtk_label_set_max_width_chars(GTK_LABEL(val), 40);
+    gtk_label_set_max_width_chars(GTK_LABEL(val), 34);
 
     gtk_box_pack_start(GTK_BOX(col), lbl, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(col), val, FALSE, FALSE, 0);
@@ -957,14 +990,10 @@ static GtkWidget *build_home(App *a)
     gtk_widget_set_margin_top(body, 8);
     gtk_widget_set_margin_bottom(body, 20);
 
-    /* 大标题（不再有右上角按钮，功能全在底部栏） */
     gtk_box_pack_start(GTK_BOX(body), page_title(APP_TITLE, "bigtitle"),
                        FALSE, FALSE, 0);
-
-    /* 状态卡 */
     gtk_box_pack_start(GTK_BOX(body), status_card(a), FALSE, FALSE, 0);
 
-    /* 版本信息卡 */
     card_info = card_new();
     gtk_box_pack_start(GTK_BOX(card_info),
                        info_row(IC_HASH, "管理器版本", &a->val_mgr), FALSE, FALSE, 0);
@@ -974,7 +1003,6 @@ static GtkWidget *build_home(App *a)
     gtk_widget_set_margin_top(card_info, 4);
     gtk_widget_set_margin_bottom(card_info, 4);
 
-    /* 系统状态卡 */
     card_sys = card_new();
     gtk_box_pack_start(GTK_BOX(card_sys),
                        info_row(IC_SHIELD, "SELinux 状态", &a->val_selinux), FALSE, FALSE, 0);
@@ -988,8 +1016,6 @@ static GtkWidget *build_home(App *a)
         GtkWidget *left = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
         GtkWidget *right = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
 
-        gtk_widget_set_halign(left, GTK_ALIGN_FILL);
-        gtk_widget_set_halign(right, GTK_ALIGN_FILL);
         gtk_box_pack_start(GTK_BOX(cols), left, TRUE, TRUE, 0);
         gtk_box_pack_start(GTK_BOX(cols), right, TRUE, TRUE, 0);
         gtk_box_pack_start(GTK_BOX(left), card_info, FALSE, FALSE, 0);
@@ -1001,49 +1027,12 @@ static GtkWidget *build_home(App *a)
     return scroll;
 }
 
-/* 日志卡：超级用户页和模块页各一个 view，共用同一个 buffer */
-static GtkWidget *log_card(App *a, int min_h)
-{
-    GtkWidget *card = card_new();
-    GtkWidget *cbody = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-    GtkWidget *logscroll, *tv, *lbl;
-
-    gtk_widget_set_margin_start(cbody, 14);
-    gtk_widget_set_margin_end(cbody, 14);
-    gtk_widget_set_margin_top(cbody, 14);
-    gtk_widget_set_margin_bottom(cbody, 14);
-
-    lbl = gtk_label_new("输出");
-    gtk_widget_set_name(lbl, "cardtitle");
-    gtk_widget_set_halign(lbl, GTK_ALIGN_START);
-    gtk_box_pack_start(GTK_BOX(cbody), lbl, FALSE, FALSE, 0);
-
-    logscroll = gtk_scrolled_window_new(NULL, NULL);
-    gtk_widget_set_name(logscroll, "logscroll");
-    gtk_widget_set_size_request(logscroll, -1, min_h);
-
-    if (!a->logbuf)
-        a->logbuf = gtk_text_buffer_new(NULL);
-    tv = gtk_text_view_new_with_buffer(a->logbuf);
-    gtk_widget_set_name(tv, "logview");
-    gtk_text_view_set_editable(GTK_TEXT_VIEW(tv), FALSE);
-    gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(tv), FALSE);
-    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(tv), GTK_WRAP_WORD_CHAR);
-
-    if (a->nlog < LOG_VIEWS)
-        a->logviews[a->nlog++] = tv;
-
-    gtk_container_add(GTK_CONTAINER(logscroll), tv);
-    gtk_box_pack_start(GTK_BOX(cbody), logscroll, TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(card), cbody, TRUE, TRUE, 0);
-    return card;
-}
-
-/* 超级用户页：可提权进程 + 输出 */
+/* 超级用户页：当前用户的 shell 进程（只读） */
 static GtkWidget *build_super(App *a)
 {
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
-    GtkWidget *card_proc, *cbody, *scroll, *h, *lbl, *sub;
+    GtkWidget *card, *cbody, *h, *lbl, *sub, *btn, *scroll;
+    GtkWidget *tree;
 
     gtk_widget_set_margin_start(box, 8);
     gtk_widget_set_margin_end(box, 8);
@@ -1052,23 +1041,27 @@ static GtkWidget *build_super(App *a)
 
     gtk_box_pack_start(GTK_BOX(box), page_title("超级用户", NULL), FALSE, FALSE, 0);
 
-    card_proc = card_new();
-    gtk_widget_set_vexpand(card_proc, TRUE);
+    card = card_new();
+    gtk_widget_set_vexpand(card, TRUE);
     cbody = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-    gtk_widget_set_margin_start(cbody, 12);
-    gtk_widget_set_margin_end(cbody, 12);
+    gtk_widget_set_margin_start(cbody, 10);
+    gtk_widget_set_margin_end(cbody, 10);
     gtk_widget_set_margin_top(cbody, 14);
     gtk_widget_set_margin_bottom(cbody, 14);
 
     h = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    lbl = gtk_label_new("可提权进程");
-    sub = gtk_label_new("当前用户");
+    lbl = gtk_label_new("当前用户的进程");
+    sub = gtk_label_new(user_name(getuid()));
+    btn = gtk_button_new_with_label("刷新");
     gtk_widget_set_name(lbl, "cardtitle");
     gtk_widget_set_name(sub, "cardvalue");
+    gtk_widget_set_name(btn, "textbtn");
     gtk_widget_set_halign(lbl, GTK_ALIGN_START);
     gtk_widget_set_valign(sub, GTK_ALIGN_CENTER);
+    gtk_widget_set_valign(btn, GTK_ALIGN_CENTER);
     gtk_box_pack_start(GTK_BOX(h), lbl, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(h), sub, FALSE, FALSE, 0);
+    gtk_box_pack_end(GTK_BOX(h), btn, FALSE, FALSE, 0);
     gtk_widget_set_margin_start(h, 10);
     gtk_box_pack_start(GTK_BOX(cbody), h, FALSE, FALSE, 0);
 
@@ -1076,13 +1069,13 @@ static GtkWidget *build_super(App *a)
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
                                    GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
     gtk_widget_set_vexpand(scroll, TRUE);
+
     a->store = gtk_list_store_new(COL_N, G_TYPE_INT, G_TYPE_STRING, G_TYPE_STRING);
-    a->tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(a->store));
-    gtk_widget_set_name(a->tree, "proctree");
-    gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(a->tree), FALSE);
-    gtk_tree_view_set_enable_search(GTK_TREE_VIEW(a->tree), FALSE);
-    g_signal_connect(gtk_tree_view_get_selection(GTK_TREE_VIEW(a->tree)),
-                     "changed", G_CALLBACK(on_sel_changed), a);
+    tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(a->store));
+    a->tree = tree;
+    gtk_widget_set_name(tree, "proctree");
+    gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(tree), FALSE);
+    gtk_tree_view_set_enable_search(GTK_TREE_VIEW(tree), FALSE);
 
     {
         GtkCellRenderer *r;
@@ -1092,114 +1085,138 @@ static GtkWidget *build_super(App *a)
         g_object_set(r, "weight", PANGO_WEIGHT_BOLD, "xpad", 10, NULL);
         c = gtk_tree_view_column_new_with_attributes("pid", r, "text", COL_PID, NULL);
         gtk_tree_view_column_set_min_width(c, 78);
-        gtk_tree_view_append_column(GTK_TREE_VIEW(a->tree), c);
+        gtk_tree_view_append_column(GTK_TREE_VIEW(tree), c);
 
         r = gtk_cell_renderer_text_new();
         g_object_set(r, "xpad", 10, NULL);
         c = gtk_tree_view_column_new_with_attributes("user", r, "text", COL_USER, NULL);
         gtk_tree_view_column_set_min_width(c, 84);
-        gtk_tree_view_append_column(GTK_TREE_VIEW(a->tree), c);
+        gtk_tree_view_append_column(GTK_TREE_VIEW(tree), c);
 
         r = gtk_cell_renderer_text_new();
         g_object_set(r, "ellipsize", PANGO_ELLIPSIZE_END, "xpad", 10, NULL);
         c = gtk_tree_view_column_new_with_attributes("cmd", r, "text", COL_CMD, NULL);
         gtk_tree_view_column_set_expand(c, TRUE);
-        gtk_tree_view_append_column(GTK_TREE_VIEW(a->tree), c);
+        gtk_tree_view_append_column(GTK_TREE_VIEW(tree), c);
     }
 
-    gtk_container_add(GTK_CONTAINER(scroll), a->tree);
+    gtk_container_add(GTK_CONTAINER(scroll), tree);
     gtk_box_pack_start(GTK_BOX(cbody), scroll, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(card), cbody, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(box), card, TRUE, TRUE, 0);
 
-    a->btn_give = gtk_button_new_with_label("提权选中进程");
-    gtk_widget_set_halign(a->btn_give, GTK_ALIGN_END);
-    gtk_widget_set_sensitive(a->btn_give, FALSE);
-    gtk_box_pack_start(GTK_BOX(cbody), a->btn_give, FALSE, FALSE, 0);
-
-    gtk_box_pack_start(GTK_BOX(card_proc), cbody, TRUE, TRUE, 0);
-
-    /* 横屏：左边进程列表，右边输出 */
     {
-        GtkWidget *cols = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
-        GtkWidget *right = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-
-        gtk_box_pack_start(GTK_BOX(cols), card_proc, TRUE, TRUE, 0);
-        gtk_box_pack_start(GTK_BOX(cols), right, TRUE, TRUE, 0);
-        gtk_box_pack_start(GTK_BOX(right), log_card(a, 150), TRUE, TRUE, 0);
-        gtk_box_pack_start(GTK_BOX(box), cols, TRUE, TRUE, 0);
+        GtkWidget *hint = gtk_label_new("这里是 /proc 里属于当前用户的 shell 进程，仅供查看。");
+        gtk_widget_set_name(hint, "cardvalue");
+        gtk_widget_set_halign(hint, GTK_ALIGN_START);
+        gtk_widget_set_margin_start(hint, 14);
+        gtk_box_pack_start(GTK_BOX(box), hint, FALSE, FALSE, 0);
     }
 
-    g_signal_connect(a->btn_give, "clicked", G_CALLBACK(on_give), a);
+    g_signal_connect_swapped(btn, "clicked", G_CALLBACK(refresh_procs), a);
     return box;
 }
 
-/* 模块页：加载 / 卸载 / 刷新 + 输出 */
-static GtkWidget *build_mod(App *a)
+/* 终端页：一行输入 + 输出区 */
+static GtkWidget *build_term(App *a)
 {
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
-    GtkWidget *card_mod, *cbody, *h, *title, *status;
-    GtkWidget *btn_row, *btn_refresh, *btn_load, *btn_unload;
+    GtkWidget *card, *cbody, *h, *lbl, *btn_clear;
+    GtkWidget *scroll, *line, *btn_run;
 
     gtk_widget_set_margin_start(box, 8);
     gtk_widget_set_margin_end(box, 8);
     gtk_widget_set_margin_top(box, 8);
     gtk_widget_set_margin_bottom(box, 12);
 
-    gtk_box_pack_start(GTK_BOX(box), page_title("模块", NULL), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(box), page_title("终端", NULL), FALSE, FALSE, 0);
 
-    card_mod = card_new();
-    cbody = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
-    gtk_widget_set_margin_start(cbody, 22);
-    gtk_widget_set_margin_end(cbody, 22);
-    gtk_widget_set_margin_top(cbody, 18);
-    gtk_widget_set_margin_bottom(cbody, 18);
+    card = card_new();
+    gtk_widget_set_vexpand(card, TRUE);
+    cbody = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_widget_set_margin_start(cbody, 14);
+    gtk_widget_set_margin_end(cbody, 14);
+    gtk_widget_set_margin_top(cbody, 14);
+    gtk_widget_set_margin_bottom(cbody, 14);
 
-    h = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
-    title = gtk_label_new("rootmgr 内核模块");
-    gtk_widget_set_name(title, "cardtitle");
-    gtk_widget_set_halign(title, GTK_ALIGN_START);
-    status = gtk_label_new("未加载");
-    gtk_widget_set_name(status, "cardvalue");
-    gtk_widget_set_valign(status, GTK_ALIGN_CENTER);
-    a->lbl_mod = status;
-    gtk_box_pack_start(GTK_BOX(h), title, FALSE, FALSE, 0);
-    gtk_box_pack_end(GTK_BOX(h), status, FALSE, FALSE, 0);
+    h = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    lbl = gtk_label_new("输出");
+    gtk_widget_set_name(lbl, "cardtitle");
+    gtk_widget_set_halign(lbl, GTK_ALIGN_START);
+    gtk_widget_set_valign(lbl, GTK_ALIGN_CENTER);
+
+    btn_clear = gtk_button_new_with_label("清屏");
+    gtk_widget_set_name(btn_clear, "textbtn");
+    gtk_widget_set_valign(btn_clear, GTK_ALIGN_CENTER);
+
+    gtk_box_pack_start(GTK_BOX(h), lbl, TRUE, TRUE, 0);
+    gtk_box_pack_end(GTK_BOX(h), btn_clear, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(cbody), h, FALSE, FALSE, 0);
 
-    {
-        GtkWidget *hint = gtk_label_new("加载后 /proc/rootmgr 才会出现，卸载前请先给进程提权完。");
-        gtk_widget_set_name(hint, "cardvalue");
-        gtk_widget_set_halign(hint, GTK_ALIGN_START);
-        gtk_label_set_line_wrap(GTK_LABEL(hint), TRUE);
-        gtk_label_set_max_width_chars(GTK_LABEL(hint), 40);
-        gtk_box_pack_start(GTK_BOX(cbody), hint, FALSE, FALSE, 0);
-    }
+    scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_widget_set_name(scroll, "termscroll");
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
+                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_vexpand(scroll, TRUE);
 
-    btn_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    btn_refresh = gtk_button_new_with_label("刷新");
-    btn_load = gtk_button_new_with_label("加载模块");
-    gtk_style_context_add_class(gtk_widget_get_style_context(btn_load), "primary");
-    btn_unload = gtk_button_new_with_label("卸载模块");
-    gtk_box_pack_start(GTK_BOX(btn_row), btn_load, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(btn_row), btn_unload, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(btn_row), btn_refresh, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(cbody), btn_row, FALSE, FALSE, 0);
+    a->termbuf = gtk_text_buffer_new(NULL);
+    gtk_text_buffer_create_tag(a->termbuf, "cmd",
+                               "weight", PANGO_WEIGHT_BOLD, NULL);
+    gtk_text_buffer_create_tag(a->termbuf, "err",
+                               "foreground", "#c0392b", NULL);
+    gtk_text_buffer_create_tag(a->termbuf, "dim",
+                               "foreground", "#8e8e93", NULL);
 
-    gtk_box_pack_start(GTK_BOX(card_mod), cbody, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(box), card_mod, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(box), log_card(a, 220), TRUE, TRUE, 0);
+    a->termview = gtk_text_view_new_with_buffer(a->termbuf);
+    gtk_widget_set_name(a->termview, "term");
+    gtk_text_view_set_editable(GTK_TEXT_VIEW(a->termview), FALSE);
+    gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(a->termview), FALSE);
+    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(a->termview), GTK_WRAP_WORD_CHAR);
+    gtk_text_view_set_left_margin(GTK_TEXT_VIEW(a->termview), 10);
+    gtk_text_view_set_right_margin(GTK_TEXT_VIEW(a->termview), 10);
+    gtk_text_view_set_top_margin(GTK_TEXT_VIEW(a->termview), 8);
+    gtk_container_add(GTK_CONTAINER(scroll), a->termview);
+    gtk_box_pack_start(GTK_BOX(cbody), scroll, TRUE, TRUE, 0);
 
-    g_signal_connect(btn_refresh, "clicked", G_CALLBACK(on_refresh), a);
-    g_signal_connect(btn_load, "clicked", G_CALLBACK(on_load), a);
-    g_signal_connect(btn_unload, "clicked", G_CALLBACK(on_unload), a);
+    /* 输入行：提示符 + 输入框 + 运行 */
+    line = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    a->prompt = gtk_label_new(term_prompt_str());
+    gtk_widget_set_name(a->prompt, "prompt");
+    gtk_widget_set_valign(a->prompt, GTK_ALIGN_CENTER);
+
+    a->entry = gtk_entry_new();
+    gtk_widget_set_name(a->entry, "cmdline");
+    gtk_entry_set_placeholder_text(GTK_ENTRY(a->entry), "输入命令后回车，例如 id / ls -l / whoami");
+    gtk_widget_set_hexpand(a->entry, TRUE);
+    gtk_widget_set_valign(a->entry, GTK_ALIGN_CENTER);
+
+    btn_run = gtk_button_new_with_label("运行");
+    gtk_style_context_add_class(gtk_widget_get_style_context(btn_run), "primary");
+    gtk_widget_set_valign(btn_run, GTK_ALIGN_CENTER);
+
+    gtk_box_pack_start(GTK_BOX(line), a->prompt, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(line), a->entry, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(line), btn_run, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(cbody), line, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(card), cbody, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(box), card, TRUE, TRUE, 0);
+
+    g_signal_connect(a->entry, "activate", G_CALLBACK(on_entry_activate), a);
+    g_signal_connect(btn_run, "clicked", G_CALLBACK(on_run_clicked), a);
+    g_signal_connect(btn_clear, "clicked", G_CALLBACK(on_term_clear), a);
     return box;
 }
 
-/* 设置页：模块路径 + 关于 */
+/* 设置页：运行身份 + 说明 */
 static GtkWidget *build_settings(App *a)
 {
-    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
-    GtkWidget *card_path, *cbody, *lbl, *hint;
-    GtkWidget *card_about, *btn_refresh;
+    GtkWidget *box;
+
+    (void)a;
+    box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    GtkWidget *card_id, *card_about, *cbody, *lbl, *hint;
+    GtkWidget *v_uid, *v_euid, *v_sudo, *v_pk;
 
     gtk_widget_set_margin_start(box, 8);
     gtk_widget_set_margin_end(box, 8);
@@ -1208,33 +1225,27 @@ static GtkWidget *build_settings(App *a)
 
     gtk_box_pack_start(GTK_BOX(box), page_title("设置", NULL), FALSE, FALSE, 0);
 
-    card_path = card_new();
-    cbody = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
-    gtk_widget_set_margin_start(cbody, 22);
-    gtk_widget_set_margin_end(cbody, 22);
-    gtk_widget_set_margin_top(cbody, 18);
-    gtk_widget_set_margin_bottom(cbody, 18);
+    card_id = card_new();
+    gtk_box_pack_start(GTK_BOX(card_id),
+                       info_row(IC_SHIELD, "当前用户", &v_uid), FALSE, FALSE, 0);
+    add_divider(card_id);
+    gtk_box_pack_start(GTK_BOX(card_id),
+                       info_row(IC_CHECK, "有效用户（euid）", &v_euid), FALSE, FALSE, 0);
+    add_divider(card_id);
+    gtk_box_pack_start(GTK_BOX(card_id),
+                       info_row(IC_HASH, "sudo -n", &v_sudo), FALSE, FALSE, 0);
+    add_divider(card_id);
+    gtk_box_pack_start(GTK_BOX(card_id),
+                       info_row(IC_CHIP, "pkexec", &v_pk), FALSE, FALSE, 0);
 
-    lbl = gtk_label_new("模块路径");
-    gtk_widget_set_name(lbl, "cardtitle");
-    gtk_widget_set_halign(lbl, GTK_ALIGN_START);
-
-    a->ko_label = gtk_label_new("");
-    gtk_widget_set_name(a->ko_label, "cardvalue");
-    gtk_widget_set_halign(a->ko_label, GTK_ALIGN_START);
-    gtk_label_set_ellipsize(GTK_LABEL(a->ko_label), PANGO_ELLIPSIZE_MIDDLE);
-    gtk_label_set_max_width_chars(GTK_LABEL(a->ko_label), 44);
-
-    hint = gtk_label_new("把 rootmgr.ko 放在这里，也可以直接放在本程序同目录。");
-    gtk_widget_set_name(hint, "cardvalue");
-    gtk_widget_set_halign(hint, GTK_ALIGN_START);
-    gtk_label_set_line_wrap(GTK_LABEL(hint), TRUE);
-    gtk_label_set_max_width_chars(GTK_LABEL(hint), 40);
-
-    gtk_box_pack_start(GTK_BOX(cbody), lbl, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(cbody), a->ko_label, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(cbody), hint, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(card_path), cbody, FALSE, FALSE, 0);
+    gtk_label_set_text(GTK_LABEL(v_uid), user_name(getuid()));
+    gtk_label_set_text(GTK_LABEL(v_euid),
+                       is_root() ? "root（命令直接以 root 执行）"
+                                 : user_name(geteuid()));
+    gtk_label_set_text(GTK_LABEL(v_sudo),
+                       sudo_ready() ? "可用（免密）" : "不可用（需要密码或未安装）");
+    gtk_label_set_text(GTK_LABEL(v_pk),
+                       have_tool("pkexec") ? "可用（执行时弹密码框）" : "未安装");
 
     card_about = card_new();
     cbody = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
@@ -1247,13 +1258,15 @@ static GtkWidget *build_settings(App *a)
     gtk_widget_set_name(lbl, "cardtitle");
     gtk_widget_set_halign(lbl, GTK_ALIGN_START);
 
-    hint = gtk_label_new("RootMgr " MGR_VERSION "　常驻 root 管理器。\n"
-                         "模块加载后写入 /proc/rootmgr 即可给进程提权，"
-                         "每次提权不用重新跑漏洞。");
+    hint = gtk_label_new("RootMgr " MGR_VERSION "　\n"
+                         "「终端」页直接调 /bin/sh -c 执行命令：以 root 运行时就是 "
+                         "root 权限，否则先试 sudo -n，再退到 pkexec。\n"
+                         "想要每次都免密，可以给 sudo 配 NOPASSWD，"
+                         "或者直接用 root 启动本程序。");
     gtk_widget_set_name(hint, "cardvalue");
     gtk_widget_set_halign(hint, GTK_ALIGN_START);
     gtk_label_set_line_wrap(GTK_LABEL(hint), TRUE);
-    gtk_label_set_max_width_chars(GTK_LABEL(hint), 40);
+    gtk_label_set_max_width_chars(GTK_LABEL(hint), 36);
 
     gtk_box_pack_start(GTK_BOX(cbody), lbl, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(cbody), hint, FALSE, FALSE, 0);
@@ -1264,17 +1277,11 @@ static GtkWidget *build_settings(App *a)
         GtkWidget *cols = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
         GtkWidget *right = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
 
-        gtk_box_pack_start(GTK_BOX(cols), card_path, TRUE, TRUE, 0);
+        gtk_box_pack_start(GTK_BOX(cols), card_id, TRUE, TRUE, 0);
         gtk_box_pack_start(GTK_BOX(cols), right, TRUE, TRUE, 0);
         gtk_box_pack_start(GTK_BOX(right), card_about, FALSE, FALSE, 0);
         gtk_box_pack_start(GTK_BOX(box), cols, FALSE, FALSE, 0);
     }
-
-    btn_refresh = gtk_button_new_with_label("刷新状态");
-    gtk_widget_set_halign(btn_refresh, GTK_ALIGN_END);
-    gtk_widget_set_margin_end(btn_refresh, 16);
-    gtk_box_pack_start(GTK_BOX(box), btn_refresh, FALSE, FALSE, 0);
-    g_signal_connect(btn_refresh, "clicked", G_CALLBACK(on_refresh), a);
 
     return box;
 }
@@ -1316,7 +1323,7 @@ static GtkWidget *build_tabbar(App *a)
     gtk_widget_set_name(bar, "tabbar");
     gtk_box_pack_start(GTK_BOX(bar), tab_item(a, 0, IC_T_HOME, "主页"), TRUE, TRUE, 0);
     gtk_box_pack_start(GTK_BOX(bar), tab_item(a, 1, IC_T_SHIELD, "超级用户"), TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(bar), tab_item(a, 2, IC_T_PUZZLE, "模块"), TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(bar), tab_item(a, 2, IC_T_TERM, "终端"), TRUE, TRUE, 0);
     gtk_box_pack_start(GTK_BOX(bar), tab_item(a, 3, IC_T_GEAR, "设置"), TRUE, TRUE, 0);
     return bar;
 }
@@ -1351,7 +1358,7 @@ static void build_ui(App *a)
 
     gtk_stack_add_named(GTK_STACK(a->stack), build_home(a), "home");
     gtk_stack_add_named(GTK_STACK(a->stack), build_super(a), "super");
-    gtk_stack_add_named(GTK_STACK(a->stack), build_mod(a), "mod");
+    gtk_stack_add_named(GTK_STACK(a->stack), build_term(a), "term");
     gtk_stack_add_named(GTK_STACK(a->stack), build_settings(a), "set");
 
     gtk_box_pack_end(GTK_BOX(shell), build_tabbar(a), FALSE, FALSE, 0);
@@ -1363,31 +1370,21 @@ static void build_ui(App *a)
 int main(int argc, char **argv)
 {
     App a;
-    char *dir, *p1, *p2;
 
     memset(&a, 0, sizeof(a));
     gtk_init(&argc, &argv);
 
-    dir = exe_dir();
-    p1 = g_build_filename(dir, "rootmgr.ko", NULL);
-    p2 = g_build_filename(dir, "tools", "kmod", "rootmgr.ko", NULL);
-    if (g_file_test(p1, G_FILE_TEST_EXISTS))
-        a.ko_path = p1;
-    else if (g_file_test(p2, G_FILE_TEST_EXISTS))
-        a.ko_path = p2;
-    else
-        a.ko_path = p1;
-
     build_ui(&a);
-    gtk_label_set_text(GTK_LABEL(a.ko_label), a.ko_path);
 
-    refresh_state(&a);
+    refresh_home(&a);
     refresh_procs(&a);
 
-    gtk_main();
+    term_append(&a, "RootMgr " MGR_VERSION " 终端\n", "dim");
+    if (is_root())
+        term_append(&a, "当前是 root，命令直接以 root 执行。\n\n", "dim");
+    else
+        term_append(&a, "当前不是 root，命令会走 sudo -n / pkexec。\n\n", "dim");
 
-    g_free(p1);
-    g_free(p2);
-    g_free(dir);
+    gtk_main();
     return 0;
 }
