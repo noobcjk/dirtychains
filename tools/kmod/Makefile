@@ -37,4 +37,19 @@ all:
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
 
-.PHONY: all clean
+# 常驻 root 管理器（独立模块，和 krec_dump 互不影响）
+#   make rootmgr
+#   sudo insmod rootmgr.ko [allow_uid=1000]
+rootmgr:
+	@if [ ! -d "$(KDIR)" ]; then \
+		echo "找不到内核树 $(KDIR)"; \
+		echo "  Ubuntu/Debian: sudo apt install linux-headers-\$$(uname -r)"; \
+		echo "  RHEL/CentOS:   sudo dnf install kernel-devel-\$$(uname -r)"; \
+		exit 1; \
+	fi
+	$(MAKE) -C $(KDIR) M=$(PWD) obj-m=rootmgr.o modules
+
+rootmgr-clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) obj-m=rootmgr.o clean
+
+.PHONY: all clean rootmgr rootmgr-clean

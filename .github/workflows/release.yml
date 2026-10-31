@@ -115,6 +115,7 @@ jobs:
             apt-get install -y --no-install-recommends \
               build-essential libgtk-3-dev pkg-config
             make dirtychains
+            make rootmgr-gui
             gcc --version | head -1 > .gccver-gui
           '
           file dirtychains
@@ -142,6 +143,9 @@ jobs:
           # GUI 及其配套（背景图、桌面项）只在编出来时才放进去
           if [ -f dirtychains ]; then
             cp dirtychains bg.png "$D/"
+          fi
+          if [ -f rootmgr-gui ]; then
+            cp rootmgr-gui "$D/"
           fi
 
           {
