@@ -111,7 +111,17 @@ make CC=aarch64-linux-gnu-gcc CFLAGS="-O2 -Wall -static -no-pie -D_FILE_OFFSET_B
 未选 CVE 时右上角显示「暂未选择CVE」，检查 / 自测 / 一键提权都会拦下，不会默认跑全链。
 
 参数区按所选 CVE 动态显隐：RxRPC 只留 `-t`，OVS 只留内核版本，其余链显示 `-t` / `-to` / `-set` / `-offset`。
-选中 CVE-2026-64531 时，内核版本右边还会出现「选择 offset」和「解析 vmlinux」两个按钮。
+选中 CVE-2026-64531 时，参数区下一行有三个按钮：
+
+| 按钮 | 作用 |
+|---|---|
+| 选择 offset | 浏览 `offset/` 下已有的 `target.h`（可过滤、可导入自定义文件） |
+| 解析 vmlinux | 用 `-dump-krec` 从 pahole/BTF + kallsyms 推导偏移，失败时给诊断 |
+| root 获取偏移表 | 提权加载随包的 `krec_dump.ko` 直接读本机偏移，写完 `target.h` 立刻卸载 |
+
+`root 获取偏移表` 需要目标机的内核头文件（`linux-headers-$(uname -r)`）：包里的 `.ko` 是现场按当前内核编译的，
+因为内核模块无法跨版本预编。编译成功后模块只加载一次、读完 `/proc/krec_dump` 就 `rmmod`。
+提权依次尝试当前身份 → `pkexec` → 免密 `sudo`。
 
 前端用 pty 启动引擎，所以引擎里的 `isatty()` 判断、彩色输出、成功后的交互式 root shell 都正常。
 

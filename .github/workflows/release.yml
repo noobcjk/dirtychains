@@ -135,6 +135,10 @@ jobs:
           cp poc ovswrap "$D/"
           cp README.md LICENSE "$D/"
           cp -r offset "$D/offset"
+          # root 获取偏移表：现场编译内核模块需要源码（.ko 绑内核版本，不能预编）
+          mkdir -p "$D/tools"
+          cp -r tools/kmod "$D/tools/kmod"
+          rm -f "$D/tools/kmod"/*.ko "$D/tools/kmod"/*.o "$D/tools/kmod"/.*.cmd 2>/dev/null || true
           # GUI 及其配套（背景图、桌面项）只在编出来时才放进去
           if [ -f dirtychains ]; then
             cp dirtychains bg.png "$D/"

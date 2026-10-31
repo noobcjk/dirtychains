@@ -92,12 +92,24 @@ install: $(TARGET)
 		cp -r offset/. $(DESTDIR)$(DATADIR)/offset/; \
 		echo "offset tables -> $(DESTDIR)$(DATADIR)/offset"; \
 	fi
+	@if [ -f tools/kmod/krec_dump.c ]; then \
+		install -d $(DESTDIR)$(DATADIR)/tools/kmod; \
+		install -m 644 tools/kmod/krec_dump.c tools/kmod/Makefile \
+			$(DESTDIR)$(DATADIR)/tools/kmod/; \
+		echo "kmod source -> $(DESTDIR)$(DATADIR)/tools/kmod (root 获取偏移表用)"; \
+	fi
+	@if [ -f tools/kmod/krec_dump.ko ]; then \
+		install -m 644 tools/kmod/krec_dump.ko $(DESTDIR)$(DATADIR)/krec_dump.ko; \
+		echo "krec_dump.ko -> $(DESTDIR)$(DATADIR)/krec_dump.ko"; \
+	fi
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/$(TARGET)
 	rm -f $(DESTDIR)$(BINDIR)/$(ENGINE)
 	rm -f $(DESTDIR)$(DATADIR)/$(BGIMG)
 	rm -rf $(DESTDIR)$(DATADIR)/offset
+	rm -rf $(DESTDIR)$(DATADIR)/tools
+	rm -f $(DESTDIR)$(DATADIR)/krec_dump.ko
 
 clean:
 	rm -f $(TARGET) $(GUI_OBJ) $(ENG_OBJ) $(ENGINE) ovswrap
