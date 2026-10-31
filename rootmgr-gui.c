@@ -1,12 +1,14 @@
 /*
  * rootmgr-gui.c —— 常驻 root 管理器的图形界面
  *
+ * 版式参照 KernelSU 首页（Material 3）：浅灰底、大标题、白色圆角卡片、
+ * 左侧线性图标 + 标题/副标题两行。首页只放状态信息，功能收进「管理」页。
+ *
  * 配合 tools/kmod/rootmgr.c 使用：
  *   1) 把 rootmgr.ko 放到本程序同目录（或 tools/kmod/ 下）；
- *   2) 点「加载模块」，走 pkexec/sudo 执行 insmod；
- *   3) 下面的列表会列出当前用户自己的 shell 进程；
- *   4) 选中一个，点「提权选中进程」，该进程的 uid 立刻变成 0
- *      （在它自己的终端里跑 id 就能看到）。
+ *   2) 点「加载模块」，root 身份直跑 insmod，否则走 pkexec / sudo -n；
+ *   3) 管理页列出当前用户自己的 shell 进程；
+ *   4) 选中一个点「提权选中进程」，该进程的 uid 立刻变成 0。
  *
  * 构建：
  *   make rootmgr-gui
@@ -23,21 +25,40 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <unistd.h>
 
 #define PROC_PATH   "/proc/rootmgr"
-#define APP_TITLE   "ROOT 管理器"
-#define APP_SUB     "late-load · /proc/rootmgr"
+#define APP_TITLE   "RootMgr"
+#define MGR_VERSION "1.0"
+
+/* 图标种类：全部用 cairo 画，不依赖图标字体 / 主题 */
+typedef enum {
+    IC_ERROR = 0,   /* 圆圈感叹号 */
+    IC_CHECK,       /* 圆圈对勾 */
+    IC_HASH,        /* # 号 */
+    IC_CHIP,        /* 芯片 */
+    IC_SHIELD,      /* 盾牌 */
+    IC_FILTER       /* 三条横线 */
+} IconKind;
 
 typedef struct {
     GtkWidget *win;
-    GtkWidget *bg_area;
-    GdkPixbuf *bg_pix;
+    GtkWidget *stack;
 
-    GtkWidget *badge;       /* 已加载 / 未加载 */
-    GtkWidget *ko_label;    /* 模块路径 */
+    /* 首页 */
+    GtkWidget *ico_status;
+    GtkWidget *lbl_status;
+    GtkWidget *lbl_status_sub;
+    GtkWidget *val_mgr;
+    GtkWidget *val_kernel;
+    GtkWidget *val_selinux;
+    GtkWidget *val_seccomp;
+
+    /* 管理页 */
+    GtkWidget *ko_label;
     GtkWidget *list;        /* 进程列表 */
     GtkWidget *logview;
     GtkWidget *btn_give;
@@ -77,51 +98,196 @@ static const char *user_name(uid_t uid)
     return buf;
 }
 
-/* --------------------------------------------------------------------------
- * 背景
- * ----------------------------------------------------------------------- */
-
-static gboolean on_bg_draw(GtkWidget *w, cairo_t *cr, gpointer data)
+static const char *selinux_text(void)
 {
-    App *a = data;
-    int ww = gtk_widget_get_allocated_width(w);
-    int wh = gtk_widget_get_allocated_height(w);
+    FILE *f = fopen("/sys/fs/selinux/enforce", "r");
+    int c;
 
-    cairo_set_source_rgb(cr, 0.937, 0.957, 0.980);
-    cairo_paint(cr);
-    if (!a->bg_pix)
-        return FALSE;
+    if (!f)
+        return "被禁用";
 
-    {
-        int iw = gdk_pixbuf_get_width(a->bg_pix);
-        int ih = gdk_pixbuf_get_height(a->bg_pix);
-        double s = MAX((double)ww / iw, (double)wh / ih);
-        double dw = iw * s, dh = ih * s;
-
-        cairo_save(cr);
-        cairo_rectangle(cr, 0, 0, ww, wh);
-        cairo_clip(cr);
-        cairo_translate(cr, (ww - dw) / 2.0, (wh - dh) / 2.0);
-        cairo_scale(cr, s, s);
-        gdk_cairo_set_source_pixbuf(cr, a->bg_pix, 0, 0);
-        cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_BILINEAR);
-        cairo_paint(cr);
-        cairo_restore(cr);
-
-        cairo_set_source_rgba(cr, 0.98, 0.99, 1.0, 0.26);
-        cairo_paint(cr);
-    }
-    return FALSE;
+    c = fgetc(f);
+    fclose(f);
+    if (c == '1')
+        return "强制执行";
+    if (c == '0')
+        return "宽容模式";
+    return "未知";
 }
 
-static gboolean on_configure(GtkWidget *w, GdkEventConfigure *ev, gpointer data)
+static const char *seccomp_text(void)
 {
-    App *a = data;
+    static char buf[32] = "未知";
+    FILE *f = fopen("/proc/self/status", "r");
+    char line[256];
 
-    (void)w;
-    (void)ev;
-    gtk_widget_queue_draw(a->bg_area);
-    return FALSE;
+    if (!f)
+        return "内核未开启";
+
+    while (fgets(line, sizeof(line), f)) {
+        if (!strncmp(line, "Seccomp:", 8)) {
+            int v = atoi(line + 8);
+
+            if (v == 0)
+                g_strlcpy(buf, "未启用", sizeof(buf));
+            else if (v == 1)
+                g_strlcpy(buf, "严格模式", sizeof(buf));
+            else if (v == 2)
+                g_strlcpy(buf, "过滤模式", sizeof(buf));
+            else
+                g_strlcpy(buf, "未知", sizeof(buf));
+            break;
+        }
+    }
+    fclose(f);
+    return buf;
+}
+
+static const char *kernel_release(void)
+{
+    static struct utsname u;
+    static gboolean done = FALSE;
+
+    if (!done) {
+        if (uname(&u) != 0)
+            g_strlcpy(u.release, "未知", sizeof(u.release));
+        done = TRUE;
+    }
+    return u.release;
+}
+
+/* --------------------------------------------------------------------------
+ * 图标：24x24 网格，线宽 1.9，圆头
+ * ----------------------------------------------------------------------- */
+
+static void rounded_rect(cairo_t *cr, double x, double y, double w, double h, double r)
+{
+    cairo_new_path(cr);
+    cairo_arc(cr, x + r, y + r, r, G_PI, 1.5 * G_PI);
+    cairo_arc(cr, x + w - r, y + r, r, 1.5 * G_PI, 2 * G_PI);
+    cairo_arc(cr, x + w - r, y + h - r, r, 0, 0.5 * G_PI);
+    cairo_arc(cr, x + r, y + h - r, r, 0.5 * G_PI, G_PI);
+    cairo_close_path(cr);
+}
+
+static gboolean on_icon_draw(GtkWidget *w, cairo_t *cr, gpointer data)
+{
+    int kind = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(w), "kind"));
+    double size = MIN(gtk_widget_get_allocated_width(w),
+                      gtk_widget_get_allocated_height(w));
+    double s;
+
+    (void)data;
+    if (size <= 0)
+        return TRUE;
+
+    s = size / 24.0;
+    cairo_save(cr);
+    cairo_scale(cr, s, s);
+    cairo_set_line_width(cr, 1.9);
+    cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+    cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
+    cairo_set_source_rgb(cr, 0.106, 0.106, 0.106);
+
+    switch (kind) {
+    case IC_CHECK:
+        cairo_arc(cr, 12, 12, 9, 0, 2 * G_PI);
+        cairo_stroke(cr);
+        cairo_move_to(cr, 7.9, 12.3);
+        cairo_line_to(cr, 10.7, 15.1);
+        cairo_line_to(cr, 16.3, 9.1);
+        cairo_stroke(cr);
+        break;
+
+    case IC_HASH:
+        cairo_move_to(cr, 4.6, 9.2);
+        cairo_line_to(cr, 19.4, 9.2);
+        cairo_move_to(cr, 4.6, 14.8);
+        cairo_line_to(cr, 19.4, 14.8);
+        cairo_move_to(cr, 10.0, 4.2);
+        cairo_line_to(cr, 8.0, 19.8);
+        cairo_move_to(cr, 16.0, 4.2);
+        cairo_line_to(cr, 14.0, 19.8);
+        cairo_stroke(cr);
+        break;
+
+    case IC_CHIP:
+        cairo_move_to(cr, 7.5, 2.2);  cairo_line_to(cr, 7.5, 4.6);
+        cairo_move_to(cr, 12.0, 2.2); cairo_line_to(cr, 12.0, 4.6);
+        cairo_move_to(cr, 16.5, 2.2); cairo_line_to(cr, 16.5, 4.6);
+        cairo_move_to(cr, 7.5, 19.4); cairo_line_to(cr, 7.5, 21.8);
+        cairo_move_to(cr, 12.0, 19.4); cairo_line_to(cr, 12.0, 21.8);
+        cairo_move_to(cr, 16.5, 19.4); cairo_line_to(cr, 16.5, 21.8);
+        cairo_stroke(cr);
+        rounded_rect(cr, 4.4, 4.4, 15.2, 15.2, 2.4);
+        cairo_stroke(cr);
+        rounded_rect(cr, 8.2, 8.2, 3.0, 3.0, 0.7);
+        cairo_fill(cr);
+        rounded_rect(cr, 12.8, 8.2, 3.0, 3.0, 0.7);
+        cairo_fill(cr);
+        rounded_rect(cr, 8.2, 12.8, 3.0, 3.0, 0.7);
+        cairo_fill(cr);
+        rounded_rect(cr, 12.8, 12.8, 3.0, 3.0, 0.7);
+        cairo_fill(cr);
+        break;
+
+    case IC_SHIELD:
+        cairo_move_to(cr, 12, 2.4);
+        cairo_line_to(cr, 19.9, 5.7);
+        cairo_line_to(cr, 19.9, 11.0);
+        cairo_curve_to(cr, 19.9, 16.1, 16.6, 20.1, 12, 21.7);
+        cairo_curve_to(cr, 7.4, 20.1, 4.1, 16.1, 4.1, 11.0);
+        cairo_line_to(cr, 4.1, 5.7);
+        cairo_close_path(cr);
+        cairo_stroke(cr);
+        cairo_move_to(cr, 8.7, 11.9);
+        cairo_line_to(cr, 11.0, 14.2);
+        cairo_line_to(cr, 15.5, 9.5);
+        cairo_stroke(cr);
+        break;
+
+    case IC_FILTER:
+        cairo_move_to(cr, 3.6, 6.6);
+        cairo_line_to(cr, 20.4, 6.6);
+        cairo_move_to(cr, 6.6, 12.0);
+        cairo_line_to(cr, 17.4, 12.0);
+        cairo_move_to(cr, 9.6, 17.4);
+        cairo_line_to(cr, 14.4, 17.4);
+        cairo_stroke(cr);
+        break;
+
+    case IC_ERROR:
+    default:
+        cairo_arc(cr, 12, 12, 9, 0, 2 * G_PI);
+        cairo_stroke(cr);
+        cairo_move_to(cr, 12, 7.3);
+        cairo_line_to(cr, 12, 12.9);
+        cairo_stroke(cr);
+        cairo_arc(cr, 12, 16.6, 1.05, 0, 2 * G_PI);
+        cairo_fill(cr);
+        break;
+    }
+
+    cairo_restore(cr);
+    return TRUE;
+}
+
+static GtkWidget *make_icon(IconKind kind, int px)
+{
+    GtkWidget *w = gtk_drawing_area_new();
+
+    gtk_widget_set_size_request(w, px, px);
+    gtk_widget_set_halign(w, GTK_ALIGN_START);
+    gtk_widget_set_valign(w, GTK_ALIGN_START);
+    g_object_set_data(G_OBJECT(w), "kind", GINT_TO_POINTER(kind));
+    g_signal_connect(w, "draw", G_CALLBACK(on_icon_draw), NULL);
+    return w;
+}
+
+static void icon_set_kind(GtkWidget *w, IconKind kind)
+{
+    g_object_set_data(G_OBJECT(w), "kind", GINT_TO_POINTER(kind));
+    gtk_widget_queue_draw(w);
 }
 
 /* --------------------------------------------------------------------------
@@ -135,6 +301,9 @@ static void log_line(App *a, const char *fmt, ...)
     va_list ap;
     char *msg;
 
+    if (!a->logview)
+        return;
+
     va_start(ap, fmt);
     msg = g_strdup_vprintf(fmt, ap);
     va_end(ap);
@@ -142,14 +311,6 @@ static void log_line(App *a, const char *fmt, ...)
     tb = gtk_text_view_get_buffer(GTK_TEXT_VIEW(a->logview));
     gtk_text_buffer_get_end_iter(tb, &end);
     gtk_text_buffer_insert(tb, &end, msg, -1);
-
-    {
-        GtkTextIter s, e;
-        gtk_text_buffer_get_end_iter(tb, &e);
-        s = e;
-        gtk_text_iter_backward_chars(&s, (int)g_utf8_strlen(msg, -1));
-        gtk_text_buffer_apply_tag_by_name(tb, "dim", &s, &e);
-    }
     g_free(msg);
 
     gtk_text_buffer_get_end_iter(tb, &end);
@@ -158,8 +319,11 @@ static void log_line(App *a, const char *fmt, ...)
 
 static void log_reset(App *a)
 {
-    GtkTextBuffer *tb = gtk_text_view_get_buffer(GTK_TEXT_VIEW(a->logview));
+    GtkTextBuffer *tb;
 
+    if (!a->logview)
+        return;
+    tb = gtk_text_view_get_buffer(GTK_TEXT_VIEW(a->logview));
     gtk_text_buffer_set_text(tb, "", -1);
 }
 
@@ -167,18 +331,29 @@ static void log_reset(App *a)
  * 状态
  * ----------------------------------------------------------------------- */
 
-static void refresh_state(App *a)
+static void refresh_home(App *a)
 {
     gboolean on = module_loaded();
-    GtkStyleContext *ctx;
+    char buf[128];
 
-    gtk_label_set_text(GTK_LABEL(a->badge), on ? "已加载" : "未加载");
-    ctx = gtk_widget_get_style_context(a->badge);
-    gtk_style_context_remove_class(ctx, "badge-on");
-    gtk_style_context_remove_class(ctx, "badge-off");
-    gtk_style_context_add_class(ctx, on ? "badge-on" : "badge-off");
+    icon_set_kind(a->ico_status, on ? IC_CHECK : IC_ERROR);
+    gtk_label_set_text(GTK_LABEL(a->lbl_status), on ? "运行中" : "尚未启动");
+    gtk_label_set_text(GTK_LABEL(a->lbl_status_sub),
+                       on ? "rootmgr 模块已加载，可以直接给进程提权。"
+                          : "rootmgr 模块还没加载。点右上角「管理」加载模块后即可使用。");
 
-    gtk_widget_set_sensitive(a->btn_give, on);
+    g_snprintf(buf, sizeof(buf), "%s (%s)", MGR_VERSION,
+               on ? "rootmgr" : "未加载");
+    gtk_label_set_text(GTK_LABEL(a->val_mgr), buf);
+    gtk_label_set_text(GTK_LABEL(a->val_kernel), kernel_release());
+    gtk_label_set_text(GTK_LABEL(a->val_selinux), selinux_text());
+    gtk_label_set_text(GTK_LABEL(a->val_seccomp), seccomp_text());
+}
+
+static void refresh_state(App *a)
+{
+    refresh_home(a);
+    gtk_widget_set_sensitive(a->btn_give, module_loaded());
 }
 
 /* 只列出当前用户自己的、常见的 shell 进程 */
@@ -186,7 +361,7 @@ static gboolean is_shell_name(const char *name)
 {
     static const char *ok[] = {
         "sh", "bash", "dash", "zsh", "ksh", "ash", "fish",
-        "bash", "tmux", "screen", "su", "sudo", "rootmgr-gui"
+        "tmux", "screen", "su", "sudo", "rootmgr-gui"
     };
     size_t i;
 
@@ -202,19 +377,18 @@ static void add_row(App *a, int pid, const char *user, const char *cmd)
 
     row = gtk_list_box_row_new();
     box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
-    gtk_widget_set_margin_start(box, 12);
-    gtk_widget_set_margin_end(box, 12);
-    gtk_widget_set_margin_top(box, 8);
-    gtk_widget_set_margin_bottom(box, 8);
+    gtk_widget_set_margin_start(box, 14);
+    gtk_widget_set_margin_end(box, 14);
+    gtk_widget_set_margin_top(box, 9);
+    gtk_widget_set_margin_bottom(box, 9);
 
     l1 = gtk_label_new(NULL);
-    gtk_label_set_markup(GTK_LABEL(l1),
-                         g_strdup_printf("<b>%d</b>", pid));
-    gtk_widget_set_size_request(l1, 70, -1);
+    gtk_label_set_markup(GTK_LABEL(l1), g_strdup_printf("<b>%d</b>", pid));
+    gtk_widget_set_size_request(l1, 62, -1);
     gtk_widget_set_halign(l1, GTK_ALIGN_START);
 
     l2 = gtk_label_new(user);
-    gtk_widget_set_size_request(l2, 90, -1);
+    gtk_widget_set_size_request(l2, 76, -1);
     gtk_widget_set_halign(l2, GTK_ALIGN_START);
 
     l3 = gtk_label_new(cmd);
@@ -238,9 +412,11 @@ static void refresh_procs(App *a)
     struct dirent *de;
     uid_t me = getuid();
 
-    while ((row = gtk_list_box_get_row_at_index(GTK_LIST_BOX(a->list), 0))) {
+    if (!a->list)
+        return;
+
+    while ((row = gtk_list_box_get_row_at_index(GTK_LIST_BOX(a->list), 0)))
         gtk_widget_destroy(GTK_WIDGET(row));
-    }
     a->sel_pid = 0;
 
     d = opendir("/proc");
@@ -262,23 +438,21 @@ static void refresh_procs(App *a)
             continue;
 
         while (fgets(buf, sizeof(buf), f)) {
-            if (!strncmp(buf, "Name:", 5)) {
+            if (!strncmp(buf, "Name:", 5))
                 g_strlcpy(name, g_strstrip(buf + 5), sizeof(name));
-            } else if (!strncmp(buf, "Uid:", 4)) {
+            else if (!strncmp(buf, "Uid:", 4))
                 uid = (unsigned)strtoul(buf + 4, NULL, 10);
-            }
         }
         fclose(f);
 
-        if (uid != (unsigned)me)
-            continue;
-        if (!is_shell_name(name))
+        if (uid != (unsigned)me || !is_shell_name(name))
             continue;
 
         g_snprintf(path, sizeof(path), "/proc/%s/cmdline", de->d_name);
         f = fopen(path, "r");
         if (f) {
             size_t n = fread(cmd, 1, sizeof(cmd) - 1, f);
+
             fclose(f);
             cmd[n] = '\0';
             for (p = cmd; p < cmd + n; p++)
@@ -485,6 +659,7 @@ static void on_give(GtkWidget *w, gpointer data)
     wr = write(fd, cmd, strlen(cmd));
     if (wr < 0 || (size_t)wr != strlen(cmd)) {
         int e = errno;
+
         close(fd);
         log_line(a, "写 %s 失败: %s\n", PROC_PATH, g_strerror(e));
         return;
@@ -497,116 +672,305 @@ static void on_give(GtkWidget *w, gpointer data)
     refresh_state(a);
 }
 
+/* 页面切换 */
+static void on_manage(GtkWidget *w, gpointer data)
+{
+    App *a = data;
+
+    (void)w;
+    gtk_stack_set_visible_child_name(GTK_STACK(a->stack), "manage");
+    refresh_state(a);
+    refresh_procs(a);
+}
+
+static void on_back(GtkWidget *w, gpointer data)
+{
+    App *a = data;
+
+    (void)w;
+    refresh_state(a);
+    gtk_stack_set_visible_child_name(GTK_STACK(a->stack), "home");
+}
+
 /* --------------------------------------------------------------------------
  * 界面
  * ----------------------------------------------------------------------- */
 
 static const char *CSS =
-    "#card { background-color: #ffffff; border-radius: 12px;"
-    "        border: 1px solid rgba(160,190,220,0.55); }\n"
-    "#cardtitle { color: #3a5a78; font-weight: 600; font-size: 10pt; }\n"
-    "#sub { color: #6b8299; font-size: 9pt; }\n"
-    "#badge { border-radius: 9px; padding: 2px 10px; font-size: 9pt; }\n"
-    ".badge-on { background-color: #d9f2e2; color: #1d7a46; }\n"
-    ".badge-off { background-color: #e8edf3; color: #6b7a89; }\n"
-    "#procname { color: #22384a; }\n"
-    "#logview, #logview text { background-color: #fbfdff; color: #2b3a48; }\n"
-    "#logscroll, #logscroll viewport { background-color: #fbfdff; }\n"
-    "#listbox { background-color: #ffffff; }\n";
+    "window, #shell { background-color: #ededf1; }\n"
+    "#bigtitle { color: #1b1b1b; font-size: 30px; font-weight: 500; }\n"
+    "#card { background-color: #ffffff; border-radius: 24px;        border: 1px solid rgba(20,30,50,0.045); }\n"
+    "#cardtitle { color: #1b1b1b; font-size: 15px; font-weight: 500; }\n"
+    "#cardvalue { color: #6f6f6f; font-size: 13px; }\n"
+    "#status_title { color: #1b1b1b; font-size: 17px; font-weight: 500; }\n"
+    "#status_sub { color: #6f6f6f; font-size: 13.5px; }\n"
+    "#rowlabel { color: #1b1b1b; font-size: 15px; }\n"
+    "button { background-image: none; background-color: #e7e7ec;\n"
+    "         border: none; border-radius: 20px; padding: 7px 18px;\n"
+    "         color: #1b1b1b; font-size: 13px; box-shadow: none;\n"
+    "         text-shadow: none; }\n"
+    "button:hover { background-color: #dcdce3; }\n"
+    "button:active { background-color: #d2d2da; }\n"
+    "button:disabled { color: rgba(27,27,27,0.35); background-color: #f0f0f3; }\n"
+    "#textbtn { background-color: transparent; padding: 6px 12px;           color: #6f6f6f; font-size: 13px; }\n"
+    "#textbtn:hover { background-color: rgba(0,0,0,0.06); }\n"
+    "#logview, #logview text { background-color: #fafafc; color: #3a3a3c; }\n"
+    "#logscroll, #logscroll viewport { background-color: #fafafc; }\n"
+    "#listbox { background-color: #ffffff; padding: 0; }\n"
+    "#listbox row { border-radius: 12px; padding: 0; }\n"
+    "button.primary { background-color: #1b1b1b; color: #ffffff; }\n"
+    "button.primary:hover { background-color: #33333a; }\n";
 
-static GtkWidget *card(const char *title, GtkWidget **body_out)
+/* 一张白卡：内盒自己往里塞 */
+static GtkWidget *card_new(void)
 {
-    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-    GtkWidget *lbl = gtk_label_new(title);
-    GtkWidget *body = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
 
     gtk_widget_set_name(box, "card");
-    gtk_widget_set_name(lbl, "cardtitle");
-    gtk_widget_set_halign(lbl, GTK_ALIGN_START);
     gtk_widget_set_margin_start(box, 16);
     gtk_widget_set_margin_end(box, 16);
-    gtk_widget_set_margin_top(box, 14);
-    gtk_widget_set_margin_bottom(box, 14);
-
-    gtk_box_pack_start(GTK_BOX(box), lbl, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(box), body, TRUE, TRUE, 0);
-    *body_out = body;
     return box;
 }
 
-static void build_ui(App *a)
+static void on_manage(GtkWidget *w, gpointer data);
+
+/* 点状态卡等同点「管理」，和 KernelSU 首页一致 */
+static gboolean on_status_click(GtkWidget *w, GdkEventButton *ev, gpointer data)
 {
-    GtkWidget *overlay, *root, *head, *hbox, *title, *sub;
-    GtkWidget *card_mod, *body_mod, *card_proc, *body_proc, *card_log, *body_log;
-    GtkWidget *btn_row, *btn_refresh, *btn_load, *btn_unload, *scroll, *logscroll;
-    GtkCssProvider *css;
+    (void)w;
+    (void)ev;
+    on_manage(NULL, data);
+    return TRUE;
+}
 
-    a->win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_window_set_title(GTK_WINDOW(a->win), "ROOT 管理器");
-    gtk_window_set_default_size(GTK_WINDOW(a->win), 860, 640);
-    gtk_window_set_position(GTK_WINDOW(a->win), GTK_WIN_POS_CENTER);
-    g_signal_connect(a->win, "destroy", G_CALLBACK(gtk_main_quit), NULL);
+/* 状态卡：左图标 + 右两行字 */
+static GtkWidget *status_card(App *a)
+{
+    GtkWidget *c = card_new();
+    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 18);
+    GtkWidget *col = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
 
-    css = gtk_css_provider_new();
-    gtk_css_provider_load_from_data(css, CSS, -1, NULL);
-    gtk_style_context_add_provider_for_screen(
-        gdk_screen_get_default(), GTK_STYLE_PROVIDER(css),
-        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-    g_object_unref(css);
+    gtk_widget_set_margin_start(row, 22);
+    gtk_widget_set_margin_end(row, 22);
+    gtk_widget_set_margin_top(row, 22);
+    gtk_widget_set_margin_bottom(row, 22);
 
-    overlay = gtk_overlay_new();
-    a->bg_area = gtk_drawing_area_new();
-    g_signal_connect(a->bg_area, "draw", G_CALLBACK(on_bg_draw), a);
-    g_signal_connect(a->win, "configure-event", G_CALLBACK(on_configure), a);
-    gtk_container_add(GTK_CONTAINER(overlay), a->bg_area);
-    gtk_container_add(GTK_CONTAINER(a->win), overlay);
+    a->ico_status = make_icon(IC_ERROR, 30);
+    gtk_widget_set_valign(a->ico_status, GTK_ALIGN_START);
+    gtk_widget_set_margin_top(a->ico_status, 2);
 
-    root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
-    gtk_widget_set_margin_start(root, 16);
-    gtk_widget_set_margin_end(root, 16);
-    gtk_widget_set_margin_top(root, 14);
-    gtk_widget_set_margin_bottom(root, 14);
-    gtk_overlay_add_overlay(GTK_OVERLAY(overlay), root);
+    a->lbl_status = gtk_label_new("尚未启动");
+    gtk_widget_set_name(a->lbl_status, "status_title");
+    gtk_widget_set_halign(a->lbl_status, GTK_ALIGN_START);
 
-    /* 顶部标题 */
-    head = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
-    title = gtk_label_new(NULL);
-    gtk_label_set_markup(GTK_LABEL(title),
-                         "<span size='large' weight='bold'>ROOT 管理器</span>");
-    sub = gtk_label_new(APP_SUB);
-    gtk_widget_set_name(sub, "sub");
-    gtk_widget_set_valign(sub, GTK_ALIGN_CENTER);
-    a->badge = gtk_label_new("未加载");
-    gtk_widget_set_name(a->badge, "badge");
-    gtk_widget_set_valign(a->badge, GTK_ALIGN_CENTER);
+    a->lbl_status_sub = gtk_label_new("");
+    gtk_widget_set_name(a->lbl_status_sub, "status_sub");
+    gtk_widget_set_halign(a->lbl_status_sub, GTK_ALIGN_START);
+    gtk_label_set_line_wrap(GTK_LABEL(a->lbl_status_sub), TRUE);
+    gtk_label_set_max_width_chars(GTK_LABEL(a->lbl_status_sub), 34);
+
+    gtk_box_pack_start(GTK_BOX(col), a->lbl_status, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(col), a->lbl_status_sub, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(row), a->ico_status, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(row), col, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(c), row, FALSE, FALSE, 0);
+
+    {
+        GtkWidget *eb = gtk_event_box_new();
+
+        gtk_event_box_set_visible_window(GTK_EVENT_BOX(eb), FALSE);
+        gtk_container_add(GTK_CONTAINER(eb), c);
+        g_signal_connect(eb, "button-press-event", G_CALLBACK(on_status_click), a);
+        return eb;
+    }
+}
+
+/* 信息行：左图标 + 标题 + 值 */
+static GtkWidget *info_row(IconKind kind, const char *label, GtkWidget **val_out)
+{
+    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 16);
+    GtkWidget *col = gtk_box_new(GTK_ORIENTATION_VERTICAL, 3);
+    GtkWidget *ico = make_icon(kind, 24);
+    GtkWidget *lbl = gtk_label_new(label);
+    GtkWidget *val = gtk_label_new("");
+
+    gtk_widget_set_margin_start(row, 22);
+    gtk_widget_set_margin_end(row, 22);
+    gtk_widget_set_margin_top(row, 14);
+    gtk_widget_set_margin_bottom(row, 14);
+
+    gtk_widget_set_valign(ico, GTK_ALIGN_START);
+    gtk_widget_set_margin_top(ico, 1);
+
+    gtk_widget_set_name(lbl, "rowlabel");
+    gtk_widget_set_halign(lbl, GTK_ALIGN_START);
+    gtk_widget_set_name(val, "cardvalue");
+    gtk_widget_set_halign(val, GTK_ALIGN_START);
+    gtk_label_set_line_wrap(GTK_LABEL(val), TRUE);
+    gtk_label_set_max_width_chars(GTK_LABEL(val), 40);
+
+    gtk_box_pack_start(GTK_BOX(col), lbl, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(col), val, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(row), ico, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(row), col, TRUE, TRUE, 0);
+
+    *val_out = val;
+    return row;
+}
+
+/* 卡片里两项之间的淡分隔线 */
+static void add_divider(GtkWidget *card)
+{
+    GtkWidget *sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
+
+    gtk_widget_set_margin_start(sep, 62);
+    gtk_widget_set_margin_end(sep, 22);
+    gtk_widget_set_opacity(sep, 0.55);
+    gtk_box_pack_start(GTK_BOX(card), sep, FALSE, FALSE, 0);
+}
+
+static GtkWidget *build_home(App *a)
+{
+    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+    GtkWidget *body = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14);
+    GtkWidget *card_info, *card_sys;
+    GtkWidget *title_row, *title, *btn_manage;
+
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
+                                   GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_name(scroll, "shell");
+
+    gtk_widget_set_margin_start(body, 8);
+    gtk_widget_set_margin_end(body, 8);
+    gtk_widget_set_margin_top(body, 8);
+    gtk_widget_set_margin_bottom(body, 20);
+
+    /* 大标题 + 右上角「管理」 */
+    title_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_margin_start(title_row, 14);
+    gtk_widget_set_margin_end(title_row, 8);
+    gtk_widget_set_margin_bottom(title_row, 10);
+
+    title = gtk_label_new(APP_TITLE);
+    gtk_widget_set_name(title, "bigtitle");
+    gtk_widget_set_halign(title, GTK_ALIGN_START);
+    gtk_widget_set_valign(title, GTK_ALIGN_CENTER);
+
+    btn_manage = gtk_button_new_with_label("管理");
+    gtk_widget_set_name(btn_manage, "textbtn");
+    gtk_widget_set_valign(btn_manage, GTK_ALIGN_CENTER);
+    g_signal_connect(btn_manage, "clicked", G_CALLBACK(on_manage), a);
+
+    gtk_box_pack_start(GTK_BOX(title_row), title, FALSE, FALSE, 0);
+    gtk_box_pack_end(GTK_BOX(title_row), btn_manage, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(body), title_row, FALSE, FALSE, 0);
+
+    /* 状态卡 */
+    gtk_box_pack_start(GTK_BOX(body), status_card(a), FALSE, FALSE, 0);
+
+    /* 版本信息卡 */
+    card_info = card_new();
+    gtk_box_pack_start(GTK_BOX(card_info),
+                       info_row(IC_HASH, "管理器版本", &a->val_mgr), FALSE, FALSE, 0);
+    add_divider(card_info);
+    gtk_box_pack_start(GTK_BOX(card_info),
+                       info_row(IC_CHIP, "内核版本", &a->val_kernel), FALSE, FALSE, 0);
+    gtk_widget_set_margin_top(card_info, 4);
+    gtk_widget_set_margin_bottom(card_info, 4);
+    gtk_box_pack_start(GTK_BOX(body), card_info, FALSE, FALSE, 0);
+
+    /* 系统状态卡 */
+    card_sys = card_new();
+    gtk_box_pack_start(GTK_BOX(card_sys),
+                       info_row(IC_SHIELD, "SELinux 状态", &a->val_selinux), FALSE, FALSE, 0);
+    add_divider(card_sys);
+    gtk_box_pack_start(GTK_BOX(card_sys),
+                       info_row(IC_FILTER, "Seccomp 状态", &a->val_seccomp), FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(body), card_sys, FALSE, FALSE, 0);
+
+    gtk_container_add(GTK_CONTAINER(scroll), body);
+    return scroll;
+}
+
+static GtkWidget *build_manage(App *a)
+{
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    GtkWidget *head, *title, *btn_back;
+    GtkWidget *card_mod, *card_proc, *card_log;
+    GtkWidget *btn_row, *btn_refresh, *btn_load, *btn_unload;
+    GtkWidget *cbody, *scroll, *logscroll;
+
+    gtk_widget_set_margin_start(box, 8);
+    gtk_widget_set_margin_end(box, 8);
+    gtk_widget_set_margin_top(box, 8);
+    gtk_widget_set_margin_bottom(box, 12);
+
+    head = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_widget_set_margin_start(head, 6);
+    gtk_widget_set_margin_bottom(head, 2);
+
+    btn_back = gtk_button_new_with_label("‹ 返回");
+    gtk_widget_set_name(btn_back, "textbtn");
+    g_signal_connect(btn_back, "clicked", G_CALLBACK(on_back), a);
+
+    title = gtk_label_new("管理");
+    gtk_widget_set_name(title, "cardtitle");
+    gtk_widget_set_valign(title, GTK_ALIGN_CENTER);
+
+    gtk_box_pack_start(GTK_BOX(head), btn_back, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(head), title, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(head), sub, FALSE, FALSE, 0);
-    gtk_box_pack_end(GTK_BOX(head), a->badge, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(root), head, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(box), head, FALSE, FALSE, 0);
 
-    /* 模块卡片 */
-    card_mod = card("内核模块", &body_mod);
+    /* 模块卡 */
+    card_mod = card_new();
+    cbody = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_widget_set_margin_start(cbody, 22);
+    gtk_widget_set_margin_end(cbody, 22);
+    gtk_widget_set_margin_top(cbody, 18);
+    gtk_widget_set_margin_bottom(cbody, 18);
+
     a->ko_label = gtk_label_new("");
-    gtk_widget_set_name(a->ko_label, "sub");
+    gtk_widget_set_name(a->ko_label, "cardvalue");
     gtk_widget_set_halign(a->ko_label, GTK_ALIGN_START);
     gtk_label_set_ellipsize(GTK_LABEL(a->ko_label), PANGO_ELLIPSIZE_MIDDLE);
-    gtk_box_pack_start(GTK_BOX(body_mod), a->ko_label, FALSE, FALSE, 0);
 
     btn_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     btn_refresh = gtk_button_new_with_label("刷新");
     btn_load = gtk_button_new_with_label("加载模块");
+    gtk_style_context_add_class(gtk_widget_get_style_context(btn_load), "primary");
     btn_unload = gtk_button_new_with_label("卸载模块");
-    gtk_box_pack_start(GTK_BOX(btn_row), btn_refresh, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(btn_row), btn_load, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(btn_row), btn_unload, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(body_mod), btn_row, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(root), card_mod, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(btn_row), btn_refresh, FALSE, FALSE, 0);
 
-    /* 进程卡片 */
-    card_proc = card("可提权进程（当前用户）", &body_proc);
+    gtk_box_pack_start(GTK_BOX(cbody), a->ko_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(cbody), btn_row, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(card_mod), cbody, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(box), card_mod, FALSE, FALSE, 0);
+
+    /* 进程卡 */
+    card_proc = card_new();
     gtk_widget_set_vexpand(card_proc, TRUE);
-    hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
-    gtk_box_pack_start(GTK_BOX(body_proc), hbox, TRUE, TRUE, 0);
+    cbody = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_margin_start(cbody, 12);
+    gtk_widget_set_margin_end(cbody, 12);
+    gtk_widget_set_margin_top(cbody, 14);
+    gtk_widget_set_margin_bottom(cbody, 14);
+
+    {
+        GtkWidget *h = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+        GtkWidget *lbl = gtk_label_new("可提权进程");
+        GtkWidget *sub = gtk_label_new("当前用户");
+        gtk_widget_set_name(lbl, "cardtitle");
+        gtk_widget_set_name(sub, "cardvalue");
+        gtk_widget_set_halign(lbl, GTK_ALIGN_START);
+        gtk_widget_set_valign(sub, GTK_ALIGN_CENTER);
+        gtk_box_pack_start(GTK_BOX(h), lbl, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(h), sub, FALSE, FALSE, 0);
+        gtk_widget_set_margin_start(h, 10);
+        gtk_box_pack_start(GTK_BOX(cbody), h, FALSE, FALSE, 0);
+    }
 
     scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
@@ -617,37 +981,78 @@ static void build_ui(App *a)
     gtk_list_box_set_selection_mode(GTK_LIST_BOX(a->list), GTK_SELECTION_SINGLE);
     g_signal_connect(a->list, "row-selected", G_CALLBACK(on_row_selected), a);
     gtk_container_add(GTK_CONTAINER(scroll), a->list);
-    gtk_box_pack_start(GTK_BOX(hbox), scroll, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(cbody), scroll, TRUE, TRUE, 0);
 
     a->btn_give = gtk_button_new_with_label("提权选中进程");
-    gtk_widget_set_valign(a->btn_give, GTK_ALIGN_START);
+    gtk_widget_set_halign(a->btn_give, GTK_ALIGN_END);
     gtk_widget_set_sensitive(a->btn_give, FALSE);
-    gtk_box_pack_start(GTK_BOX(hbox), a->btn_give, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(root), card_proc, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(cbody), a->btn_give, FALSE, FALSE, 0);
 
-    /* 日志卡片 */
-    card_log = card("输出", &body_log);
-    gtk_widget_set_size_request(card_log, -1, 150);
+    gtk_box_pack_start(GTK_BOX(card_proc), cbody, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(box), card_proc, TRUE, TRUE, 0);
+
+    /* 日志卡 */
+    card_log = card_new();
+    cbody = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_margin_start(cbody, 14);
+    gtk_widget_set_margin_end(cbody, 14);
+    gtk_widget_set_margin_top(cbody, 14);
+    gtk_widget_set_margin_bottom(cbody, 14);
+
+    {
+        GtkWidget *lbl = gtk_label_new("输出");
+        gtk_widget_set_name(lbl, "cardtitle");
+        gtk_widget_set_halign(lbl, GTK_ALIGN_START);
+        gtk_box_pack_start(GTK_BOX(cbody), lbl, FALSE, FALSE, 0);
+    }
+
     logscroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_widget_set_name(logscroll, "logscroll");
+    gtk_widget_set_size_request(logscroll, -1, 96);
     a->logview = gtk_text_view_new();
     gtk_widget_set_name(a->logview, "logview");
     gtk_text_view_set_editable(GTK_TEXT_VIEW(a->logview), FALSE);
     gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(a->logview), FALSE);
     gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(a->logview), GTK_WRAP_WORD_CHAR);
     gtk_container_add(GTK_CONTAINER(logscroll), a->logview);
-    gtk_box_pack_start(GTK_BOX(body_log), logscroll, TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(root), card_log, FALSE, FALSE, 0);
-
-    {
-        GtkTextBuffer *tb = gtk_text_view_get_buffer(GTK_TEXT_VIEW(a->logview));
-        gtk_text_buffer_create_tag(tb, "dim", "foreground", "#5a7086", NULL);
-    }
+    gtk_box_pack_start(GTK_BOX(cbody), logscroll, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(card_log), cbody, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(box), card_log, FALSE, FALSE, 0);
 
     g_signal_connect(btn_refresh, "clicked", G_CALLBACK(on_refresh), a);
     g_signal_connect(btn_load, "clicked", G_CALLBACK(on_load), a);
     g_signal_connect(btn_unload, "clicked", G_CALLBACK(on_unload), a);
     g_signal_connect(a->btn_give, "clicked", G_CALLBACK(on_give), a);
+
+    return box;
+}
+
+static void build_ui(App *a)
+{
+    GtkCssProvider *css;
+
+    a->win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_title(GTK_WINDOW(a->win), "RootMgr");
+    gtk_window_set_default_size(GTK_WINDOW(a->win), 440, 720);
+    gtk_window_set_position(GTK_WINDOW(a->win), GTK_WIN_POS_CENTER);
+    g_signal_connect(a->win, "destroy", G_CALLBACK(gtk_main_quit), NULL);
+
+    css = gtk_css_provider_new();
+    gtk_css_provider_load_from_data(css, CSS, -1, NULL);
+    gtk_style_context_add_provider_for_screen(
+        gdk_screen_get_default(), GTK_STYLE_PROVIDER(css),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    g_object_unref(css);
+
+    a->stack = gtk_stack_new();
+    gtk_stack_set_transition_type(GTK_STACK(a->stack),
+                                  GTK_STACK_TRANSITION_TYPE_CROSSFADE);
+    gtk_stack_set_transition_duration(GTK_STACK(a->stack), 120);
+    gtk_container_add(GTK_CONTAINER(a->win), a->stack);
+
+    gtk_stack_add_named(GTK_STACK(a->stack), build_home(a), "home");
+    gtk_stack_add_named(GTK_STACK(a->stack), build_manage(a), "manage");
+    gtk_stack_set_visible_child_name(GTK_STACK(a->stack), "home");
 
     gtk_widget_show_all(a->win);
 }
@@ -670,22 +1075,14 @@ int main(int argc, char **argv)
     else
         a.ko_path = p1;
 
-    a.bg_pix = gdk_pixbuf_new_from_file(
-        g_build_filename(dir, "bg.png", NULL), NULL);
-
     build_ui(&a);
     gtk_label_set_text(GTK_LABEL(a.ko_label), a.ko_path);
 
     refresh_state(&a);
     refresh_procs(&a);
-    log_line(&a, "模块状态: %s\n", module_loaded() ? "已加载" : "未加载");
-    if (!module_loaded())
-        log_line(&a, "先点「加载模块」；ko 路径见上方。\n");
 
     gtk_main();
 
-    if (a.bg_pix)
-        g_object_unref(a.bg_pix);
     g_free(p1);
     g_free(p2);
     g_free(dir);
