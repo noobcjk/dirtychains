@@ -3693,7 +3693,7 @@ int ovswrap_main(int argc, char **argv)
 
 #define APP_TITLE       "DirtyChains · 页缓存提权"
 /* 构建标识: 标题栏副标题上直接显示, 用来确认跑的是不是最新这份 */
-#define DF_BUILD        "2026-10-31-r12"
+#define DF_BUILD        "2026-10-31-r13"
 #define APP_SUBTITLE    "六链 PoC 图形前端 · " DF_BUILD
 #define LOG_MAX_LINES   20000
 #define PTY_COLS        110
@@ -3710,38 +3710,45 @@ typedef struct {
     const char *desc;    /* 说明 */
     const char *need;    /* 前提 */
     int         engine;  /* 0 = 内置 dirtychains 引擎, 1 = ovswrap 引擎 */
+    const char *cls;     /* 侧栏里显示的类别名 */
 } Chain;
 
 static const Chain chains[] = {
     { "-2026-31431", "31431 · Copy Fail",
       "CVE-2026-31431  AF_ALG / AEAD",
       "splice 文件页进 AEAD, 原地解密写 4 字节",
-      "需 authencesn(hmac(sha256),cbc(aes)) + algif_aead", 0 },
+      "需 authencesn(hmac(sha256),cbc(aes)) + algif_aead", 0,
+      "AEAD类" },
 
     { "-2026-43284", "43284 · XFRM/ESP",
       "CVE-2026-43284  XFRM / ESP",
       "splice + esp_input 原地解密, 写 ESN 高 32 位",
-      "需非特权 userns + XFRM + ESP", 0 },
+      "需非特权 userns + XFRM + ESP", 0,
+      "ESP类" },
 
     { "-2026-43500", "43500 · RxRPC",
       "CVE-2026-43500  RxRPC / RXKAD",
       "8 字节 pcbc(fcrypt) 原地解密, 改 /etc/passwd 首行",
-      "需 AF_RXRPC + RXKAD, 写位置固定", 0 },
+      "需 AF_RXRPC + RXKAD, 写位置固定", 0,
+      "RxRPC类" },
 
     { "-2026-43494", "43494 · io_uring",
       "CVE-2026-43494  io_uring + RDS",
       "页引用计数劫持, 整页替换 setuid 文件",
-      "需 IORING_REGISTER_CLONE_BUFFERS (6.12+)", 0 },
+      "需 IORING_REGISTER_CLONE_BUFFERS (6.12+)", 0,
+      "UAF类" },
 
     { "-2026-46331", "46331 · act_pedit",
       "CVE-2026-46331  net/sched act_pedit",
       "sendfile 进 loopback, pedit 改 TCP 头, 写穿页缓存",
-      "需 act_pedit + clsact + userns", 0 },
+      "需 act_pedit + clsact + userns", 0,
+      "pedit类" },
 
     { "-2026-64531", "64531 · OVS CT",
       "CVE-2026-64531  net/openvswitch CT action",
       "伪造 SET action 越界读内核内存, dst_release 递减改 cred",
-      "需 openvswitch + userns，偏移读 offset/ 配置表", 1 },
+      "需 openvswitch + userns，偏移读 offset/ 配置表", 1,
+      "OVS类" },
 };
 #define N_CHAINS ((int)(sizeof(chains) / sizeof(chains[0])))
 
@@ -4816,16 +4823,6 @@ static void act_write(GtkWidget *w, gpointer data)
     app_spawn(a, args, "通用写");
 }
 
-
-static void on_collapse_clicked(GtkWidget *w, gpointer data)
-{
-    App *a = data;
-
-    (void)w;
-    if (a->btn_expand)
-        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(a->btn_expand), FALSE);
-}
-
 static void on_toggle_expand(GtkWidget *w, gpointer data)
 {
     App *a = data;
@@ -5034,32 +5031,6 @@ static void install_css(void)
         "  background-color: #ffffff;\n"
         "  border-right: 1px solid #dbe7f2;\n"
         "}\n"
-        "#mainwin #sidehead { color: #1e2c3a; font-size: 14pt; }\n"
-        "#mainwin #sidehead-arrow { color: #5a7691; }\n"
-        "#mainwin #sideicon {\n"
-        "  background-image: none;\n"
-        "  background-color: #eef1f5;\n"
-        "  border: none;\n"
-        "  box-shadow: none;\n"
-        "  border-radius: 100px;\n"
-        "  padding: 0;\n"
-        "  min-width: 30px;\n"
-        "  min-height: 30px;\n"
-        "}\n"
-        "#mainwin #sideicon:hover { background-color: #e2e8ef; }\n"
-        "#mainwin #newtask {\n"
-        "  background-image: none;\n"
-        "  background-color: #ffffff;\n"
-        "  border: 1px solid #dbe3ec;\n"
-        "  border-radius: 20px;\n"
-        "  box-shadow: 0 1px 2px rgba(35,70,110,0.06);\n"
-        "  padding: 8px 14px;\n"
-        "}\n"
-        "#mainwin #newtask:hover { background-color: #f7fbff; border-color: #b9d4ec; }\n"
-        "#mainwin #newtask:active { background-color: #eaf4fd; }\n"
-        "#mainwin #newtask-label { color: #1f2b38; font-size: 11pt; }\n"
-        "#mainwin #sidegroup { color: #8a97a5; font-size: 10pt; }\n"
-        "#mainwin #sidegroup-arrow { color: #a8b4c1; }\n"
         "#mainwin #sidescroll, #mainwin #sidescroll viewport { background-color: transparent; }\n"
         "#mainwin #tasklist { background-color: transparent; }\n"
         "#mainwin #tasklist row {\n"
@@ -5251,8 +5222,8 @@ static GtkWidget *build_actions(App *a)
 /*
  * 左上角「展开」拉开的任务抽屉。
  *
- * 版式走手机端会话列表那一套: 页头 → 新建任务 → 分组标题 → 条目列表。
- * 列表与顶部下拉框双向联动: 点条目等于选链, 选链也会反选条目。
+ * 纯列表版式: 每个条目是一类漏洞 (UAF类 / ESP类 / ...), 点条目等于选链,
+ * 与顶部下拉框双向联动。对应链的全名放在条目 tooltip 里。
  */
 #define SIDEBAR_W 268
 
@@ -5285,105 +5256,14 @@ static void on_task_row_selected(GtkListBox *lb, GtkListBoxRow *row, gpointer da
         gtk_combo_box_set_active(GTK_COMBO_BOX(a->combo), idx);
 }
 
-/* 「新建任务」: 清日志 + 回到全部链, 相当于开一轮新会话 */
-static void on_new_task(GtkWidget *w, gpointer data)
-{
-    App *a = data;
-
-    (void)w;
-    gtk_combo_box_set_active(GTK_COMBO_BOX(a->combo), 0);
-    gtk_text_buffer_set_text(a->logbuf, "", -1);
-    gtk_label_set_text(GTK_LABEL(a->status_lbl), "已新建任务：全部链");
-    gtk_widget_set_name(a->status_lbl, "status-run");
-    if (a->entry_input)
-        gtk_widget_grab_focus(a->entry_input);
-}
-
-/* 圆形图标按钮 (页头右边那种) */
-static GtkWidget *side_icon_button(const char *icon, const char *tip)
-{
-    GtkWidget *btn = gtk_button_new();
-    GtkWidget *img = gtk_image_new_from_icon_name(icon, GTK_ICON_SIZE_MENU);
-
-    gtk_widget_set_name(btn, "sideicon");
-    gtk_button_set_relief(GTK_BUTTON(btn), GTK_RELIEF_NONE);
-    gtk_widget_set_valign(btn, GTK_ALIGN_CENTER);
-    gtk_widget_set_tooltip_text(btn, tip);
-    gtk_container_add(GTK_CONTAINER(btn), img);
-    return btn;
-}
-
 static GtkWidget *build_task_sidebar(App *a)
 {
-    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
-    GtkWidget *head = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    GtkWidget *group = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
-    GtkWidget *btn, *lbl, *img, *scroller, *list;
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    GtkWidget *scroller, *list;
     int i;
 
     gtk_widget_set_name(box, "sidebar");
     gtk_widget_set_size_request(box, SIDEBAR_W, -1);
-
-    /* ── 页头: 云图标 + 本机 ▾ + 收起 ── */
-    img = gtk_image_new_from_icon_name("computer-symbolic", GTK_ICON_SIZE_MENU);
-    gtk_box_pack_start(GTK_BOX(head), img, FALSE, FALSE, 0);
-
-    lbl = gtk_label_new("本机");
-    gtk_widget_set_name(lbl, "sidehead");
-    gtk_box_pack_start(GTK_BOX(head), lbl, FALSE, FALSE, 0);
-
-    img = gtk_image_new_from_icon_name("pan-down-symbolic", GTK_ICON_SIZE_MENU);
-    gtk_widget_set_name(img, "sidehead-arrow");
-    gtk_box_pack_start(GTK_BOX(head), img, FALSE, FALSE, 0);
-
-    btn = side_icon_button("pan-start-symbolic", "收起任务面板");
-    g_signal_connect(btn, "clicked", G_CALLBACK(on_collapse_clicked), a);
-    gtk_box_pack_end(GTK_BOX(head), btn, FALSE, FALSE, 0);
-
-    gtk_widget_set_margin_start(head, 16);
-    gtk_widget_set_margin_end(head, 12);
-    gtk_widget_set_margin_top(head, 12);
-    gtk_box_pack_start(GTK_BOX(box), head, FALSE, FALSE, 0);
-
-    /* ── 新建任务 ── */
-    btn = gtk_button_new();
-    {
-        GtkWidget *h = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-        GtkWidget *ic = gtk_image_new_from_icon_name("list-add-symbolic",
-                                                     GTK_ICON_SIZE_MENU);
-
-        gtk_widget_set_halign(h, GTK_ALIGN_CENTER);
-        gtk_box_pack_start(GTK_BOX(h), ic, FALSE, FALSE, 0);
-        lbl = gtk_label_new("新建任务");
-        gtk_widget_set_name(lbl, "newtask-label");
-        gtk_box_pack_start(GTK_BOX(h), lbl, FALSE, FALSE, 0);
-        gtk_container_add(GTK_CONTAINER(btn), h);
-    }
-    gtk_widget_set_name(btn, "newtask");
-    gtk_button_set_relief(GTK_BUTTON(btn), GTK_RELIEF_NONE);
-    gtk_widget_set_tooltip_text(btn, "清空日志并回到「全部链」");
-    g_signal_connect(btn, "clicked", G_CALLBACK(on_new_task), a);
-    gtk_widget_set_margin_start(btn, 12);
-    gtk_widget_set_margin_end(btn, 12);
-    gtk_box_pack_start(GTK_BOX(box), btn, FALSE, FALSE, 0);
-
-    /* ── 分组标题: 任务 ▾ ... 列表图标 ── */
-    lbl = gtk_label_new("任务");
-    gtk_widget_set_name(lbl, "sidegroup");
-    gtk_box_pack_start(GTK_BOX(group), lbl, FALSE, FALSE, 0);
-
-    img = gtk_image_new_from_icon_name("pan-down-symbolic", GTK_ICON_SIZE_MENU);
-    gtk_widget_set_name(img, "sidegroup-arrow");
-    gtk_box_pack_start(GTK_BOX(group), img, FALSE, FALSE, 0);
-
-    img = gtk_image_new_from_icon_name("view-list-symbolic", GTK_ICON_SIZE_MENU);
-    gtk_widget_set_name(img, "sidegroup-arrow");
-    gtk_box_pack_end(GTK_BOX(group), img, FALSE, FALSE, 0);
-
-    gtk_widget_set_margin_start(group, 16);
-    gtk_widget_set_margin_end(group, 14);
-    gtk_widget_set_margin_top(group, 4);
-    gtk_box_pack_start(GTK_BOX(box), group, FALSE, FALSE, 0);
 
     /* ── 条目列表 ── */
     scroller = gtk_scrolled_window_new(NULL, NULL);
@@ -5399,12 +5279,14 @@ static GtkWidget *build_task_sidebar(App *a)
 
     for (i = 0; i <= N_CHAINS; i++) {
         GtkWidget *row = gtk_list_box_row_new();
-        GtkWidget *l = gtk_label_new(i == 0 ? "全部链 · 检查 / 自测"
-                                            : chains[i - 1].tag);
+        GtkWidget *l = gtk_label_new(i == 0 ? "全部类 · 检查 / 自测"
+                                            : chains[i - 1].cls);
 
         gtk_label_set_xalign(GTK_LABEL(l), 0.0f);
         gtk_widget_set_halign(l, GTK_ALIGN_START);
         gtk_widget_set_valign(l, GTK_ALIGN_CENTER);
+        if (i > 0)
+            gtk_widget_set_tooltip_text(row, chains[i - 1].name);
         gtk_container_add(GTK_CONTAINER(row), l);
         gtk_container_add(GTK_CONTAINER(list), row);
     }
@@ -5412,6 +5294,7 @@ static GtkWidget *build_task_sidebar(App *a)
     g_signal_connect(list, "row-selected", G_CALLBACK(on_task_row_selected), a);
 
     gtk_container_add(GTK_CONTAINER(scroller), list);
+    gtk_widget_set_margin_top(scroller, 12);
     gtk_widget_set_margin_start(scroller, 8);
     gtk_widget_set_margin_end(scroller, 8);
     gtk_widget_set_margin_bottom(scroller, 10);
