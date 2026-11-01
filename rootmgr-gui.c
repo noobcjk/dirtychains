@@ -1294,6 +1294,29 @@ static void on_term_clear(GtkWidget *w, gpointer data)
 
 static const char *PAGE_NAMES[TAB_COUNT] = { "home", "super", "term", "set" };
 
+/* GtkEntry 一获得焦点就会把自己的文本整段选中，这是 GTK 的默认行为。
+   放在切页上就格外碍眼：从终端页切走再切回来，刚敲的命令整段变蓝。
+   这里把选区收成光标处的一个点——不跳回开头，否则输入到一半的内容会被挪走。 */
+static void entry_drop_selection(GtkWidget *w)
+{
+    int pos;
+
+    if (!w)
+        return;
+    pos = gtk_editable_get_position(GTK_EDITABLE(w));
+    if (pos < 0)
+        pos = 0;
+    gtk_editable_select_region(GTK_EDITABLE(w), pos, pos);
+}
+
+static gboolean reset_entry_selection(gpointer data)
+{
+    App *a = data;
+
+    entry_drop_selection(a->entry);
+    return G_SOURCE_REMOVE;
+}
+
 static void switch_page(App *a, int idx)
 {
     int i;
@@ -1327,6 +1350,9 @@ static void switch_page(App *a, int idx)
         gtk_widget_grab_focus(a->entry);
     if (idx == 3)
         refresh_settings(a);
+
+    /* grab_focus 之后 GTK 才把选区刷出来，所以收到 idle 里再收 */
+    g_idle_add(reset_entry_selection, a);
 }
 
 static void on_tab(GtkWidget *w, GdkEventButton *ev, gpointer data)
