@@ -3,6 +3,7 @@
 #   make                编译 dirtychains（前端 + 五链引擎 + Fragnesia/DirtyClone/DirtyDecrypt + OVS）
 #   make poc            另外编一个独立的命令行引擎
 #   make ovswrap        用同一个源编出不含 GTK 的 OVS 命令行版
+#   make ghostlock      编出 CVE-2026-43499 的独立命令行验证程序
 #   make offset-add REC=rec.json 把一条记录写成 offset/<N>系/<release>/target.h
 #   make offset-sync     从 krec-808.json 整批重建 offset/ 目录树
 #   make kmod            编译 tools/kmod 的偏移提取模块
@@ -51,6 +52,11 @@ $(TARGET): $(GUI_OBJ) $(ENG_OBJ)
 # 独立的命令行版本，可单独拷走使用
 poc: $(ENGINE_SRC)
 	$(CC) $(ENGINE_CFLAGS) -o $@ $<
+
+# CVE-2026-43499 (rtmutex remove_waiter 栈 UAF) 独立命令行版
+# 零依赖: 只用 futex(PI)，不加载模块、不建 userns、不需要 setuid 靶子
+ghostlock: cve-2026-43499.c
+	$(CC) $(CFLAGS) -o $@ $< -lpthread
 
 # CVE-2026-64531 (net/openvswitch CT action 越界) 命令行版
 # 源码就在 dirtyfrag-gui.c 里，用 OVSWRAP_STANDALONE 把 GTK 段裁掉
@@ -124,6 +130,6 @@ uninstall:
 	rm -f $(DESTDIR)$(DATADIR)/krec_dump.ko
 
 clean:
-	rm -f $(TARGET) $(GUI_OBJ) $(ENG_OBJ) $(ENGINE) ovswrap rootmgr-gui
+	rm -f $(TARGET) $(GUI_OBJ) $(ENG_OBJ) $(ENGINE) ovswrap rootmgr-gui ghostlock
 
-.PHONY: all install uninstall clean poc ovswrap offset-add offset-sync kmod rootmgr-ko rootmgr-gui
+.PHONY: all install uninstall clean poc ovswrap ghostlock offset-add offset-sync kmod rootmgr-ko rootmgr-gui
