@@ -10,7 +10,6 @@
 /ovswrap
 /rootmgr-gui
 /tools/kmod/rootmgr_fd_demo
-/tools/lpe/fragnesia
 *.cmd
 .gccver-gui
 
