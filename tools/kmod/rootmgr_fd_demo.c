@@ -17,6 +17,11 @@
  *   version = 21000 (2.1.0)
  *   info: version=21000 flags=0x3 root=1 manager=1 uid=0 euid=0 allow_uid=-1
  *
+ *   == APP PROFILE（按 exe 的 ino/dev 授权）==
+ *   app: ino=0x1a2b3c dev=0x801 state=ask(未记录)
+ *   GRANT_ROOT 被 deny 拦住：Operation not permitted
+ *   ...
+ *
  *   == GRANT_ROOT ==
  *   已经是 root，GRANT_ROOT 是空操作
  *
@@ -53,6 +58,50 @@ static void print_info(void)
 	       !!(info.flags & KSU_FLAG_ROOT),
 	       !!(info.flags & KSU_FLAG_MANAGER),
 	       info.uid, info.euid, info.manager_uid);
+}
+
+static void print_app(void)
+{
+	struct ksu_app_entry e;
+
+	if (rootmgr_get_app(&e) != 0) {
+		perror("GET_APP_PROFILE");
+		return;
+	}
+	printf("app: ino=%#llx dev=%#x state=%s\n",
+	       (unsigned long long)e.ino, e.dev,
+	       e.state == KSU_POLICY_ROOT ? "root" :
+	       e.state == KSU_POLICY_DENY ? "deny" :
+	       e.state == KSU_POLICY_ASK  ? "ask(未记录)" : "?");
+}
+
+static void test_app_profile(void)
+{
+	section("APP PROFILE（按 exe 的 ino/dev 授权）");
+	print_app();
+
+	/* 1) 显式禁止：连 manager 也提不了，这是硬约束 */
+	if (rootmgr_set_state("/proc/self/exe", KSU_POLICY_DENY) != 0) {
+		perror("SET deny");
+		return;
+	}
+	print_app();
+	if (rootmgr_grant_root() == 0)
+		printf("!! 不应该成功：deny 没生效\n");
+	else
+		printf("GRANT_ROOT 被 deny 拦住：%s\n", strerror(errno));
+
+	/* 2) 改成 root */
+	if (rootmgr_set_state("/proc/self/exe", KSU_POLICY_ROOT) != 0)
+		perror("SET root");
+	else
+		print_app();
+
+	/* 3) 删掉记录，回到"未登记" */
+	if (rootmgr_set_state("/proc/self/exe", KSU_POLICY_ASK) != 0)
+		perror("SET ask");
+	else
+		print_app();
 }
 
 static void test_grant_root(void)
@@ -190,6 +239,7 @@ int main(void)
 
 	print_info();
 
+	test_app_profile();
 	test_grant_root();
 	test_grant_pid();
 

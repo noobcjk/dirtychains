@@ -44,6 +44,8 @@
  *     nr 2  GET_INFO     读通道信息（版本 / uid / 是否 root / 是否 manager）
  *     nr 3  GET_VERSION  只读版本号（__u32）
  *     nr 4  GRANT_PID    给指定 pid 提权（管理器用，arg 指向 __s32）
+ *     nr 5  SET_APP_PROFILE  写一条程序授权（ino + dev + state）
+ *     nr 6  GET_APP_PROFILE  读调用者自己的授权状态（ino + dev + state）
  *
  *   分派时只比对 _IOC_TYPE + _IOC_NR，不比对 size 字段 —— 32 位进程走
  *   compat_ioctl 进来时 sizeof(struct) 会变，整串 cmd 就对不上了。
@@ -54,11 +56,18 @@
  *   这一层只改进程凭证，不动 SELinux 域：如果当前域本身被策略卡着，
  *   提权后仍然可能被 avc deny 拦，需要在策略侧放行（后续再补）。
  *
- * 五、谁能调 GRANT_ROOT / GRANT_PID
- *   模块参数 allow_uid（默认 -1）：
- *     -1  -> 要求调用者具备 CAP_SYS_ADMIN；
- *     >=0 -> 只允许该 uid 调用。
- *   普通进程即便凑到了 fd，也只能 PING / GET_INFO，提权会被 -EPERM 拒绝。
+ * 五、谁能提权：三层判断，从硬到软
+ *
+ *   1) 程序被显式标成 DENY —— 谁都提不了，包括管理器自己。这一层是硬约束，
+ *      用来"收回"一条已经被信任的程序。
+ *   2) 程序被标成 ROOT —— 允许。识别方式是 exe 文件的 (i_ino, i_sb->s_dev)，
+ *      不是路径字符串：换名字、软链接、替换文件名都骗不过去，绑的是 inode。
+ *   3) 没记录 —— 只有 manager 能提；manager 的判据见模块参数 allow_uid
+ *      （-1 要求 CAP_SYS_ADMIN，>=0 只认该 uid）。
+ *
+ *   授权表由管理器用 SET_APP_PROFILE 写入（最多 ROOTMGR_MAX_APPS 条），
+ *   存在内核内存里，rmmod 后清空 —— 持久化交给用户态的 policy 文件，
+ *   每次加载模块后由管理器重新灌一遍。
  *
  * 构建 / 使用：
  *   make rootmgr
@@ -79,6 +88,9 @@
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/sched.h>
+#include <linux/sched/mm.h>
+#include <linux/mm.h>
+#include <linux/mutex.h>
 #include <linux/sched/task.h>
 #include <linux/cred.h>
 #include <linux/capability.h>
@@ -87,8 +99,8 @@
 #include <linux/version.h>
 #include <linux/ioctl.h>
 
-#define ROOTMGR_VERSION_STR "2.1"
-#define ROOTMGR_VERSION_NUM 21000
+#define ROOTMGR_VERSION_STR "2.2"
+#define ROOTMGR_VERSION_NUM 22000
 #define ROOTMGR_NAME        "[ksu_driver]"
 
 /* 用户态 reboot(2) 用的暗号 */
@@ -106,6 +118,8 @@
 #define KSU_NR_GET_INFO     2
 #define KSU_NR_GET_VERSION  3
 #define KSU_NR_GRANT_PID    4
+#define KSU_NR_SET_APP_PROFILE 5
+#define KSU_NR_GET_APP_PROFILE 6
 
 /* GET_INFO 的载荷。前两个字段和 KernelSU 对齐，后面是自定的扩展。 */
 struct ksu_get_info_cmd {
@@ -120,6 +134,25 @@ struct ksu_get_info_cmd {
 #define KSU_FLAG_ROOT    (1u << 0)
 #define KSU_FLAG_MANAGER (1u << 1)
 
+/*
+ * 一条程序授权。程序的身份是 (ino, dev)：exe 文件的 inode 号 +
+ * 它所在 superblock 的设备号（new_encode_dev 编码，和用户态 stat().st_dev
+ * 一致）。不用路径，是因为路径可以被改名、被软链接、被替换。
+ *
+ * state = ASK 时表示"删除这条记录"。
+ */
+struct ksu_app_entry {
+	__u64 ino;
+	__u32 dev;
+	__s32 state;    /* KSU_POLICY_ASK / ROOT / DENY */
+	__u32 uid;      /* 记录归属用户，只用于展示 */
+	__u32 reserved;
+};
+
+#define KSU_POLICY_ASK  0
+#define KSU_POLICY_ROOT 1
+#define KSU_POLICY_DENY 2
+
 #define KSU_IOCTL_PING        _IOC(_IOC_NONE, KSU_IOCTL_MAGIC, KSU_NR_PING, 0)
 #define KSU_IOCTL_GRANT_ROOT  _IOC(_IOC_NONE, KSU_IOCTL_MAGIC, KSU_NR_GRANT_ROOT, 0)
 #define KSU_IOCTL_GET_INFO    _IOC(_IOC_READ, KSU_IOCTL_MAGIC, KSU_NR_GET_INFO, \
@@ -128,14 +161,24 @@ struct ksu_get_info_cmd {
 				   sizeof(__u32))
 #define KSU_IOCTL_GRANT_PID   _IOC(_IOC_WRITE, KSU_IOCTL_MAGIC, KSU_NR_GRANT_PID, \
 				   sizeof(__s32))
+#define KSU_IOCTL_SET_APP_PROFILE _IOC(_IOC_WRITE, KSU_IOCTL_MAGIC, \
+				       KSU_NR_SET_APP_PROFILE, \
+				       sizeof(struct ksu_app_entry))
+#define KSU_IOCTL_GET_APP_PROFILE _IOC(_IOC_READ | _IOC_WRITE, KSU_IOCTL_MAGIC, \
+				       KSU_NR_GET_APP_PROFILE, \
+				       sizeof(struct ksu_app_entry))
 
 /* allow_uid：-1 = 只认 CAP_SYS_ADMIN；>=0 = 只认这个 uid */
 static int allow_uid = -1;
 module_param(allow_uid, int, 0644);
-MODULE_PARM_DESC(allow_uid, "只允许该 uid 调用 GRANT_ROOT/GRANT_PID，-1 表示要求 CAP_SYS_ADMIN");
+MODULE_PARM_DESC(allow_uid, "manager uid：没登记过的程序只有它才能提权，-1 表示要求 CAP_SYS_ADMIN");
 
 /* 统计 */
 static atomic_t grant_count = ATOMIC_INIT(0);
+
+/* 前置声明：第 1 节的凭据操作要用到第 2 节的授权表 */
+static int task_exe_id(struct task_struct *t, u64 *ino, u32 *dev);
+static int app_lookup(u64 ino, u32 dev);
 
 /* -------------------------------------------------------------------------
  * 1. 凭据：造一份 root cred，换给目标 task
@@ -270,13 +313,149 @@ static int escape_pid(pid_t pid)
 		return -EINVAL;
 	}
 
+	/* 被显式标成 DENY 的程序，谁都不能替它开这个口子 */
+	{
+		u64 ino;
+		u32 dev;
+
+		if (task_exe_id(t, &ino, &dev) == 0 &&
+		    app_lookup(ino, dev) == KSU_POLICY_DENY) {
+			put_task_struct(t);
+			return -EPERM;
+		}
+	}
+
 	ret = grant_task(t);
 	put_task_struct(t);
 	return ret;
 }
 
 /* -------------------------------------------------------------------------
- * 2. 权限判断
+ * 2. 授权表：程序身份 = exe 的 (ino, dev)
+ * ---------------------------------------------------------------------- */
+
+#define ROOTMGR_MAX_APPS 256
+
+struct app_rec {
+	u64 ino;
+	u32 dev;
+	int state;
+	kuid_t uid;
+};
+
+static struct app_rec app_table[ROOTMGR_MAX_APPS];
+static int app_count;
+static DEFINE_MUTEX(app_lock);
+
+/* 某个 task 的可执行文件身份；内核线程、刚 exec 到一半的进程没有 exe_file */
+static int task_exe_id(struct task_struct *t, u64 *ino, u32 *dev)
+{
+	struct file *exe;
+	struct inode *i;
+	struct mm_struct *mm = t->mm;
+
+	if (!mm)
+		return -ENOENT;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
+	mmap_read_lock(mm);
+#else
+	down_read(&mm->mmap_sem);
+#endif
+	exe = mm->exe_file;
+	if (exe)
+		get_file(exe);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
+	mmap_read_unlock(mm);
+#else
+	up_read(&mm->mmap_sem);
+#endif
+
+	if (!exe)
+		return -ENOENT;
+
+	i = file_inode(exe);
+	*ino = i->i_ino;
+	*dev = new_encode_dev(i->i_sb->s_dev);
+	fput(exe);
+
+	return 0;
+}
+
+static int current_exe_id(u64 *ino, u32 *dev)
+{
+	return task_exe_id(current, ino, dev);
+}
+
+/* 查表；未记录返回 KSU_POLICY_ASK */
+static int app_lookup(u64 ino, u32 dev)
+{
+	int i, state = KSU_POLICY_ASK;
+
+	mutex_lock(&app_lock);
+	for (i = 0; i < app_count; i++) {
+		if (app_table[i].ino == ino && app_table[i].dev == dev) {
+			state = app_table[i].state;
+			break;
+		}
+	}
+	mutex_unlock(&app_lock);
+
+	return state;
+}
+
+/* 写一条记录；state == ASK 表示删除 */
+static int app_set(const struct ksu_app_entry *e)
+{
+	int i;
+
+	if (e->state != KSU_POLICY_ROOT && e->state != KSU_POLICY_DENY &&
+	    e->state != KSU_POLICY_ASK)
+		return -EINVAL;
+
+	mutex_lock(&app_lock);
+
+	for (i = 0; i < app_count; i++) {
+		if (app_table[i].ino == e->ino && app_table[i].dev == e->dev) {
+			if (e->state == KSU_POLICY_ASK) {
+				/* 删除：用最后一条填坑，顺序不重要 */
+				app_table[i] = app_table[app_count - 1];
+				app_count--;
+			} else {
+				app_table[i].state = e->state;
+				app_table[i].uid = current_uid();
+			}
+			mutex_unlock(&app_lock);
+			return 0;
+		}
+	}
+
+	if (e->state == KSU_POLICY_ASK) {
+		mutex_unlock(&app_lock);        /* 本来就没有，删也算成功 */
+		return 0;
+	}
+
+	if (app_count >= ROOTMGR_MAX_APPS) {
+		mutex_unlock(&app_lock);
+		return -ENOSPC;
+	}
+
+	app_table[app_count].ino = e->ino;
+	app_table[app_count].dev = e->dev;
+	app_table[app_count].state = e->state;
+	app_table[app_count].uid = current_uid();
+	app_count++;
+
+	mutex_unlock(&app_lock);
+
+	pr_info("rootmgr: app %#llx/%#x -> %s (%d entries)\n",
+		(unsigned long long)e->ino, e->dev,
+		e->state == KSU_POLICY_ROOT ? "root" : "deny", app_count);
+	return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * 3. 权限判断
  * ---------------------------------------------------------------------- */
 
 static bool is_manager(void)
@@ -285,6 +464,30 @@ static bool is_manager(void)
 		return uid_eq(current_uid(), KUIDT_INIT((uid_t)allow_uid));
 
 	return capable(CAP_SYS_ADMIN);
+}
+
+/*
+ * GRANT_ROOT 的总闸门。顺序很重要：
+ *   - DENY 是硬约束，先判，manager 也挡；
+ *   - ROOT 放行；
+ *   - 没记录时才回落到 manager 判断。
+ */
+static bool may_escalate(void)
+{
+	u64 ino;
+	u32 dev;
+	int state;
+
+	if (current_exe_id(&ino, &dev) != 0)
+		return is_manager();
+
+	state = app_lookup(ino, dev);
+	if (state == KSU_POLICY_DENY)
+		return false;
+	if (state == KSU_POLICY_ROOT)
+		return true;
+
+	return is_manager();
 }
 
 /* -------------------------------------------------------------------------
@@ -309,7 +512,7 @@ static long rootmgr_ioctl(struct file *filp, unsigned int cmd, unsigned long arg
 		return 0;
 
 	case KSU_NR_GRANT_ROOT:
-		if (!is_manager())
+		if (!may_escalate())
 			return -EPERM;
 		return escape_to_root();
 
@@ -356,6 +559,42 @@ static long rootmgr_ioctl(struct file *filp, unsigned int cmd, unsigned long arg
 		if (!is_manager())
 			return -EPERM;
 		return escape_pid((pid_t)pid);
+	}
+
+	case KSU_NR_SET_APP_PROFILE: {
+		struct ksu_app_entry e;
+
+		if (!uarg)
+			return -EINVAL;
+		if (copy_from_user(&e, uarg, sizeof(e)))
+			return -EFAULT;
+		if (!is_manager())
+			return -EPERM;
+		return app_set(&e);
+	}
+
+	case KSU_NR_GET_APP_PROFILE: {
+		struct ksu_app_entry e;
+		u64 ino;
+		u32 dev;
+		int ret;
+
+		if (!uarg)
+			return -EINVAL;
+
+		ret = current_exe_id(&ino, &dev);
+		if (ret)
+			return ret;
+
+		memset(&e, 0, sizeof(e));
+		e.ino = ino;
+		e.dev = dev;
+		e.state = app_lookup(ino, dev);
+		e.uid = __kuid_val(current_uid());
+
+		if (copy_to_user(uarg, &e, sizeof(e)))
+			return -EFAULT;
+		return 0;
 	}
 
 	default:

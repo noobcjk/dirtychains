@@ -26,7 +26,9 @@
 #include <errno.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -44,15 +46,30 @@
 #define KSU_NR_GET_INFO     2
 #define KSU_NR_GET_VERSION  3
 #define KSU_NR_GRANT_PID    4
+#define KSU_NR_SET_APP_PROFILE 5
+#define KSU_NR_GET_APP_PROFILE 6
 
 struct ksu_get_info_cmd {
-	uint32_t version;      /* 21000 => 2.1.0 */
+	uint32_t version;      /* 22000 => 2.2.0 */
 	uint32_t flags;        /* bit0 已 root，bit1 是 manager */
 	uint32_t uid;          /* 调用者 real uid */
 	uint32_t euid;         /* 调用者 effective uid */
 	int32_t  manager_uid;  /* allow_uid，-1 表示按能力判断 */
 	uint32_t reserved;
 };
+
+/* 一条程序授权。身份是 exe 的 (ino, dev)，不是路径。 */
+struct ksu_app_entry {
+	uint64_t ino;
+	uint32_t dev;
+	int32_t  state;        /* 0 = 未记录，1 = root，2 = 禁止 */
+	uint32_t uid;
+	uint32_t reserved;
+};
+
+#define KSU_POLICY_ASK  0
+#define KSU_POLICY_ROOT 1
+#define KSU_POLICY_DENY 2
 
 #define KSU_FLAG_ROOT    (1u << 0)
 #define KSU_FLAG_MANAGER (1u << 1)
@@ -65,6 +82,12 @@ struct ksu_get_info_cmd {
 				   sizeof(uint32_t))
 #define KSU_IOCTL_GRANT_PID   _IOC(_IOC_WRITE, KSU_IOCTL_MAGIC, KSU_NR_GRANT_PID, \
 				   sizeof(int32_t))
+#define KSU_IOCTL_SET_APP_PROFILE _IOC(_IOC_WRITE, KSU_IOCTL_MAGIC, \
+				       KSU_NR_SET_APP_PROFILE, \
+				       sizeof(struct ksu_app_entry))
+#define KSU_IOCTL_GET_APP_PROFILE _IOC(_IOC_READ | _IOC_WRITE, KSU_IOCTL_MAGIC, \
+				       KSU_NR_GET_APP_PROFILE, \
+				       sizeof(struct ksu_app_entry))
 
 /* 进程内的唯一缓存 */
 static int g_rootmgr_fd = -1;
@@ -135,6 +158,48 @@ static inline int rootmgr_grant_pid(int pid)
 	int32_t p = pid;
 
 	return rootmgr_call(KSU_IOCTL_GRANT_PID, &p);
+}
+
+/* -------------------------------------------------------------------------
+ * 程序授权表：身份取 exe 的 (st_ino, st_dev)
+ * ---------------------------------------------------------------------- */
+
+/* 把一个路径 / 一个 /proc/<pid>/exe 填成授权条目（state 由调用者设） */
+static inline int rootmgr_app_id(const char *path, struct ksu_app_entry *out)
+{
+	struct stat st;
+
+	memset(out, 0, sizeof(*out));
+	if (stat(path, &st) != 0)
+		return -1;
+
+	out->ino = (uint64_t)st.st_ino;
+	/* 内核用 new_encode_dev()，32 位就够；高位在 64 位 dev_t 里是空的 */
+	out->dev = (uint32_t)st.st_dev;
+	return 0;
+}
+
+/* 写一条授权：state 传 ROOT / DENY 是新增或修改，传 ASK 是删除 */
+static inline int rootmgr_set_app(const struct ksu_app_entry *e)
+{
+	return rootmgr_call(KSU_IOCTL_SET_APP_PROFILE, (void *)e);
+}
+
+/* 直接按路径设置某程序的状态 */
+static inline int rootmgr_set_state(const char *path, int state)
+{
+	struct ksu_app_entry e;
+
+	if (rootmgr_app_id(path, &e) != 0)
+		return -1;
+	e.state = state;
+	return rootmgr_set_app(&e);
+}
+
+/* 读当前进程自己的授权状态 */
+static inline int rootmgr_get_app(struct ksu_app_entry *e)
+{
+	return rootmgr_call(KSU_IOCTL_GET_APP_PROFILE, e);
 }
 
 #endif /* ROOTMGR_FD_H */
