@@ -69,6 +69,10 @@ rootmgr-gui: rootmgr-gui.c
 kmod:
 	$(MAKE) -C tools/kmod
 
+# 内核通信模块 rootmgr.ko（[ksu_driver] 匿名 inode + reboot 暗号换 fd）
+rootmgr-ko:
+	$(MAKE) -C tools/kmod rootmgr
+
 # 外部配置表：一条记录写成一个目录（rec.json 由 `ovswrap -dump-krec` 生成）
 offset-add:
 	python3 tools/mk_offset.py $(REC) --root offset
@@ -122,4 +126,4 @@ uninstall:
 clean:
 	rm -f $(TARGET) $(GUI_OBJ) $(ENG_OBJ) $(ENGINE) ovswrap rootmgr-gui
 
-.PHONY: all install uninstall clean poc ovswrap offset-add offset-sync kmod rootmgr-gui
+.PHONY: all install uninstall clean poc ovswrap offset-add offset-sync kmod rootmgr-ko rootmgr-gui

@@ -1,221 +1,295 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * rootmgr.c —— 常驻的 root 管理器（late-load 模式）
+ * rootmgr.c —— 内核通信通道（仿 KernelSU 的匿名 inode 设计）
  *
- * 借鉴 KernelSU 的加载思路，不用它的代码：
- *   1) 模块在系统起来之后再 insmod，不改内核镜像、不刷机；
- *   2) 内核侧只留一条极窄的通道 —— 一个 proc 文件，不是整套系统调用 hook；
- *   3) 权限判定放在内核里：普通用户只能提权自己名下的进程。
+ * 一、通信载体是匿名 inode，不是设备节点
+ *   模块不会创建 /dev/xxx，也不会注册 /proc/xxx。真正的通道是：
  *
- * 用法：
+ *       anon_inode_getfile("[ksu_driver]", &rootmgr_fops, NULL, O_RDWR)
+ *
+ *   它没有路径、不挂在任何文件系统上，`ls /dev` 看不到，open(2) 也没法按
+ *   名字打开。用户态唯一的入口就是**先拿到一个 fd**，之后 read/ioctl 都
+ *   在这个 fd 上做。拿不到 fd 就完全碰不到驱动。
+ *
+ * 二、fd 怎么来：reboot(2) 的一对暗号
+ *   用户态调用：
+ *
+ *       syscall(SYS_reboot, 0xDEADBEEF, 0xCAFEBABE, 0, NULL);
+ *
+ *   这两个数不是真想重启 —— 内核里 reboot 会先校验 magic1/magic2 是不是
+ *   LINUX_REBOOT_MAGIC1/MAGIC2，对不上直接返回 -EINVAL，没有任何副作用。
+ *   模块用一个 kretprobe 挂在 __x64_sys_reboot / __arm64_sys_reboot 上：
+ *
+ *     - entry  阶段：把 magic1、magic2 记到 ri->data 里；
+ *     - return 阶段：发现是暗号，就给 current 装一个指向 [ksu_driver] 的
+ *       fd，再把系统调用的返回值改写成这个 fd。
+ *
+ *   于是用户态看到的就是 reboot() 返回了一个 fd（负数表示失败）。
+ *
+ *   为什么用 kretprobe 而不是在入口用 kprobe：
+ *   入口处要"吞掉"整个系统调用，得跳过原函数、伪造返回地址，栈和寄存器
+ *   都不好收拾；挂在返回点只动返回值寄存器 ax / x0 一个字段，原函数该走
+ *   的路照走（返回 -EINVAL），我们把它替换成 fd，最干净。
+ *
+ * 三、fd 要缓存
+ *   每拿一次 fd 都要走一次异常 + 装 fd，完全没必要。用户态拿到后存进全局
+ *   变量，后面所有通信都用同一个 fd。见 rootmgr_fd.h 里的 rootmgr_fd()。
+ *
+ * 构建 / 使用：
  *   make rootmgr
- *   sudo insmod rootmgr.ko                 # 任意本地用户都能提权自己的进程
- *   sudo insmod rootmgr.ko allow_uid=1000  # 只允许 uid 1000 这么做
- *
- *   echo give <pid> > /proc/rootmgr        # 把 <pid> 的凭据换成 root
- *   cat /proc/rootmgr                      # 版本、allow_uid、已提权次数
- *
- * 例：普通用户的 shell 里
- *   echo give $$ > /proc/rootmgr && id     # 这个 shell 立刻变成 uid=0
- *
- * 原理：
- *   prepare_kernel_cred(target) 按目标进程的 user_ns 生成一份 init_cred 副本，
- *   把 uid/gid/caps 显式拉满后，用 rcu_assign_pointer 换掉 target 的
- *   real_cred / cred，旧凭据 put_cred。不 hook 系统调用、不碰 sys_call_table，
- *   也不依赖 target.h 里的偏移。
- *
- * 注意：
- *   - 这是研究/演示用的本地提权通道，装上等于给机器留了个后门，
- *     别在生产环境长期保留。用完 rmmod，/proc/rootmgr 就消失。
- *   - 6.x 上 prepare_kernel_cred() 的实现了改动，若编不过，把参数换成 NULL。
+ *   sudo insmod rootmgr.ko
+ *   ./rootmgr_fd_demo            # 演示拿 fd、缓存、ping
+ *   sudo rmmod rootmgr
  */
 
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
-#include <linux/proc_fs.h>
 #include <linux/fs.h>
+#include <linux/file.h>
+#include <linux/fdtable.h>
+#include <linux/anon_inodes.h>
+#include <linux/kprobes.h>
+#include <linux/ptrace.h>
+#include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/sched.h>
-#include <linux/sched/task.h>
-#include <linux/cred.h>
-#include <linux/pid.h>
-#include <linux/capability.h>
-#include <linux/uidgid.h>
-#include <linux/string.h>
-#include <linux/spinlock.h>
-#include <linux/securebits.h>
+#include <linux/version.h>
+#include <linux/ioctl.h>
 
-#define ROOTMGR_VERSION   "1.0"
-#define ROOTMGR_MAX_PIDS  16
+#define ROOTMGR_VERSION "2.0"
+#define ROOTMGR_NAME    "[ksu_driver]"
 
-static int allow_uid = -1;
-module_param(allow_uid, int, 0644);
-MODULE_PARM_DESC(allow_uid,
-                 "只允许该 uid 提权自己名下的进程；-1 表示任意本地用户");
+/* 用户态 reboot(2) 用的暗号 */
+#define KSU_INSTALL_MAGIC1 0xDEADBEEF
+#define KSU_INSTALL_MAGIC2 0xCAFEBABE
 
-static pid_t given[ROOTMGR_MAX_PIDS];
-static int given_n;
-static unsigned long give_count;
-static DEFINE_SPINLOCK(given_lock);
+/* ioctl 命令（和用户态 rootmgr_fd.h 保持一致） */
+#define ROOTMGR_IOCTL_MAGIC 'R'
+#define ROOTMGR_CMD_PING    _IO(ROOTMGR_IOCTL_MAGIC, 0)
+#define ROOTMGR_CMD_VERSION _IOR(ROOTMGR_IOCTL_MAGIC, 1, char[32])
 
-/* 记最近提权过的 pid，status 里能看到，方便确认有没有生效 */
-static void note_pid(pid_t pid)
+/* -------------------------------------------------------------------------
+ * 1. 匿名 inode 上的文件操作
+ * ---------------------------------------------------------------------- */
+
+static ssize_t rootmgr_read(struct file *filp, char __user *buf,
+			    size_t count, loff_t *ppos)
 {
-    int i;
+	char tmp[64];
+	int len;
 
-    spin_lock(&given_lock);
-    give_count++;
-    for (i = 0; i < given_n; i++) {
-        if (given[i] == pid)
-            goto out;
-    }
-    if (given_n < ROOTMGR_MAX_PIDS) {
-        given[given_n++] = pid;
-    } else {
-        memmove(given, given + 1, sizeof(given[0]) * (ROOTMGR_MAX_PIDS - 1));
-        given[ROOTMGR_MAX_PIDS - 1] = pid;
-    }
-out:
-    spin_unlock(&given_lock);
+	(void)filp;
+	(void)ppos;
+
+	/* 所有 fd 共享同一份 file，f_pos 不可靠，每次都从头给一遍 */
+	len = scnprintf(tmp, sizeof(tmp), "rootmgr %s\n", ROOTMGR_VERSION);
+	if ((size_t)len > count)
+		len = count;
+	if (copy_to_user(buf, tmp, len))
+		return -EFAULT;
+
+	return len;
 }
+
+static long rootmgr_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+	void __user *uarg = (void __user *)arg;
+
+	(void)filp;
+
+	switch (cmd) {
+	case ROOTMGR_CMD_PING:
+		return 0;
+
+	case ROOTMGR_CMD_VERSION: {
+		char ver[32];
+		int len = scnprintf(ver, sizeof(ver), "%s", ROOTMGR_VERSION);
+
+		if (!uarg)
+			return -EINVAL;
+		if (copy_to_user(uarg, ver, len + 1))
+			return -EFAULT;
+		return 0;
+	}
+
+	default:
+		return -ENOTTY;
+	}
+}
+
+static int rootmgr_release(struct inode *inode, struct file *filp)
+{
+	(void)inode;
+	(void)filp;
+
+	/* 对应 install 时的 try_module_get，保证还有 fd 时 rmmod 会被拒绝 */
+	module_put(THIS_MODULE);
+	return 0;
+}
+
+static const struct file_operations rootmgr_fops = {
+	.owner          = THIS_MODULE,
+	.read           = rootmgr_read,
+	.unlocked_ioctl = rootmgr_ioctl,
+#if IS_ENABLED(CONFIG_COMPAT)
+	.compat_ioctl   = rootmgr_ioctl,
+#endif
+	.release        = rootmgr_release,
+	.llseek         = noop_llseek,
+};
+
+/* -------------------------------------------------------------------------
+ * 2. 给当前进程装一个指向 [ksu_driver] 的 fd
+ * ---------------------------------------------------------------------- */
 
 /*
- * 把 pid 的凭据换成 root。
- * 非 root 调用者只能操作和自己同 uid 的进程。
+ * 模块加载时就把这个匿名 inode 建好，之后每次只是 get_file() 加一个引用
+ * 再 fd_install()。这样在 kretprobe 的钩子里完全不分配内存 —— 钩子跑在
+ * 关中断的异常上下文，kmalloc(GFP_KERNEL) 会触发 "sleeping function" 警告。
  */
-static int do_give(pid_t pid)
+static struct file *rootmgr_file;
+
+static int rootmgr_install_fd(void)
 {
-    struct task_struct *t;
-    const struct cred *old, *tc;
-    struct cred *new;
-    kuid_t caller = current_uid();
+	int fd;
 
-    if (pid <= 0)
-        return -EINVAL;
+	if (!rootmgr_file)
+		return -ENODEV;
 
-    rcu_read_lock();
-    t = pid_task(find_vpid(pid), PIDTYPE_PID);
-    if (t)
-        get_task_struct(t);
-    rcu_read_unlock();
-    if (!t)
-        return -ESRCH;
+	if (!try_module_get(THIS_MODULE))
+		return -ENODEV;
 
-    if (!uid_eq(current_euid(), GLOBAL_ROOT_UID)) {
-        if (allow_uid >= 0 && !uid_eq(caller, KUIDT_INIT(allow_uid))) {
-            put_task_struct(t);
-            return -EPERM;
-        }
-        tc = get_task_cred(t);
-        if (!uid_eq(tc->uid, caller)) {
-            put_cred(tc);
-            put_task_struct(t);
-            return -EPERM;
-        }
-        put_cred(tc);
-    }
+	fd = get_unused_fd_flags(O_CLOEXEC);
+	if (fd < 0) {
+		module_put(THIS_MODULE);
+		return fd;
+	}
 
-    new = prepare_kernel_cred(t);
-    if (!new) {
-        put_task_struct(t);
-        return -ENOMEM;
-    }
-
-    new->uid  = new->euid  = new->suid  = new->fsuid = GLOBAL_ROOT_UID;
-    new->gid  = new->egid  = new->sgid  = new->fsgid = GLOBAL_ROOT_GID;
-    new->cap_inheritable = CAP_EMPTY_SET;
-    new->cap_permitted   = CAP_FULL_SET;
-    new->cap_effective   = CAP_FULL_SET;
-    new->cap_bset        = CAP_FULL_SET;
-    new->cap_ambient     = CAP_EMPTY_SET;
-    new->securebits      = SECUREBITS_DEFAULT;
-
-    rcu_read_lock();
-    old = get_task_cred(t);
-    rcu_assign_pointer(t->real_cred, new);
-    rcu_assign_pointer(t->cred, new);
-    rcu_read_unlock();
-    put_cred(old);
-
-    put_task_struct(t);
-    note_pid(pid);
-    pr_info("rootmgr: pid %d -> uid 0\n", pid);
-    return 0;
+	get_file(rootmgr_file);
+	fd_install(fd, rootmgr_file);
+	return fd;
 }
 
-static ssize_t rootmgr_read(struct file *f, char __user *buf, size_t len,
-                            loff_t *off)
-{
-    char kb[256];
-    int n, i, cnt;
+/* -------------------------------------------------------------------------
+ * 3. reboot(2) 上的钩子：识别暗号并改返回值
+ * ---------------------------------------------------------------------- */
 
-    if (*off)
-        return 0;
+#if defined(CONFIG_X86_64)
+#define ROOTMGR_REBOOT_SYMBOL "__x64_sys_reboot"
+#define ROOTMGR_ARG0(r)       ((unsigned long)(r)->di)
+#define ROOTMGR_ARG1(r)       ((unsigned long)(r)->si)
+#elif defined(CONFIG_ARM64)
+#define ROOTMGR_REBOOT_SYMBOL "__arm64_sys_reboot"
+#define ROOTMGR_ARG0(r)       ((unsigned long)(r)->regs[0])
+#define ROOTMGR_ARG1(r)       ((unsigned long)(r)->regs[1])
+#else
+#error "rootmgr: 只支持 x86_64 / arm64"
+#endif
 
-    n = scnprintf(kb, sizeof(kb), "rootmgr %s\nallow_uid=%d\ngive_count=%lu\ngiven=",
-                  ROOTMGR_VERSION, allow_uid, give_count);
+#if IS_ENABLED(CONFIG_KRETPROBES)
 
-    spin_lock(&given_lock);
-    for (i = 0; i < given_n && n < (int)sizeof(kb) - 16; i++)
-        n += scnprintf(kb + n, sizeof(kb) - n, "%s%d", i ? "," : "", given[i]);
-    cnt = given_n;
-    spin_unlock(&given_lock);
-
-    n += scnprintf(kb + n, sizeof(kb) - n, "\n(%d pids)\n", cnt);
-    return simple_read_from_buffer(buf, len, off, kb, n);
-}
-
-static ssize_t rootmgr_write(struct file *f, const char __user *ubuf,
-                             size_t len, loff_t *off)
-{
-    char buf[64], cmd[16];
-    size_t n;
-    int pid = 0, ret;
-
-    n = len < sizeof(buf) - 1 ? len : sizeof(buf) - 1;
-    if (copy_from_user(buf, ubuf, n))
-        return -EFAULT;
-    buf[n] = '\0';
-
-    if (sscanf(buf, "%15s %d", cmd, &pid) < 1)
-        return -EINVAL;
-
-    if (!strcmp(cmd, "give"))
-        ret = do_give(pid);
-    else if (!strcmp(cmd, "version"))
-        ret = 0;
-    else
-        ret = -EINVAL;
-
-    return ret ? ret : (ssize_t)len;
-}
-
-static const struct proc_ops rootmgr_pops = {
-    .proc_read  = rootmgr_read,
-    .proc_write = rootmgr_write,
-    .proc_lseek = noop_llseek,
+struct reboot_args {
+	unsigned int magic1;
+	unsigned int magic2;
+	bool matched;
 };
+
+static int reboot_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct reboot_args *a = (struct reboot_args *)ri->data;
+
+	a->magic1 = (unsigned int)ROOTMGR_ARG0(regs);
+	a->magic2 = (unsigned int)ROOTMGR_ARG1(regs);
+	a->matched = (a->magic1 == KSU_INSTALL_MAGIC1 &&
+		      a->magic2 == KSU_INSTALL_MAGIC2);
+
+	return 0;
+}
+
+static int reboot_return(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct reboot_args *a = (struct reboot_args *)ri->data;
+	int fd;
+
+	if (!a->matched)
+		return 0;
+
+	fd = rootmgr_install_fd();
+	if (fd < 0) {
+		pr_err("rootmgr: install fd failed: %d\n", fd);
+		return 0;
+	}
+
+	/* 把 reboot() 原本的 -EINVAL 换成 fd，用户态直接拿到句柄 */
+	regs_set_return_value(regs, fd);
+	pr_info("rootmgr: pid %d got fd %d\n", task_pid_nr(current), fd);
+
+	return 0;
+}
+
+static struct kretprobe reboot_krp = {
+	.kp.symbol_name = ROOTMGR_REBOOT_SYMBOL,
+	.entry_handler  = reboot_entry,
+	.handler        = reboot_return,
+	.data_size      = sizeof(struct reboot_args),
+	.maxactive      = 64,
+};
+
+#endif /* CONFIG_KRETPROBES */
+
+/* -------------------------------------------------------------------------
+ * 4. 模块出入口
+ * ---------------------------------------------------------------------- */
 
 static int __init rootmgr_init(void)
 {
-    if (!proc_create("rootmgr", 0622, NULL, &rootmgr_pops))
-        return -ENOMEM;
+#if !IS_ENABLED(CONFIG_KRETPROBES)
+	pr_err("rootmgr: 内核没开 CONFIG_KRETPROBES，拿不到 fd，模块不加载\n");
+	return -EOPNOTSUPP;
+#else
+	int ret;
 
-    pr_info("rootmgr: loaded, allow_uid=%d, /proc/rootmgr ready\n", allow_uid);
-    return 0;
+	rootmgr_file = anon_inode_getfile(ROOTMGR_NAME, &rootmgr_fops, NULL,
+					  O_RDWR | O_CLOEXEC);
+	if (IS_ERR(rootmgr_file)) {
+		ret = PTR_ERR(rootmgr_file);
+		rootmgr_file = NULL;
+		pr_err("rootmgr: anon_inode_getfile failed: %d\n", ret);
+		return ret;
+	}
+
+	ret = register_kretprobe(&reboot_krp);
+	if (ret) {
+		pr_err("rootmgr: register_kretprobe(%s) failed: %d\n",
+		       ROOTMGR_REBOOT_SYMBOL, ret);
+		fput(rootmgr_file);
+		rootmgr_file = NULL;
+		return ret;
+	}
+
+	pr_info("rootmgr %s loaded: driver is %s, get fd via reboot(%#x, %#x)\n",
+		ROOTMGR_VERSION, ROOTMGR_NAME,
+		KSU_INSTALL_MAGIC1, KSU_INSTALL_MAGIC2);
+	return 0;
+#endif
 }
 
 static void __exit rootmgr_exit(void)
 {
-    remove_proc_entry("rootmgr", NULL);
-    pr_info("rootmgr: unloaded\n");
+#if IS_ENABLED(CONFIG_KRETPROBES)
+	unregister_kretprobe(&reboot_krp);
+#endif
+	if (rootmgr_file) {
+		fput(rootmgr_file);
+		rootmgr_file = NULL;
+	}
+	pr_info("rootmgr: unloaded\n");
 }
 
 module_init(rootmgr_init);
 module_exit(rootmgr_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Late-load root manager: give <pid> via /proc/rootmgr");
-MODULE_AUTHOR("dirtychains");
+MODULE_DESCRIPTION("rootmgr: anon-inode channel reachable only through a reboot(2) magic fd");
 MODULE_VERSION(ROOTMGR_VERSION);

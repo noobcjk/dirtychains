@@ -9,6 +9,7 @@
 /poc
 /ovswrap
 /rootmgr-gui
+/tools/kmod/rootmgr_fd_demo
 *.cmd
 .gccver-gui
 
