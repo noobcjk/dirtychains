@@ -70,7 +70,10 @@ gcc -O2 -Wall -o dirtychains dirtyfrag-gui.c $(pkg-config --cflags --libs gtk+-3
 gcc -O2 -Wall -DOVSWRAP_STANDALONE -o ovswrap dirtyfrag-gui.c -lutil   # 只要 OVS 命令行版
 ```
 
-六链引擎仍来自 `dirtyfrag_lpe.c`，编译时用 `-Dmain=dirtychains_poc_main` 改名后与前端链接。
+五链引擎（31431 / 43284 / 43500 / 43494 / 46331）仍来自 `dirtyfrag_lpe.c`，
+编译时用 `-Dmain=dirtychains_poc_main` 改名后与前端链接。
+另外两条 —— 46300（Fragnesia）和 64531（OVS）—— 直接写在 `dirtyfrag-gui.c` 里，
+不经过这个文件，所以「七链」≠「七链引擎」，别按总链数去对。
 两个源文件名保留 `dirtyfrag` 前缀，记录实现来路；产物二进制叫 `dirtychains`。
 
 内核模块（可选，见下）：
