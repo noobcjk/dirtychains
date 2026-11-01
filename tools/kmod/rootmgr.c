@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * rootmgr.c —— 内核通信通道（仿 KernelSU 的匿名 inode 设计）
+ * rootmgr.c —— 内核通信通道（仿 KernelSU 的匿名 inode + ioctl 设计）
  *
  * 一、通信载体是匿名 inode，不是设备节点
  *   模块不会创建 /dev/xxx，也不会注册 /proc/xxx。真正的通道是：
@@ -8,8 +8,8 @@
  *       anon_inode_getfile("[ksu_driver]", &rootmgr_fops, NULL, O_RDWR)
  *
  *   它没有路径、不挂在任何文件系统上，`ls /dev` 看不到，open(2) 也没法按
- *   名字打开。用户态唯一的入口就是**先拿到一个 fd**，之后 read/ioctl 都
- *   在这个 fd 上做。拿不到 fd 就完全碰不到驱动。
+ *   名字打开。用户态唯一的入口就是**先拿到一个 fd**，之后所有操作都在
+ *   这个 fd 上做。拿不到 fd 就完全碰不到驱动。
  *
  * 二、fd 怎么来：reboot(2) 的一对暗号
  *   用户态调用：
@@ -24,6 +24,8 @@
  *     - return 阶段：发现是暗号，就给 current 装一个指向 [ksu_driver] 的
  *       fd，再把系统调用的返回值改写成这个 fd。
  *
+ *   注意 fops 里没有 read/write：拿 fd 是 reboot 的事，通信只有 ioctl 一条路。
+ *
  *   于是用户态看到的就是 reboot() 返回了一个 fd（负数表示失败）。
  *
  *   为什么用 kretprobe 而不是在入口用 kprobe：
@@ -31,14 +33,37 @@
  *   都不好收拾；挂在返回点只动返回值寄存器 ax / x0 一个字段，原函数该走
  *   的路照走（返回 -EINVAL），我们把它替换成 fd，最干净。
  *
- * 三、fd 要缓存
- *   每拿一次 fd 都要走一次异常 + 装 fd，完全没必要。用户态拿到后存进全局
- *   变量，后面所有通信都用同一个 fd。见 rootmgr_fd.h 里的 rootmgr_fd()。
+ * 三、拿到 fd 之后，全部通信都是 ioctl
+ *
+ *       ioctl(fd, _IOC(..., 'K', nr, size), arg)
+ *
+ *   魔术字符固定是 'K'，和 KernelSU 的 supercall 保持一致：
+ *
+ *     nr 0  PING         探活，arg 忽略
+ *     nr 1  GRANT_ROOT   给**调用者自己**提权到 root
+ *     nr 2  GET_INFO     读通道信息（版本 / uid / 是否 root / 是否 manager）
+ *     nr 3  GET_VERSION  只读版本号（__u32）
+ *     nr 4  GRANT_PID    给指定 pid 提权（管理器用，arg 指向 __s32）
+ *
+ *   分派时只比对 _IOC_TYPE + _IOC_NR，不比对 size 字段 —— 32 位进程走
+ *   compat_ioctl 进来时 sizeof(struct) 会变，整串 cmd 就对不上了。
+ *
+ * 四、提权做到什么程度
+ *   escape_to_root() 用 prepare_kernel_cred() 造一份全新 cred，把 uid/gid
+ *   全置 0、cap_* 全开，再 commit_creds() 换掉当前进程的 real_cred/cred。
+ *   这一层只改进程凭证，不动 SELinux 域：如果当前域本身被策略卡着，
+ *   提权后仍然可能被 avc deny 拦，需要在策略侧放行（后续再补）。
+ *
+ * 五、谁能调 GRANT_ROOT / GRANT_PID
+ *   模块参数 allow_uid（默认 -1）：
+ *     -1  -> 要求调用者具备 CAP_SYS_ADMIN；
+ *     >=0 -> 只允许该 uid 调用。
+ *   普通进程即便凑到了 fd，也只能 PING / GET_INFO，提权会被 -EPERM 拒绝。
  *
  * 构建 / 使用：
  *   make rootmgr
- *   sudo insmod rootmgr.ko
- *   ./rootmgr_fd_demo            # 演示拿 fd、缓存、ping
+ *   sudo insmod rootmgr.ko [allow_uid=10123]
+ *   ./rootmgr_fd_demo            # 演示拿 fd、缓存、ioctl 通信、提权
  *   sudo rmmod rootmgr
  */
 
@@ -54,63 +79,283 @@
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/sched.h>
+#include <linux/sched/task.h>
+#include <linux/cred.h>
+#include <linux/capability.h>
+#include <linux/securebits.h>
+#include <linux/pid.h>
 #include <linux/version.h>
 #include <linux/ioctl.h>
 
-#define ROOTMGR_VERSION "2.0"
-#define ROOTMGR_NAME    "[ksu_driver]"
+#define ROOTMGR_VERSION_STR "2.1"
+#define ROOTMGR_VERSION_NUM 21000
+#define ROOTMGR_NAME        "[ksu_driver]"
 
 /* 用户态 reboot(2) 用的暗号 */
 #define KSU_INSTALL_MAGIC1 0xDEADBEEF
 #define KSU_INSTALL_MAGIC2 0xCAFEBABE
 
-/* ioctl 命令（和用户态 rootmgr_fd.h 保持一致） */
-#define ROOTMGR_IOCTL_MAGIC 'R'
-#define ROOTMGR_CMD_PING    _IO(ROOTMGR_IOCTL_MAGIC, 0)
-#define ROOTMGR_CMD_VERSION _IOR(ROOTMGR_IOCTL_MAGIC, 1, char[32])
-
 /* -------------------------------------------------------------------------
- * 1. 匿名 inode 上的文件操作
+ * ioctl 协议：魔术字符 'K'（与用户态 rootmgr_fd.h 完全一致）
  * ---------------------------------------------------------------------- */
 
-static ssize_t rootmgr_read(struct file *filp, char __user *buf,
-			    size_t count, loff_t *ppos)
+#define KSU_IOCTL_MAGIC 'K'
+
+#define KSU_NR_PING         0
+#define KSU_NR_GRANT_ROOT   1
+#define KSU_NR_GET_INFO     2
+#define KSU_NR_GET_VERSION  3
+#define KSU_NR_GRANT_PID    4
+
+/* GET_INFO 的载荷。前两个字段和 KernelSU 对齐，后面是自定的扩展。 */
+struct ksu_get_info_cmd {
+	__u32 version;      /* ROOTMGR_VERSION_NUM */
+	__u32 flags;        /* bit0 已 root，bit1 是 manager */
+	__u32 uid;          /* 调用者 real uid */
+	__u32 euid;         /* 调用者 effective uid */
+	__s32 manager_uid;  /* allow_uid，-1 表示按能力判断 */
+	__u32 reserved;
+};
+
+#define KSU_FLAG_ROOT    (1u << 0)
+#define KSU_FLAG_MANAGER (1u << 1)
+
+#define KSU_IOCTL_PING        _IOC(_IOC_NONE, KSU_IOCTL_MAGIC, KSU_NR_PING, 0)
+#define KSU_IOCTL_GRANT_ROOT  _IOC(_IOC_NONE, KSU_IOCTL_MAGIC, KSU_NR_GRANT_ROOT, 0)
+#define KSU_IOCTL_GET_INFO    _IOC(_IOC_READ, KSU_IOCTL_MAGIC, KSU_NR_GET_INFO, \
+				   sizeof(struct ksu_get_info_cmd))
+#define KSU_IOCTL_GET_VERSION _IOC(_IOC_READ, KSU_IOCTL_MAGIC, KSU_NR_GET_VERSION, \
+				   sizeof(__u32))
+#define KSU_IOCTL_GRANT_PID   _IOC(_IOC_WRITE, KSU_IOCTL_MAGIC, KSU_NR_GRANT_PID, \
+				   sizeof(__s32))
+
+/* allow_uid：-1 = 只认 CAP_SYS_ADMIN；>=0 = 只认这个 uid */
+static int allow_uid = -1;
+module_param(allow_uid, int, 0644);
+MODULE_PARM_DESC(allow_uid, "只允许该 uid 调用 GRANT_ROOT/GRANT_PID，-1 表示要求 CAP_SYS_ADMIN");
+
+/* 统计 */
+static atomic_t grant_count = ATOMIC_INIT(0);
+
+/* -------------------------------------------------------------------------
+ * 1. 凭据：造一份 root cred，换给目标 task
+ * ---------------------------------------------------------------------- */
+
+static struct cred *make_root_cred(struct task_struct *daemon)
 {
-	char tmp[64];
-	int len;
+	struct cred *new;
 
-	(void)filp;
-	(void)ppos;
+	/*
+	 * 6.3 起 prepare_kernel_cred(NULL) 会 WARN 并返回 NULL，必须传 task；
+	 * 5.x 传 NULL 表示复制 init_cred。两条路都能拿到一份可用的 cred，
+	 * 下面的显式赋值保证不管哪条路，结果都是 uid=0 + 全 capability。
+	 */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+	new = prepare_kernel_cred(daemon);
+#else
+	new = prepare_kernel_cred(NULL);
+	(void)daemon;
+#endif
+	if (!new)
+		return NULL;
 
-	/* 所有 fd 共享同一份 file，f_pos 不可靠，每次都从头给一遍 */
-	len = scnprintf(tmp, sizeof(tmp), "rootmgr %s\n", ROOTMGR_VERSION);
-	if ((size_t)len > count)
-		len = count;
-	if (copy_to_user(buf, tmp, len))
-		return -EFAULT;
+	new->uid = GLOBAL_ROOT_UID;
+	new->euid = GLOBAL_ROOT_UID;
+	new->suid = GLOBAL_ROOT_UID;
+	new->fsuid = GLOBAL_ROOT_UID;
+	new->gid = GLOBAL_ROOT_GID;
+	new->egid = GLOBAL_ROOT_GID;
+	new->sgid = GLOBAL_ROOT_GID;
+	new->fsgid = GLOBAL_ROOT_GID;
 
-	return len;
+	new->securebits = SECUREBITS_DEFAULT;
+	new->cap_inheritable = CAP_EMPTY_SET;
+	new->cap_permitted = CAP_FULL_SET;
+	new->cap_effective = CAP_FULL_SET;
+	new->cap_bset = CAP_FULL_SET;
+	new->cap_ambient = CAP_EMPTY_SET;
+
+	return new;
 }
+
+/* 给自己提权：走 commit_creds，最正规的一条路 */
+static int escape_to_root(void)
+{
+	struct cred *new;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0)
+	int ret;
+#endif
+
+	if (uid_eq(current_uid(), GLOBAL_ROOT_UID) &&
+	    uid_eq(current_euid(), GLOBAL_ROOT_UID))
+		return 0;               /* 已经是 root，什么都不用做 */
+
+	/*
+	 * commit_creds() 里 BUG_ON(task->cred != old)：如果当前进程正处在
+	 * override_creds() 区间（cred 和 real_cred 不相等），直接拒绝，
+	 * 免得把内核打崩。
+	 */
+	if (current->cred != current->real_cred)
+		return -EBUSY;
+
+	new = make_root_cred(current);
+	if (!new)
+		return -ENOMEM;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)
+	commit_creds(new);              /* 6.5 起改成返回 void */
+#else
+	ret = commit_creds(new);
+	if (ret) {
+		put_cred(new);
+		return ret;
+	}
+#endif
+
+	atomic_inc(&grant_count);
+	pr_info("rootmgr: pid %d (%s) -> root\n",
+		task_pid_nr(current), current->comm);
+	return 0;
+}
+
+/*
+ * 给别的进程提权。commit_creds() 只作用于 current，所以这里只能直接换
+ * 目标 task 的 real_cred / cred 指针 —— 和 KernelSU 老版 do_give 的做法
+ * 一致。注意：目标进程如果已经缓存了 uid（比如 libc 里的 getuid 结果），
+ * 它自己不一定立刻感知，重新 getuid() 或下一轮系统调用才会看到 0。
+ */
+static int grant_task(struct task_struct *t)
+{
+	struct cred *new;
+	const struct cred *old_r, *old_c;
+
+	new = make_root_cred(t);
+	if (!new)
+		return -ENOMEM;
+
+	rcu_read_lock();
+	old_r = t->real_cred;
+	old_c = t->cred;
+	get_cred(new);                  /* 两个指针各持一份引用 */
+	rcu_assign_pointer(t->real_cred, new);
+	rcu_assign_pointer(t->cred, new);
+	rcu_read_unlock();
+
+	put_cred(old_r);
+	put_cred(old_c);
+
+	atomic_inc(&grant_count);
+	pr_info("rootmgr: pid %d (%s) granted by pid %d\n",
+		task_pid_nr(t), t->comm, task_pid_nr(current));
+	return 0;
+}
+
+static int escape_pid(pid_t pid)
+{
+	struct task_struct *t;
+	int ret;
+
+	rcu_read_lock();
+	t = pid_task(find_vpid(pid), PIDTYPE_PID);
+	if (t)
+		get_task_struct(t);
+	rcu_read_unlock();
+
+	if (!t)
+		return -ESRCH;
+
+	/* 不给内核线程换 cred：它们的 cred 是共享的 init_cred，改了会连累一片 */
+	if (t->flags & PF_KTHREAD) {
+		put_task_struct(t);
+		return -EINVAL;
+	}
+
+	ret = grant_task(t);
+	put_task_struct(t);
+	return ret;
+}
+
+/* -------------------------------------------------------------------------
+ * 2. 权限判断
+ * ---------------------------------------------------------------------- */
+
+static bool is_manager(void)
+{
+	if (allow_uid >= 0)
+		return uid_eq(current_uid(), KUIDT_INIT((uid_t)allow_uid));
+
+	return capable(CAP_SYS_ADMIN);
+}
+
+/* -------------------------------------------------------------------------
+ * 3. 匿名 inode 上的文件操作
+ * ---------------------------------------------------------------------- */
 
 static long rootmgr_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	void __user *uarg = (void __user *)arg;
+	unsigned int nr;
 
 	(void)filp;
 
-	switch (cmd) {
-	case ROOTMGR_CMD_PING:
+	if (_IOC_TYPE(cmd) != KSU_IOCTL_MAGIC)
+		return -ENOTTY;
+
+	/* 只按 nr 分派：compat 进程的 cmd 里 size 字段不一样 */
+	nr = _IOC_NR(cmd);
+
+	switch (nr) {
+	case KSU_NR_PING:
 		return 0;
 
-	case ROOTMGR_CMD_VERSION: {
-		char ver[32];
-		int len = scnprintf(ver, sizeof(ver), "%s", ROOTMGR_VERSION);
+	case KSU_NR_GRANT_ROOT:
+		if (!is_manager())
+			return -EPERM;
+		return escape_to_root();
+
+	case KSU_NR_GET_INFO: {
+		struct ksu_get_info_cmd info;
 
 		if (!uarg)
 			return -EINVAL;
-		if (copy_to_user(uarg, ver, len + 1))
+
+		memset(&info, 0, sizeof(info));
+		info.version = ROOTMGR_VERSION_NUM;
+		info.uid = __kuid_val(current_uid());
+		info.euid = __kuid_val(current_euid());
+		info.manager_uid = allow_uid;
+		if (uid_eq(current_euid(), GLOBAL_ROOT_UID))
+			info.flags |= KSU_FLAG_ROOT;
+		if (is_manager())
+			info.flags |= KSU_FLAG_MANAGER;
+
+		if (copy_to_user(uarg, &info, sizeof(info)))
 			return -EFAULT;
 		return 0;
+	}
+
+	case KSU_NR_GET_VERSION: {
+		__u32 ver = ROOTMGR_VERSION_NUM;
+
+		if (!uarg)
+			return -EINVAL;
+		if (copy_to_user(uarg, &ver, sizeof(ver)))
+			return -EFAULT;
+		return 0;
+	}
+
+	case KSU_NR_GRANT_PID: {
+		__s32 pid;
+
+		if (!uarg)
+			return -EINVAL;
+		if (copy_from_user(&pid, uarg, sizeof(pid)))
+			return -EFAULT;
+		if (pid <= 0)
+			return -EINVAL;
+		if (!is_manager())
+			return -EPERM;
+		return escape_pid((pid_t)pid);
 	}
 
 	default:
@@ -130,7 +375,6 @@ static int rootmgr_release(struct inode *inode, struct file *filp)
 
 static const struct file_operations rootmgr_fops = {
 	.owner          = THIS_MODULE,
-	.read           = rootmgr_read,
 	.unlocked_ioctl = rootmgr_ioctl,
 #if IS_ENABLED(CONFIG_COMPAT)
 	.compat_ioctl   = rootmgr_ioctl,
@@ -140,7 +384,7 @@ static const struct file_operations rootmgr_fops = {
 };
 
 /* -------------------------------------------------------------------------
- * 2. 给当前进程装一个指向 [ksu_driver] 的 fd
+ * 4. 给当前进程装一个指向 [ksu_driver] 的 fd
  * ---------------------------------------------------------------------- */
 
 /*
@@ -172,7 +416,7 @@ static int rootmgr_install_fd(void)
 }
 
 /* -------------------------------------------------------------------------
- * 3. reboot(2) 上的钩子：识别暗号并改返回值
+ * 5. reboot(2) 上的钩子：识别暗号并改返回值
  * ---------------------------------------------------------------------- */
 
 #if defined(CONFIG_X86_64)
@@ -239,7 +483,7 @@ static struct kretprobe reboot_krp = {
 #endif /* CONFIG_KRETPROBES */
 
 /* -------------------------------------------------------------------------
- * 4. 模块出入口
+ * 6. 模块出入口
  * ---------------------------------------------------------------------- */
 
 static int __init rootmgr_init(void)
@@ -268,9 +512,11 @@ static int __init rootmgr_init(void)
 		return ret;
 	}
 
-	pr_info("rootmgr %s loaded: driver is %s, get fd via reboot(%#x, %#x)\n",
-		ROOTMGR_VERSION, ROOTMGR_NAME,
+	pr_info("rootmgr %s loaded: %s, fd via reboot(%#x, %#x), ioctl magic 'K'\n",
+		ROOTMGR_VERSION_STR, ROOTMGR_NAME,
 		KSU_INSTALL_MAGIC1, KSU_INSTALL_MAGIC2);
+	pr_info("rootmgr: allow_uid=%d (GRANT_ROOT %s)\n", allow_uid,
+		allow_uid < 0 ? "requires CAP_SYS_ADMIN" : "uid-restricted");
 	return 0;
 #endif
 }
@@ -284,12 +530,13 @@ static void __exit rootmgr_exit(void)
 		fput(rootmgr_file);
 		rootmgr_file = NULL;
 	}
-	pr_info("rootmgr: unloaded\n");
+	pr_info("rootmgr: unloaded after %d grant(s)\n",
+		atomic_read(&grant_count));
 }
 
 module_init(rootmgr_init);
 module_exit(rootmgr_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("rootmgr: anon-inode channel reachable only through a reboot(2) magic fd");
-MODULE_VERSION(ROOTMGR_VERSION);
+MODULE_DESCRIPTION("rootmgr: anon-inode [ksu_driver] channel, ioctl magic 'K'");
+MODULE_VERSION(ROOTMGR_VERSION_STR);
