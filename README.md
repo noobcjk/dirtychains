@@ -52,7 +52,7 @@ gcc -O2 -Wall -o dirtychains dirtyfrag-gui.c $(pkg-config --cflags --libs gtk+-3
 gcc -O2 -Wall -DOVSWRAP_STANDALONE -o ovswrap dirtyfrag-gui.c -lutil   # 只要 OVS 命令行版
 ```
 
-五链引擎仍来自 `dirtyfrag_lpe.c`，编译时用 `-Dmain=dirtychains_poc_main` 改名后与前端链接。
+六链引擎仍来自 `dirtyfrag_lpe.c`，编译时用 `-Dmain=dirtychains_poc_main` 改名后与前端链接。
 两个源文件名保留 `dirtyfrag` 前缀，记录实现来路；产物二进制叫 `dirtychains`。
 
 内核模块（可选，见下）：
