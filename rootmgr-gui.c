@@ -5,6 +5,12 @@
  * 窗口默认 960x600 横屏，卡片在宽屏下分左右两列，底部是四格切换栏：
  *   主页 / 超级用户 / 终端 / 设置
  *
+ * 超级用户页是一张授权表（仿 KernelSU）：
+ *   - 默认是空的，程序在终端里执行时会被登记成「待授权」；
+ *   - 点一行展开，里面是 root / 禁止 两个选项；
+ *   - 记录存在 /var/lib/rootmgr/policy.tsv（非 root 时放用户配置目录），
+ *     重启后状态还在；右键可以移除一条记录。
+ *
  * 终端页直接调 /bin/sh -c 执行命令：
  *   - 程序本身以 root 运行时，命令就是 root 权限；
  *   - 否则先试 sudo -n（免密），再退到 pkexec（弹密码框）。
@@ -27,7 +33,7 @@
 #include <unistd.h>
 
 #define APP_TITLE   "RootMgr"
-#define MGR_VERSION "1.2"
+#define MGR_VERSION "1.3"
 
 /* 图标种类：全部用 cairo 画，不依赖图标字体 / 主题 */
 typedef enum {
@@ -45,8 +51,14 @@ typedef enum {
 
 #define TAB_COUNT 4
 
-/* 进程列表：图标 / PID / 程序位置 / 用户 / 悬浮提示（命令行） */
-enum { COL_ICON, COL_PID, COL_PATH, COL_USER, COL_TIP, COL_N };
+/* 超级用户列表：图标 / 程序位置 / 权限设置 / 层级 / 悬浮提示 */
+enum { COL_ICON, COL_PATH, COL_STATE, COL_LEVEL, COL_TIP, COL_N };
+
+/* 授权状态 */
+enum { ST_ASK = 0, ST_ROOT, ST_DENY };
+
+#define STATE_TEXT(st) ((st) == ST_ROOT ? "root" : \
+                        (st) == ST_DENY ? "禁止" : "待授权")
 
 typedef struct {
     GtkWidget *win;
@@ -64,7 +76,9 @@ typedef struct {
     /* 超级用户页 */
     GtkWidget *lbl_count;
     GtkWidget *tree;
-    GtkListStore *store;
+    GtkTreeStore *store;
+    GtkWidget *empty_hint;      /* 列表为空时的提示 */
+    GHashTable *policy;         /* 程序位置 -> 授权状态 */
 
     /* 终端页 */
     GtkWidget *termview;
@@ -452,27 +466,6 @@ static void refresh_home(App *a)
  * 超级用户页：当前用户进程对应的「程序位置」
  * ----------------------------------------------------------------------- */
 
-/* 读 /proc/<pid>/exe，返回可执行文件的绝对路径；读不到返回 NULL */
-static char *proc_exe(int pid)
-{
-    char link[64], buf[2048];
-    ssize_t n;
-    size_t len;
-
-    g_snprintf(link, sizeof(link), "/proc/%d/exe", pid);
-    n = readlink(link, buf, sizeof(buf) - 1);
-    if (n <= 0)
-        return NULL;
-    buf[n] = '\0';
-
-    /* 程序被删掉后内核会追加 " (deleted)"，去掉更干净 */
-    len = strlen(buf);
-    if (len > 10 && !strcmp(buf + len - 10, " (deleted)"))
-        buf[len - 10] = '\0';
-
-    return g_strdup(buf);
-}
-
 /* 程序图标：浅色圆角方块 + 程序名首字母，纯 cairo 绘制，不依赖图标主题 */
 static GdkPixbuf *prog_icon(const char *path, const char *name)
 {
@@ -554,103 +547,375 @@ static GdkPixbuf *prog_icon(const char *path, const char *name)
     return pb;
 }
 
-static void refresh_procs(App *a)
+/* 授权记录文件：root 时放 /var/lib/rootmgr，否则放用户配置目录 */
+static char *policy_file(void)
 {
-    DIR *d;
-    struct dirent *de;
-    uid_t me = getuid();
+    if (geteuid() == 0)
+        return g_strdup("/var/lib/rootmgr/policy.tsv");
+    return g_build_filename(g_get_user_config_dir(), "rootmgr", "policy.tsv", NULL);
+}
+
+static int policy_get(App *a, const char *path)
+{
+    if (!a->policy || !path)
+        return ST_ASK;
+    return GPOINTER_TO_INT(g_hash_table_lookup(a->policy, path));
+}
+
+static void policy_load(App *a)
+{
+    char *pf = policy_file();
+    char *dir = g_path_get_dirname(pf);
+    char *data = NULL;
+
+    g_mkdir_with_parents(dir, 0755);
+    g_free(dir);
+
+    if (!a->policy)
+        a->policy = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+
+    if (g_file_get_contents(pf, &data, NULL, NULL)) {
+        char **lines = g_strsplit(data, "\n", -1);
+        int i;
+
+        for (i = 0; lines[i]; i++) {
+            char *line = lines[i];
+            char *tab;
+            int st;
+
+            if (!*line || line[0] == '#')
+                continue;
+            tab = strchr(line, '\t');
+            if (!tab)
+                continue;
+            *tab = '\0';
+            st = !strcmp(line, "root") ? ST_ROOT :
+                 !strcmp(line, "deny") ? ST_DENY : ST_ASK;
+            if (!tab[1])
+                continue;
+            g_hash_table_replace(a->policy, g_strdup(tab + 1),
+                                 GINT_TO_POINTER(st));
+        }
+        g_strfreev(lines);
+        g_free(data);
+    }
+    g_free(pf);
+}
+
+static void policy_save(App *a)
+{
+    char *pf = policy_file();
+    char *dir = g_path_get_dirname(pf);
+    GString *out;
+    GHashTableIter it;
+    gpointer k, v;
+
+    g_mkdir_with_parents(dir, 0755);
+
+    out = g_string_new("# rootmgr 授权记录：状态<TAB>程序位置\n");
+    if (a->policy) {
+        g_hash_table_iter_init(&it, a->policy);
+        while (g_hash_table_iter_next(&it, &k, &v)) {
+            int st = GPOINTER_TO_INT(v);
+
+            g_string_append_printf(out, "%s\t%s\n",
+                                   st == ST_ROOT ? "root" :
+                                   st == ST_DENY ? "deny" : "ask",
+                                   (const char *)k);
+        }
+    }
+    g_file_set_contents(pf, out->str, (gssize)out->len, NULL);
+    g_string_free(out, TRUE);
+    g_free(dir);
+    g_free(pf);
+}
+
+/* 从一条命令行里取出真正要执行的程序全路径，取不到返回 NULL */
+static char *cmd_program(const char *cmd)
+{
+    static const char *skip[] = { "sudo", "env", "nohup", "time", "command" };
+    char word[512];
+    const char *p = cmd;
+    size_t i;
+    int round;
+
+    if (!cmd)
+        return NULL;
+
+    for (round = 0; round < 4; round++) {
+        while (*p == ' ' || *p == '\t')
+            p++;
+
+        i = 0;
+        while (*p && *p != ' ' && *p != '\t' && i + 1 < sizeof(word))
+            word[i++] = *p++;
+        word[i] = '\0';
+
+        if (!i)
+            return NULL;
+
+        /* VAR=value 前缀直接跳过 */
+        if (strchr(word, '='))
+            continue;
+
+        if (round > 0 || (i = 0, 1)) {
+            size_t k;
+            gboolean is_skip = FALSE;
+
+            for (k = 0; k < G_N_ELEMENTS(skip); k++)
+                if (!strcmp(word, skip[k])) {
+                    is_skip = TRUE;
+                    break;
+                }
+            if (!is_skip)
+                break;
+            if (round == 3)
+                return NULL;
+        }
+    }
+
+    /* 去掉成对的引号 */
+    i = strlen(word);
+    if (i >= 2 && (word[0] == '\'' || word[0] == '"') && word[i - 1] == word[0]) {
+        memmove(word, word + 1, i - 2);
+        word[i - 2] = '\0';
+    }
+    if (!word[0])
+        return NULL;
+
+    if (strchr(word, '/'))
+        return realpath(word, NULL);
+
+    {
+        char *found = g_find_program_in_path(word);
+
+        if (found) {
+            char *real = realpath(found, NULL);
+
+            g_free(found);
+            return real;
+        }
+    }
+    return NULL;
+}
+
+static gint cmp_path(gconstpointer a, gconstpointer b)
+{
+    return g_strcmp0((const char *)a, (const char *)b);
+}
+
+/* 重建超级用户列表：每行一个程序，展开后是 root / 禁止 两个选项 */
+static void refresh_super(App *a)
+{
+    GHashTableIter it;
+    gpointer k, v;
+    GList *paths = NULL, *l;
+    guint n = 0;
 
     if (!a->store)
         return;
 
-    gtk_list_store_clear(a->store);
+    gtk_tree_store_clear(a->store);
 
-    d = opendir("/proc");
-    if (!d)
-        return;
+    if (a->policy) {
+        g_hash_table_iter_init(&it, a->policy);
+        while (g_hash_table_iter_next(&it, &k, &v))
+            paths = g_list_prepend(paths, k);
+        paths = g_list_sort(paths, cmp_path);
+    }
 
-    while ((de = readdir(d))) {
-        char path[300], buf[1024], name[64] = "", args[400] = "";
-        FILE *f;
-        unsigned uid = 0;
-        int pid;
-        char *exe;
-        char *tip;
-        char *p;
+    for (l = paths; l; l = l->next) {
+        const char *path = l->data;
+        int st = policy_get(a, path);
+        GtkTreeIter parent, child;
+        GdkPixbuf *ico = prog_icon(path, NULL);
 
-        if (de->d_name[0] < '0' || de->d_name[0] > '9')
-            continue;
-
-        pid = atoi(de->d_name);
-        if (pid <= 0)
-            continue;
-
-        g_snprintf(path, sizeof(path), "/proc/%d/status", pid);
-        f = fopen(path, "r");
-        if (!f)
-            continue;
-
-        while (fgets(buf, sizeof(buf), f)) {
-            if (!strncmp(buf, "Name:", 5))
-                g_strlcpy(name, g_strstrip(buf + 5), sizeof(name));
-            else if (!strncmp(buf, "Uid:", 4))
-                uid = (unsigned)strtoul(buf + 4, NULL, 10);
-        }
-        fclose(f);
-
-        if (uid != (unsigned)me)
-            continue;
-
-        exe = proc_exe(pid);
-        if (!exe) {
-            /* 内核线程或权限不足时没有 exe 链接，用进程名占位 */
-            if (!name[0]) {
-                continue;
-            }
-            exe = g_strdup_printf("(%s)", name);
-        }
-
-        g_snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
-        f = fopen(path, "r");
-        if (f) {
-            size_t n = fread(args, 1, sizeof(args) - 1, f);
-
-            fclose(f);
-            args[n] = '\0';
-            for (p = args; p < args + n; p++)
-                if (*p == '\0')
-                    *p = ' ';
-        }
-
-        tip = args[0] ? g_strdup_printf("%s\n%s", exe, args) : g_strdup(exe);
+        gtk_tree_store_append(a->store, &parent, NULL);
+        gtk_tree_store_set(a->store, &parent,
+                           COL_ICON, ico,
+                           COL_PATH, path,
+                           COL_STATE, STATE_TEXT(st),
+                           COL_LEVEL, 0,
+                           COL_TIP, path, -1);
+        if (ico)
+            g_object_unref(ico);
 
         {
-            GtkTreeIter it;
-            GdkPixbuf *ico = prog_icon(exe, name);
+            static const int opts[2] = { ST_ROOT, ST_DENY };
+            int i;
 
-            gtk_list_store_append(a->store, &it);
-            gtk_list_store_set(a->store, &it,
-                               COL_ICON, ico,
-                               COL_PID, pid,
-                               COL_PATH, exe,
-                               COL_USER, user_name(me),
-                               COL_TIP, tip, -1);
-            if (ico)
-                g_object_unref(ico);
+            for (i = 0; i < 2; i++) {
+                char buf[64];
+
+                g_snprintf(buf, sizeof(buf), "     %s %s",
+                           st == opts[i] ? "●" : "○", STATE_TEXT(opts[i]));
+                gtk_tree_store_append(a->store, &child, &parent);
+                gtk_tree_store_set(a->store, &child,
+                                   COL_ICON, NULL,
+                                   COL_PATH, buf,
+                                   COL_STATE, "",
+                                   COL_LEVEL, opts[i],
+                                   COL_TIP, NULL, -1);
+            }
         }
-
-        g_free(tip);
-        g_free(exe);
+        n++;
     }
-    closedir(d);
+    g_list_free(paths);
 
     if (a->lbl_count) {
         char cnt[64];
 
-        g_snprintf(cnt, sizeof(cnt), "%u 个进程",
-                   gtk_tree_model_iter_n_children(GTK_TREE_MODEL(a->store), NULL));
+        g_snprintf(cnt, sizeof(cnt), "%u 个程序", n);
         gtk_label_set_text(GTK_LABEL(a->lbl_count), cnt);
     }
+    if (a->empty_hint)
+        gtk_widget_set_visible(a->empty_hint, n == 0);
+}
+
+/* 登记一次 root 请求：程序还没记录过就加进来（状态待授权） */
+static void policy_request(App *a, const char *cmd)
+{
+    char *prog = cmd_program(cmd);
+    gboolean added = FALSE;
+
+    if (!prog)
+        return;
+    if (!a->policy)
+        a->policy = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+
+    if (!g_hash_table_contains(a->policy, prog)) {
+        g_hash_table_insert(a->policy, prog, GINT_TO_POINTER(ST_ASK));
+        added = TRUE;
+    } else {
+        g_free(prog);
+    }
+
+    if (added) {
+        policy_save(a);
+        refresh_super(a);
+    }
+}
+
+/* 把某一行设成 root / 禁止，只更新这一行，不重建列表（保留展开状态） */
+static void apply_state(App *a, GtkTreeIter *parent, int st)
+{
+    GtkTreeModel *m = GTK_TREE_MODEL(a->store);
+    GtkTreeIter child;
+    char *path = NULL;
+
+    gtk_tree_model_get(m, parent, COL_PATH, &path, -1);
+    if (path) {
+        g_hash_table_replace(a->policy, path, GINT_TO_POINTER(st));
+        policy_save(a);
+    }
+    gtk_tree_store_set(a->store, parent, COL_STATE, STATE_TEXT(st), -1);
+
+    if (gtk_tree_model_iter_children(m, &child, parent)) {
+        do {
+            int lvl = 0;
+            char buf[64];
+
+            gtk_tree_model_get(m, &child, COL_LEVEL, &lvl, -1);
+            g_snprintf(buf, sizeof(buf), "     %s %s",
+                       lvl == st ? "●" : "○", STATE_TEXT(lvl));
+            gtk_tree_store_set(a->store, &child, COL_PATH, buf, -1);
+        } while (gtk_tree_model_iter_next(m, &child));
+    }
+}
+
+static void on_remove_prog(GtkWidget *mi, gpointer data)
+{
+    App *a = data;
+    char *path = g_object_get_data(G_OBJECT(mi), "path");
+
+    if (!path || !a->policy)
+        return;
+    g_hash_table_remove(a->policy, path);
+    policy_save(a);
+    refresh_super(a);
+}
+
+/* 右键：移除一条授权记录 */
+static gboolean on_super_right(GtkWidget *w, GdkEventButton *ev, gpointer data)
+{
+    App *a = data;
+    GtkTreePath *tp = NULL;
+    GtkTreeViewColumn *col = NULL;
+    GtkTreeModel *m = gtk_tree_view_get_model(GTK_TREE_VIEW(w));
+    GtkTreeIter it, parent;
+    char *path = NULL;
+    GtkWidget *menu, *item;
+    int lvl = 0;
+
+    if (ev->type != GDK_BUTTON_PRESS || ev->button != 3)
+        return FALSE;
+    if (!gtk_tree_view_get_path_at_pos(GTK_TREE_VIEW(w), (int)ev->x, (int)ev->y,
+                                       &tp, &col, NULL, NULL))
+        return FALSE;
+    (void)col;
+
+    if (!gtk_tree_model_get_iter(m, &it, tp)) {
+        gtk_tree_path_free(tp);
+        return FALSE;
+    }
+    gtk_tree_path_free(tp);
+
+    gtk_tree_model_get(m, &it, COL_LEVEL, &lvl, -1);
+    if (lvl != 0 && gtk_tree_model_iter_parent(m, &parent, &it))
+        it = parent;
+
+    gtk_tree_model_get(m, &it, COL_PATH, &path, -1);
+    if (!path)
+        return FALSE;
+
+    menu = gtk_menu_new();
+    item = gtk_menu_item_new_with_label("移除这条记录");
+    g_object_set_data_full(G_OBJECT(item), "path", path, g_free);
+    g_signal_connect(item, "activate", G_CALLBACK(on_remove_prog), a);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+    gtk_widget_show_all(menu);
+    gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)ev);
+    return TRUE;
+}
+
+/* 单击：父行展开/收起，子行就是选 root 或禁止 */
+static gboolean on_super_click(GtkWidget *w, GdkEventButton *ev, gpointer data)
+{
+    App *a = data;
+    GtkTreePath *tp = NULL;
+    GtkTreeViewColumn *col = NULL;
+    GtkTreeModel *m = gtk_tree_view_get_model(GTK_TREE_VIEW(w));
+    GtkTreeIter it, parent;
+
+    if (ev->type != GDK_BUTTON_PRESS || ev->button != 1)
+        return FALSE;
+    if (!gtk_tree_view_get_path_at_pos(GTK_TREE_VIEW(w), (int)ev->x, (int)ev->y,
+                                       &tp, &col, NULL, NULL))
+        return FALSE;
+    (void)col;
+
+    if (!gtk_tree_model_get_iter(m, &it, tp)) {
+        gtk_tree_path_free(tp);
+        return FALSE;
+    }
+
+    {
+        int lvl = 0;
+
+        gtk_tree_model_get(m, &it, COL_LEVEL, &lvl, -1);
+        if (lvl == ST_ROOT || lvl == ST_DENY) {
+            /* 子行：设置授权 */
+            if (gtk_tree_model_iter_parent(m, &parent, &it))
+                apply_state(a, &parent, lvl);
+        } else if (gtk_tree_view_row_expanded(GTK_TREE_VIEW(w), tp)) {
+            gtk_tree_view_collapse_row(GTK_TREE_VIEW(w), tp);
+        } else {
+            gtk_tree_view_expand_row(GTK_TREE_VIEW(w), tp, FALSE);
+        }
+    }
+
+    gtk_tree_path_free(tp);
+    return TRUE;
 }
 
 /* --------------------------------------------------------------------------
@@ -817,6 +1082,25 @@ static void term_run(App *a, const char *cmd)
         return;
     }
 
+    {
+        char *prog = cmd_program(cmd);
+
+        if (prog) {
+            int st = policy_get(a, prog);
+
+            if (st == ST_DENY) {
+                term_append(a, prog, "err");
+                term_append(a, " 已被设为「禁止」，"
+                               "可到「超级用户」页改回 root\n", "err");
+                g_free(prog);
+                return;
+            }
+            g_free(prog);
+        }
+        /* 没记录过的程序登记成待授权，会出现在超级用户列表里 */
+        policy_request(a, cmd);
+    }
+
     if (!build_argv(cmd, argv, &argc)) {
         term_append(a, "没有 root 也不见 sudo / pkexec，"
                        "请直接以 root 启动本程序\n", "err");
@@ -924,7 +1208,7 @@ static void switch_page(App *a, int idx)
     if (idx == 0)
         refresh_home(a);
     if (idx == 1)
-        refresh_procs(a);
+        refresh_super(a);
     if (idx == 2 && a->entry)
         gtk_widget_grab_focus(a->entry);
 }
@@ -1153,7 +1437,7 @@ static GtkWidget *build_super(App *a)
 {
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
     GtkWidget *card, *cbody, *h, *lbl, *sub, *btn, *scroll;
-    GtkWidget *tree;
+    GtkWidget *overlay, *empty, *tree;
 
     gtk_widget_set_margin_start(box, 8);
     gtk_widget_set_margin_end(box, 8);
@@ -1172,7 +1456,7 @@ static GtkWidget *build_super(App *a)
 
     h = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     lbl = gtk_label_new("程序位置");
-    sub = gtk_label_new(user_name(getuid()));
+    sub = gtk_label_new("0 个程序");
     a->lbl_count = sub;
     btn = gtk_button_new_with_label("刷新");
     gtk_widget_set_name(lbl, "cardtitle");
@@ -1192,8 +1476,8 @@ static GtkWidget *build_super(App *a)
                                    GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
     gtk_widget_set_vexpand(scroll, TRUE);
 
-    a->store = gtk_list_store_new(COL_N, GDK_TYPE_PIXBUF, G_TYPE_INT,
-                                  G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING);
+    a->store = gtk_tree_store_new(COL_N, GDK_TYPE_PIXBUF, G_TYPE_STRING,
+                                  G_TYPE_STRING, G_TYPE_INT, G_TYPE_STRING);
     tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(a->store));
     a->tree = tree;
     gtk_widget_set_name(tree, "proctree");
@@ -1212,42 +1496,56 @@ static GtkWidget *build_super(App *a)
         gtk_tree_view_append_column(GTK_TREE_VIEW(tree), c);
 
         r = gtk_cell_renderer_text_new();
-        g_object_set(r, "weight", PANGO_WEIGHT_BOLD, "xpad", 6, NULL);
-        c = gtk_tree_view_column_new_with_attributes("pid", r, "text", COL_PID, NULL);
-        gtk_tree_view_column_set_min_width(c, 76);
-        gtk_tree_view_append_column(GTK_TREE_VIEW(tree), c);
-
-        r = gtk_cell_renderer_text_new();
         g_object_set(r, "ellipsize", PANGO_ELLIPSIZE_MIDDLE, "xpad", 6, NULL);
         c = gtk_tree_view_column_new_with_attributes("path", r, "text", COL_PATH, NULL);
         gtk_tree_view_column_set_expand(c, TRUE);
         gtk_tree_view_append_column(GTK_TREE_VIEW(tree), c);
 
         r = gtk_cell_renderer_text_new();
-        g_object_set(r, "ellipsize", PANGO_ELLIPSIZE_END, "xpad", 6, "xalign", 1.0, NULL);
-        c = gtk_tree_view_column_new_with_attributes("user", r, "text", COL_USER, NULL);
-        gtk_tree_view_column_set_min_width(c, 78);
+        g_object_set(r, "xpad", 6, "xalign", 0.0, NULL);
+        c = gtk_tree_view_column_new_with_attributes("state", r, "text", COL_STATE, NULL);
+        gtk_tree_view_column_set_min_width(c, 120);
         gtk_tree_view_append_column(GTK_TREE_VIEW(tree), c);
     }
 
-    /* 按程序位置排序，同一个程序的多个进程会挨在一起 */
-    gtk_tree_sortable_set_sort_column_id(GTK_TREE_SORTABLE(a->store),
-                                         COL_PATH, GTK_SORT_ASCENDING);
-
     gtk_container_add(GTK_CONTAINER(scroll), tree);
-    gtk_box_pack_start(GTK_BOX(cbody), scroll, TRUE, TRUE, 0);
+
+    /* 列表为空时盖一层居中提示 */
+    overlay = gtk_overlay_new();
+    gtk_container_add(GTK_CONTAINER(overlay), scroll);
+
+    empty = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_widget_set_halign(empty, GTK_ALIGN_CENTER);
+    gtk_widget_set_valign(empty, GTK_ALIGN_CENTER);
+    {
+        GtkWidget *t1 = gtk_label_new("还没有程序申请 root");
+        GtkWidget *t2 = gtk_label_new("在「终端」里执行命令后，程序会出现在这里");
+
+        gtk_widget_set_name(t1, "cardtitle");
+        gtk_widget_set_name(t2, "cardvalue");
+        gtk_widget_set_halign(t1, GTK_ALIGN_CENTER);
+        gtk_widget_set_halign(t2, GTK_ALIGN_CENTER);
+        gtk_box_pack_start(GTK_BOX(empty), t1, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(empty), t2, FALSE, FALSE, 0);
+    }
+    gtk_overlay_add_overlay(GTK_OVERLAY(overlay), empty);
+    a->empty_hint = empty;
+
+    gtk_box_pack_start(GTK_BOX(cbody), overlay, TRUE, TRUE, 0);
     gtk_box_pack_start(GTK_BOX(card), cbody, TRUE, TRUE, 0);
     gtk_box_pack_start(GTK_BOX(box), card, TRUE, TRUE, 0);
 
     {
-        GtkWidget *hint = gtk_label_new("程序位置取自 /proc/<pid>/exe，按路径排序；鼠标悬停可看完整命令行。");
+        GtkWidget *hint = gtk_label_new("点一行展开，选 root 或禁止；右键可以移除记录。");
         gtk_widget_set_name(hint, "cardvalue");
         gtk_widget_set_halign(hint, GTK_ALIGN_START);
         gtk_widget_set_margin_start(hint, 14);
         gtk_box_pack_start(GTK_BOX(box), hint, FALSE, FALSE, 0);
     }
 
-    g_signal_connect_swapped(btn, "clicked", G_CALLBACK(refresh_procs), a);
+    g_signal_connect(tree, "button-press-event", G_CALLBACK(on_super_click), a);
+    g_signal_connect(tree, "button-press-event", G_CALLBACK(on_super_right), a);
+    g_signal_connect_swapped(btn, "clicked", G_CALLBACK(refresh_super), a);
     return box;
 }
 
@@ -1510,8 +1808,9 @@ int main(int argc, char **argv)
 
     build_ui(&a);
 
+    policy_load(&a);
     refresh_home(&a);
-    refresh_procs(&a);
+    refresh_super(&a);
 
     term_append(&a, "RootMgr " MGR_VERSION " 终端\n", "dim");
     if (is_root())
