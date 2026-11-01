@@ -38,7 +38,7 @@
 #include "tools/kmod/rootmgr_fd.h"
 
 #define APP_TITLE   "RootMgr"
-#define MGR_VERSION "1.5"
+#define MGR_VERSION "1.6"
 
 /* 图标种类：全部用 cairo 画，不依赖图标字体 / 主题 */
 typedef enum {
