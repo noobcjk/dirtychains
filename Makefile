@@ -1,6 +1,6 @@
 # DirtyChains —— GTK3 / XFCE 前端（引擎已内嵌，单文件）
 #
-#   make                编译 dirtychains（前端 + 五链引擎 + OVS 引擎）
+#   make                编译 dirtychains（前端 + 五链引擎 + Fragnesia/DirtyClone/DirtyDecrypt + OVS）
 #   make poc            另外编一个独立的命令行引擎
 #   make ovswrap        用同一个源编出不含 GTK 的 OVS 命令行版
 #   make offset-add REC=rec.json 把一条记录写成 offset/<N>系/<release>/target.h

@@ -2,7 +2,7 @@
 
 !此项目由AI编写!
 
-八条 CVE 链的页缓存写原语 / 本地提权 PoC 合集，带一个 GTK3 图形前端和四个内置引擎。
+九条 CVE 链的页缓存写原语 / 本地提权 PoC 合集，带一个 GTK3 图形前端和五个内置引擎。
 
 > **免责声明**
 > 本项目仅用于**自有设备**或**已获得书面授权的渗透测试**。
@@ -15,7 +15,7 @@
 
 | 文件 | 说明 |
 |---|---|
-| `dirtyfrag-gui.c` | **单文件主程序**：GTK3 前端 + 内置 Fragnesia / DirtyClone / OVS 三个引擎（原 `ovswrap.c` 已并入） |
+| `dirtyfrag-gui.c` | **单文件主程序**：GTK3 前端 + 内置 Fragnesia / DirtyClone / DirtyDecrypt / OVS 四个引擎（原 `ovswrap.c` 已并入） |
 | `dirtyfrag_lpe.c` | 五链引擎实现，也可单独编成命令行 `poc` |
 
 
@@ -31,6 +31,7 @@
 | CVE-2026-64531 | net/openvswitch | CT action 越界 → 伪造 SET action → 任意读 + `dst_release` 递减写 |
 | CVE-2026-46300 | XFRM / espintcp | ESP 分片被 TCP coalesce 后当普通数据 splice 回页缓存，改只读文件（Fragnesia） |
 | CVE-2026-43503 | XFRM / ESP over UDP | `esn.seq_hi` 被当明文写回页缓存，一个 SA 带 4 字节（DirtyClone） |
+| CVE-2026-31635 | RxRPC / RXGK | rxgk 解密把 splice 进来的文件页当密文，明文直接落回页缓存（DirtyDecrypt） |
 
 ### CVE-2026-46300（Fragnesia）
 
@@ -45,7 +46,7 @@ sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 ./dirtychains --frag -start -t /usr/bin/su    # 成功后 exec 目标 → root shell
 ```
 
-退出码和另外七条链**相反**：`1` = 有漏洞（字节被改写）、`0` = 没打成、
+退出码和另外八条链**相反**：`1` = 有漏洞（字节被改写）、`0` = 没打成、
 `2` = 参数或目标文件不合法、`4` = userns / XFRM 前置条件不满足。
 GUI 里按这个映射显示结论，不要按「0 就是成功」去读。
 
@@ -70,6 +71,34 @@ GUI 里按这个映射显示结论，不要按「0 就是成功」去读。
 root 跑会被 gate 挡住，避免把系统文件打成后门。退出码和主引擎一致：
 `0` = 写成功、`1` = 没打成、`2` = 目标不合法、`4` = 前置条件不满足。
 
+### CVE-2026-31635（DirtyDecrypt）
+
+第五个内置引擎，代码取自上游 PoC（Ashraf Zaryouh "0xBlackash"），入口 `--cve31635`。
+和前几条不同的地方：它不碰 XFRM，走的是 **AF_RXRPC + rxgk 安全类**（security index 6）。
+rxgk 在收包时把 splice 进 socket 的"载荷"——实际是目标文件的页——当成密文原地解密，
+明文直接落回 page cache。每次 fire 换一个随机 AES128 key，解出来的字节近似随机，
+所以只能**逐字节暴力猜**（约 1/256 命中），命中一字节再换下一字节。
+
+```bash
+./dirtychains --cve31635 -find                    # 只列 setuid 候选靶子，纯只读
+./dirtychains --cve31635 -check -t /usr/bin/su    # userns/netns + AF_RXRPC + rxgk，不写文件
+./dirtychains --cve31635 -test  -t /usr/bin/su    # 写 120 字节并回读校验，不 exec
+./dirtychains --cve31635 -start -t /usr/bin/su    # 成功后 exec 目标 → root shell
+```
+
+- 载荷是 120 字节的 tiny ELF（`setuid(0)` → `setgid(0)` → `setgroups(0)` → `execve("/bin/sh")`），
+  整段覆盖目标文件开头，所以**不支持 `-offset`**，永远从 0 开始写。
+- 慢：120 字节、平均每字节几百次 fire，通常要跑几分钟，日志每 8 字节报一次
+  `fires` / 秒速。中途可以停，已写进去的字节不会回退。
+- 前置条件：内核要编 `CONFIG_AF_RXRPC`，并且 rxgk 可用（`add_key("rxrpc", ...)` 成功）。
+  缺 rxgk 时 `-check` 直接以 `4` 退出，提示 `No such device`。
+- 目标必须 **setuid root 且对当前用户可读**（splice 要读它），同时不可写。
+- 写之前自动备份到 `/tmp/.<名字>.<pid>`，成功失败都保留，日志里给恢复命令；
+  页缓存脏页 5 秒后可能已回写磁盘，最稳的恢复仍是 `apt-get install --reinstall -y <包名>`。
+
+退出码和主引擎一致：`0` = 写成功、`1` = 没打成、`2` = 目标不合法、
+`4` = 前置条件不满足（userns 被禁 / 无 AF_RXRPC / 无 rxgk / 目标可写）。
+
 ---
 
 ## 构建
@@ -78,7 +107,7 @@ root 跑会被 gate 挡住，避免把系统文件打成后门。退出码和主
 # 依赖：gtk+-3.0 开发包
 sudo apt install build-essential libgtk-3-dev pkg-config
 
-make                 # GUI 单二进制 dirtychains（前端 + 五链引擎 + Fragnesia + DirtyClone + OVS 引擎）
+make                 # GUI 单二进制 dirtychains（前端 + 五链引擎 + Fragnesia + DirtyClone + DirtyDecrypt + OVS 引擎）
 make poc             # 独立的命令行引擎
 make ovswrap         # 独立的 OVS 命令行版（不含 GTK）
 sudo make install    # 装到 /usr/local/bin，背景图与 offset/ 进 share/dirtychains
@@ -94,8 +123,8 @@ gcc -O2 -Wall -DOVSWRAP_STANDALONE -o ovswrap dirtyfrag-gui.c -lutil   # 只要 
 
 五链引擎（31431 / 43284 / 43500 / 43494 / 46331）仍来自 `dirtyfrag_lpe.c`，
 编译时用 `-Dmain=dirtychains_poc_main` 改名后与前端链接。
-另外三条 —— 46300（Fragnesia）、43503（DirtyClone）、64531（OVS）—— 直接写在
-`dirtyfrag-gui.c` 里，不经过这个文件，所以「八链」≠「五链引擎」，别按总链数去对。
+另外四条 —— 46300（Fragnesia）、43503（DirtyClone）、31635（DirtyDecrypt）、64531（OVS）—— 直接写在
+`dirtyfrag-gui.c` 里，不经过这个文件，所以「九链」≠「五链引擎」，别按总链数去对。
 两个源文件名保留 `dirtyfrag` 前缀，记录实现来路；产物二进制叫 `dirtychains`。
 
 内核模块（可选，见下）：
