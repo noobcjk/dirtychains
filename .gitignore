@@ -23,3 +23,5 @@ __pycache__/
 
 # 工具链缓存
 .codebuddy/
+core
+core.*

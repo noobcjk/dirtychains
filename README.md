@@ -2,7 +2,7 @@
 
 !此项目由AI编写!
 
-七条 CVE 链的页缓存写原语 / 本地提权 PoC 合集，带一个 GTK3 图形前端和三个内置引擎。
+八条 CVE 链的页缓存写原语 / 本地提权 PoC 合集，带一个 GTK3 图形前端和四个内置引擎。
 
 > **免责声明**
 > 本项目仅用于**自有设备**或**已获得书面授权的渗透测试**。
@@ -15,7 +15,7 @@
 
 | 文件 | 说明 |
 |---|---|
-| `dirtyfrag-gui.c` | **单文件主程序**：GTK3 前端 + 内置 Fragnesia 引擎 + 内置 OVS 引擎（原 `ovswrap.c` 已并入） |
+| `dirtyfrag-gui.c` | **单文件主程序**：GTK3 前端 + 内置 Fragnesia / DirtyClone / OVS 三个引擎（原 `ovswrap.c` 已并入） |
 | `dirtyfrag_lpe.c` | 五链引擎实现，也可单独编成命令行 `poc` |
 
 
@@ -30,6 +30,7 @@
 | CVE-2026-46331 | net/sched act_pedit | skb 越界写 |
 | CVE-2026-64531 | net/openvswitch | CT action 越界 → 伪造 SET action → 任意读 + `dst_release` 递减写 |
 | CVE-2026-46300 | XFRM / espintcp | ESP 分片被 TCP coalesce 后当普通数据 splice 回页缓存，改只读文件（Fragnesia） |
+| CVE-2026-43503 | XFRM / ESP over UDP | `esn.seq_hi` 被当明文写回页缓存，一个 SA 带 4 字节（DirtyClone） |
 
 ### CVE-2026-46300（Fragnesia）
 
@@ -44,9 +45,25 @@ sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 ./dirtychains --frag -start -t /usr/bin/su    # 成功后 exec 目标 → root shell
 ```
 
-退出码和另外六条链**相反**：`1` = 有漏洞（字节被改写）、`0` = 没打成、
+退出码和另外七条链**相反**：`1` = 有漏洞（字节被改写）、`0` = 没打成、
 `2` = 参数或目标文件不合法、`4` = userns / XFRM 前置条件不满足。
 GUI 里按这个映射显示结论，不要按「0 就是成功」去读。
+
+### CVE-2026-43503（DirtyClone）
+
+第四个内置引擎，代码取自上游 PoC（Ashraf Zaryouh "0xBlackash"），入口 `--cve43503`。
+和 46300 同走 XFRM，但用 ESP over UDP（encap 4500）配合 `esn.seq_hi`：一个 SA 只带
+4 字节，192 字节载荷要装 48 个 SA、发 48 次包，全程约 8 秒。
+
+```bash
+./dirtychains --cve43503 -check -t /usr/bin/su    # 只探测 userns + XFRM，不写文件
+./dirtychains --cve43503 -test  -t /usr/bin/su    # 写完回读校验，不 exec 目标
+./dirtychains --cve43503 -start -t /usr/bin/su    # 成功后 exec 目标 → root shell
+```
+
+目标必须是普通文件、>= 4096 字节、且对当前用户不可写，否则直接以 `2` / `4` 退出——
+root 跑会被 gate 挡住，避免把系统文件打成后门。退出码和主引擎一致：
+`0` = 写成功、`1` = 没打成、`2` = 目标不合法、`4` = 前置条件不满足。
 
 ---
 
@@ -56,7 +73,7 @@ GUI 里按这个映射显示结论，不要按「0 就是成功」去读。
 # 依赖：gtk+-3.0 开发包
 sudo apt install build-essential libgtk-3-dev pkg-config
 
-make                 # GUI 单二进制 dirtychains（前端 + 五链引擎 + Fragnesia + 内置 OVS 引擎）
+make                 # GUI 单二进制 dirtychains（前端 + 五链引擎 + Fragnesia + DirtyClone + OVS 引擎）
 make poc             # 独立的命令行引擎
 make ovswrap         # 独立的 OVS 命令行版（不含 GTK）
 sudo make install    # 装到 /usr/local/bin，背景图与 offset/ 进 share/dirtychains
@@ -72,8 +89,8 @@ gcc -O2 -Wall -DOVSWRAP_STANDALONE -o ovswrap dirtyfrag-gui.c -lutil   # 只要 
 
 五链引擎（31431 / 43284 / 43500 / 43494 / 46331）仍来自 `dirtyfrag_lpe.c`，
 编译时用 `-Dmain=dirtychains_poc_main` 改名后与前端链接。
-另外两条 —— 46300（Fragnesia）和 64531（OVS）—— 直接写在 `dirtyfrag-gui.c` 里，
-不经过这个文件，所以「七链」≠「七链引擎」，别按总链数去对。
+另外三条 —— 46300（Fragnesia）、43503（DirtyClone）、64531（OVS）—— 直接写在
+`dirtyfrag-gui.c` 里，不经过这个文件，所以「八链」≠「五链引擎」，别按总链数去对。
 两个源文件名保留 `dirtyfrag` 前缀，记录实现来路；产物二进制叫 `dirtychains`。
 
 内核模块（可选，见下）：

