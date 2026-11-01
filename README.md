@@ -2,7 +2,7 @@
 
 !此项目由AI编写!
 
-九条 CVE 链的页缓存写原语 / 本地提权 PoC 合集，带一个 GTK3 图形前端和五个内置引擎。
+十条 CVE 链的本地提权 PoC 合集，带一个 GTK3 图形前端和五个内置引擎；其中九条是页缓存写原语，另一条（CVE-2026-74469）是独立的 SCTP 堆越界写。
 
 > **免责声明**
 > 本项目仅用于**自有设备**或**已获得书面授权的渗透测试**。
@@ -15,7 +15,7 @@
 
 | 文件 | 说明 |
 |---|---|
-| `dirtyfrag-gui.c` | **单文件主程序**：GTK3 前端 + 内置 Fragnesia / DirtyClone / DirtyDecrypt / OVS 四个引擎（原 `ovswrap.c` 已并入） |
+| `dirtyfrag-gui.c` | **单文件主程序**：GTK3 前端 + 内置 Fragnesia / DirtyClone / DirtyDecrypt / DiagSpill / OVS 五个引擎（原 `ovswrap.c` 已并入） |
 | `dirtyfrag_lpe.c` | 五链引擎实现，也可单独编成命令行 `poc` |
 
 
@@ -32,6 +32,45 @@
 | CVE-2026-46300 | XFRM / espintcp | ESP 分片被 TCP coalesce 后当普通数据 splice 回页缓存，改只读文件（Fragnesia） |
 | CVE-2026-43503 | XFRM / ESP over UDP | `esn.seq_hi` 被当明文写回页缓存，一个 SA 带 4 字节（DirtyClone） |
 | CVE-2026-31635 | RxRPC / RXGK | rxgk 解密把 splice 进来的文件页当密文，明文直接落回页缓存（DirtyDecrypt） |
+| CVE-2026-74469 | SCTP / sctp_diag | `transport_count` 16 位回绕，`sctp_diag` 按回绕后 count 预留 payload 却按真实链表长度拷贝，堆越界写约 10MB（DiagSpill） |
+
+### CVE-2026-74469（DiagSpill）
+
+第六个内置引擎，移植自公开 PoC（manizada/DiagSpill），入口 `--diagspill`。
+和前几条页缓存写原语完全不同：它走 **SCTP + `sctp_diag`**（`INET_DIAG_PEERS` dump），
+不依赖 userns / 内核模块 / setuid 靶子。
+
+根因：`sctp_assoc_add_peer()` 每新增一个**唯一**对端就把 16 位 `transport_count` +1，
+第 65536 个回绕成 0；随后 `sctp_diag` 的 `INET_DIAG_PEERS` dump 用回绕后的 count 预留
+payload，却按 `transport_addr_list` 的真实长度（81920）逐条拷贝 `sockaddr_storage`
+（128 字节），写出约 10MB 堆越界（CWE-787）。
+
+> **完整本地提权（LPE）锁死在高版本内核**：上游公开 exploit 的完整提权路线
+> （2MiB 大页饱和 + 页表蓄水池 + 物理内存扫描 + 2048 个 cred worker + 篡改 PMD 把物理内存
+> 映射成用户可读写 + 改写 UID/GID + 借 sudo 提权）要求 **Ubuntu 24.04 6.17.0-35 /
+> Fedora 44 6.19.10 + 严格 4 vCPU / 4GB + 透明大页**，且**破坏性**
+> （约 8MB 内核内存损坏、大概率 panic、需重启）。本 GUI 引擎**不内置**这套提权，
+> 只接「存在性检测」与「破坏性触发器（DoS 演示，非提权）」两种用途。
+
+```bash
+./dirtychains --diagspill -check                 # 只读探测 SCTP / sctp_diag + 打印 /proc/version 与修复版
+./dirtychains --diagspill -find                  # 打印修复版本表与各模式说明，纯只读，无需靶子
+./dirtychains --diagspill -test  -force          # 建 81920 对端关联后发 diag，触发越界（DoS，破坏性）
+./dirtychains --diagspill -start -force          # 同 -test 的破坏性触发器（此处不做提权）
+```
+
+- `-check`：创建 `AF_INET6 / SCTP` 与 `NETLINK_SOCK_DIAG` 套接字验证原语可用，
+  打印 `/proc/version` 并按修复版本表给出判定；不可用（无 SCTP 或 `sctp_diag` 缺失）时
+  以 `3` 退出，提示「SCTP / sctp_diag 不可用」。
+- `-test` / `-start`：**破坏性**，会在内核里建 81920 对端关联并触发堆越界写，
+  大概率 panic —— 只应在 disposable 虚拟机里跑。缺 `-force` 一律以 `2` 退出，
+  不触发；未知参数也以 `2` 退出。
+- **判定**：看 `/proc/version` 是否低于修复版（5.10.270 / 5.15.221 / 6.1.188 /
+  6.6.157 / 6.12.109 / 6.18.50 / 7.2.4 起）。低于修复版 + `-test -force` 实测 panic
+  即确认受影响。
+
+退出码：`-check` 可用 `0` / 不可用 `3`；`-test`/`-start` 无 `-force` 或参数错 `2`、
+触发成功（或安全失败）`1`、环境不可用 `3`；其它前置 `4`。
 
 ### CVE-2026-46300（Fragnesia）
 
@@ -107,7 +146,7 @@ rxgk 在收包时把 splice 进 socket 的"载荷"——实际是目标文件的
 # 依赖：gtk+-3.0 开发包
 sudo apt install build-essential libgtk-3-dev pkg-config
 
-make                 # GUI 单二进制 dirtychains（前端 + 五链引擎 + Fragnesia + DirtyClone + DirtyDecrypt + OVS 引擎）
+make                 # GUI 单二进制 dirtychains（前端 + 五链引擎 + Fragnesia + DirtyClone + DirtyDecrypt + OVS + DiagSpill 引擎）
 make poc             # 独立的命令行引擎
 make ovswrap         # 独立的 OVS 命令行版（不含 GTK）
 sudo make install    # 装到 /usr/local/bin，背景图与 offset/ 进 share/dirtychains
@@ -123,8 +162,9 @@ gcc -O2 -Wall -DOVSWRAP_STANDALONE -o ovswrap dirtyfrag-gui.c -lutil   # 只要 
 
 五链引擎（31431 / 43284 / 43500 / 43494 / 46331）仍来自 `dirtyfrag_lpe.c`，
 编译时用 `-Dmain=dirtychains_poc_main` 改名后与前端链接。
-另外四条 —— 46300（Fragnesia）、43503（DirtyClone）、31635（DirtyDecrypt）、64531（OVS）—— 直接写在
-`dirtyfrag-gui.c` 里，不经过这个文件，所以「九链」≠「五链引擎」，别按总链数去对。
+另外五条 —— 46300（Fragnesia）、43503（DirtyClone）、31635（DirtyDecrypt）、64531（OVS）、
+74469（DiagSpill）—— 直接写在 `dirtyfrag-gui.c` 里，不经过这个文件，
+所以「十链」≠「五链引擎」，别按总链数去对。
 两个源文件名保留 `dirtyfrag` 前缀，记录实现来路；产物二进制叫 `dirtychains`。
 
 内核模块（可选，见下）：

