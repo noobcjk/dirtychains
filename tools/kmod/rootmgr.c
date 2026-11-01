@@ -70,6 +70,34 @@
  *   存在内核内存里，rmmod 后清空 —— 持久化交给用户态的 policy 文件，
  *   每次加载模块后由管理器重新灌一遍。
  *
+ * 六、授权过的程序，执行时直接变成 root（exec 钩子）
+ *   上面第五节只回答"这个进程能不能主动调 GRANT_ROOT"，程序本身不会自动
+ *   变 root。要让授权真的有用，还得在 exec 这一步动手：
+ *
+ *     kprobe 挂在 security_bprm_check() 上（fs/exec.c 的执行路径里，
+ *     bprm->file 已经打开、bprm->cred 已经备好，还没 commit）。
+ *
+ *   钩子里拿 bprm->file 的 (i_ino, s_dev) 去查授权表：
+ *
+ *     - 命中 ROOT  → 直接把 bprm->cred 改成 uid/gid 全 0 + 全 capability，
+ *                    并把 bprm->secureexec 置 1（让动态链接器进入 AT_SECURE
+ *                    模式，丢掉 LD_PRELOAD / LD_LIBRARY_PATH 这类注入面）；
+ *                    begin_new_exec() 随后 commit_creds(bprm->cred)，
+ *                    新程序从第一条用户态指令起就是 root。
+ *     - 其他        → 什么都不做，行为跟没装模块完全一样。
+ *
+ *   选 security_bprm_check 而不是"exec 返回后再给 current 换 cred"：
+ *   后者要调 prepare_kernel_cred()，而 kprobe 上下文里不能睡眠分配内存；
+ *   改 bprm->cred 是纯内存写，不分配、不加锁睡眠，最稳。
+ *
+ *   注意两点：
+ *     1) 语义等于"给这个文件加了个 setuid 位"。如果授权的是 sh / python
+ *        这类通用解释器，任何人执行它都会拿到 root —— 管理器里给这类程序
+ *        点 root 之前先想清楚。
+ *     2) 只加不减：DENY 表示"不给 root"，不会把父进程已经继承下来的 root
+ *        收回去。
+ *   整个钩子可以用模块参数 exec_root=0 关掉。
+ *
  * 构建 / 使用：
  *   make rootmgr
  *   sudo insmod rootmgr.ko [allow_uid=10123]
@@ -99,9 +127,11 @@
 #include <linux/pid.h>
 #include <linux/version.h>
 #include <linux/ioctl.h>
+#include <linux/spinlock.h>
+#include <linux/binfmts.h>
 
-#define ROOTMGR_VERSION_STR "2.3"
-#define ROOTMGR_VERSION_NUM 23000
+#define ROOTMGR_VERSION_STR "2.4"
+#define ROOTMGR_VERSION_NUM 24000
 #define ROOTMGR_NAME        "[ksu_driver]"
 
 /* 用户态 reboot(2) 用的暗号 */
@@ -135,6 +165,7 @@ struct ksu_get_info_cmd {
 
 #define KSU_FLAG_ROOT    (1u << 0)
 #define KSU_FLAG_MANAGER (1u << 1)
+#define KSU_FLAG_AUTOEXEC (1u << 2)   /* exec 钩子已挂上，授权程序启动即 root */
 
 /*
  * 一条程序授权。程序的身份是 (ino, dev)：exe 文件的 inode 号 +
@@ -177,12 +208,21 @@ static int allow_uid = -1;
 module_param(allow_uid, int, 0644);
 MODULE_PARM_DESC(allow_uid, "manager uid：没登记过的程序只有它才能提权，-1 表示要求 CAP_SYS_ADMIN");
 
+/* exec_root：1 = 被标成 ROOT 的程序 exec 时自动以 root 运行；0 = 只保留手动 GRANT_ROOT */
+static int exec_root = 1;
+module_param(exec_root, int, 0644);
+MODULE_PARM_DESC(exec_root, "1 = 授权为 root 的程序执行时自动提权（等效 setuid），0 = 关闭 exec 钩子");
+
 /* 统计 */
 static atomic_t grant_count = ATOMIC_INIT(0);
+static atomic_t exec_grant_count = ATOMIC_INIT(0);
 
 /* 前置声明：第 1 节的凭据操作要用到第 2 节的授权表 */
 static int task_exe_id(struct task_struct *t, u64 *ino, u32 *dev);
 static int app_lookup(u64 ino, u32 dev);
+
+/* exec 钩子是否真的挂上了（内核没这个符号时退化成纯手动提权） */
+static bool exec_hook_ok;
 
 /* -------------------------------------------------------------------------
  * 1. 凭据：造一份 root cred，换给目标 task
@@ -349,7 +389,14 @@ struct app_rec {
 
 static struct app_rec app_table[ROOTMGR_MAX_APPS];
 static int app_count;
-static DEFINE_MUTEX(app_lock);
+
+/*
+ * 用自旋锁而不是 mutex：这张表不只在 ioctl（进程上下文）里查，exec 钩子
+ * 也会查，而 kprobe 的 pre_handler 跑在关抢占的上下文里，mutex_lock 可能
+ * 睡眠 —— 那会直接触发 "sleeping function called from invalid context"。
+ * 临界区只有一次线性扫描，自旋锁完全够。
+ */
+static DEFINE_SPINLOCK(app_lock);
 
 /* 某个 task 的可执行文件身份；内核线程、刚 exec 到一半的进程没有 exe_file */
 static int task_exe_id(struct task_struct *t, u64 *ino, u32 *dev)
@@ -394,16 +441,17 @@ static int current_exe_id(u64 *ino, u32 *dev)
 /* 查表；未记录返回 KSU_POLICY_ASK */
 static int app_lookup(u64 ino, u32 dev)
 {
+	unsigned long flags;
 	int i, state = KSU_POLICY_ASK;
 
-	mutex_lock(&app_lock);
+	spin_lock_irqsave(&app_lock, flags);
 	for (i = 0; i < app_count; i++) {
 		if (app_table[i].ino == ino && app_table[i].dev == dev) {
 			state = app_table[i].state;
 			break;
 		}
 	}
-	mutex_unlock(&app_lock);
+	spin_unlock_irqrestore(&app_lock, flags);
 
 	return state;
 }
@@ -411,21 +459,24 @@ static int app_lookup(u64 ino, u32 dev)
 /* 清空整张表。管理器做全量同步时先清后灌，省得算差异。 */
 static void app_clear(void)
 {
-	mutex_lock(&app_lock);
+	unsigned long flags;
+
+	spin_lock_irqsave(&app_lock, flags);
 	app_count = 0;
-	mutex_unlock(&app_lock);
+	spin_unlock_irqrestore(&app_lock, flags);
 }
 
 /* 写一条记录；state == ASK 表示删除 */
 static int app_set(const struct ksu_app_entry *e)
 {
+	unsigned long flags;
 	int i;
 
 	if (e->state != KSU_POLICY_ROOT && e->state != KSU_POLICY_DENY &&
 	    e->state != KSU_POLICY_ASK)
 		return -EINVAL;
 
-	mutex_lock(&app_lock);
+	spin_lock_irqsave(&app_lock, flags);
 
 	for (i = 0; i < app_count; i++) {
 		if (app_table[i].ino == e->ino && app_table[i].dev == e->dev) {
@@ -437,18 +488,18 @@ static int app_set(const struct ksu_app_entry *e)
 				app_table[i].state = e->state;
 				app_table[i].uid = current_uid();
 			}
-			mutex_unlock(&app_lock);
+			spin_unlock_irqrestore(&app_lock, flags);
 			return 0;
 		}
 	}
 
 	if (e->state == KSU_POLICY_ASK) {
-		mutex_unlock(&app_lock);        /* 本来就没有，删也算成功 */
-		return 0;
+		spin_unlock_irqrestore(&app_lock, flags);
+		return 0;                       /* 本来就没有，删也算成功 */
 	}
 
 	if (app_count >= ROOTMGR_MAX_APPS) {
-		mutex_unlock(&app_lock);
+		spin_unlock_irqrestore(&app_lock, flags);
 		return -ENOSPC;
 	}
 
@@ -458,7 +509,7 @@ static int app_set(const struct ksu_app_entry *e)
 	app_table[app_count].uid = current_uid();
 	app_count++;
 
-	mutex_unlock(&app_lock);
+	spin_unlock_irqrestore(&app_lock, flags);
 
 	pr_info("rootmgr: app %#llx/%#x -> %s (%d entries)\n",
 		(unsigned long long)e->ino, e->dev,
@@ -543,6 +594,8 @@ static long rootmgr_ioctl(struct file *filp, unsigned int cmd, unsigned long arg
 			info.flags |= KSU_FLAG_ROOT;
 		if (is_manager())
 			info.flags |= KSU_FLAG_MANAGER;
+		if (exec_hook_ok && READ_ONCE(exec_root))
+			info.flags |= KSU_FLAG_AUTOEXEC;
 
 		if (copy_to_user(uarg, &info, sizeof(info)))
 			return -EFAULT;
@@ -740,7 +793,105 @@ static struct kretprobe reboot_krp = {
 #endif /* CONFIG_KRETPROBES */
 
 /* -------------------------------------------------------------------------
- * 6. 模块出入口
+ * 6. exec 钩子：授权为 root 的程序，执行时新 cred 直接就是 root
+ * ---------------------------------------------------------------------- */
+
+/*
+ * 挂在 security_bprm_check() 上。选它作为落点的原因：
+ *
+ *   - 它在 bprm_execve() 里、do_open_execat() 之后被调用，此时 bprm->file
+ *     已经指向"要执行的这个文件"，拿得到 inode；
+ *   - 此时 bprm->cred 已经由 prepare_bprm_creds() 分配好、还没被
+ *     begin_new_exec() 里的 commit_creds() 装上，改它来得及；
+ *   - 再往后一点（exec 返回后）就只能给 current 换 cred，那要
+ *     prepare_kernel_cred() 分配内存，kprobe 上下文里不允许睡眠。
+ *
+ * 这里只写内存，不分配、不等待，所以在 pre_handler 里是安全的。
+ */
+#if IS_ENABLED(CONFIG_KPROBES)
+
+static int exec_bprm_check(struct kprobe *p, struct pt_regs *regs)
+{
+	struct linux_binprm *bprm;
+	struct file *exe;
+	struct inode *inode;
+	struct cred *cred;
+	u64 ino;
+	u32 dev;
+
+	(void)p;
+
+	if (!exec_root)
+		return 0;
+	if (!READ_ONCE(app_count))
+		return 0;               /* 表是空的：绝大多数 exec 走这条快路 */
+
+	bprm = (struct linux_binprm *)ROOTMGR_ARG0(regs);
+	if (!bprm || !bprm->file || !bprm->cred)
+		return 0;
+
+	exe = bprm->file;
+	inode = file_inode(exe);
+	ino = inode->i_ino;
+	dev = new_encode_dev(inode->i_sb->s_dev);
+
+	if (app_lookup(ino, dev) != KSU_POLICY_ROOT)
+		return 0;
+
+	/*
+	 * 授权是按 inode 认的，但 inode 不变、内容可以变：一个谁都写得动的
+	 * 文件（S_IWOTH）被授权成 root，等于原地放了个 root 后门。这种文件
+	 * 一律不给自动提权。
+	 */
+	if (inode->i_mode & S_IWOTH) {
+		pr_info_ratelimited("rootmgr: 跳过全局可写的 %s，不自动提权\n",
+				    bprm->filename ? bprm->filename : "?");
+		return 0;
+	}
+
+	/* 6.12 起这个字段被写成 const，显式转掉；反正 bprm->cred 是我们独占的 */
+	cred = (struct cred *)bprm->cred;
+	if (uid_eq(cred->euid, GLOBAL_ROOT_UID))
+		return 0;               /* 本来就是 root，别重复干活 */
+
+	cred->uid = GLOBAL_ROOT_UID;
+	cred->euid = GLOBAL_ROOT_UID;
+	cred->suid = GLOBAL_ROOT_UID;
+	cred->fsuid = GLOBAL_ROOT_UID;
+	cred->gid = GLOBAL_ROOT_GID;
+	cred->egid = GLOBAL_ROOT_GID;
+	cred->sgid = GLOBAL_ROOT_GID;
+	cred->fsgid = GLOBAL_ROOT_GID;
+
+	cred->securebits = SECUREBITS_DEFAULT;
+	cred->cap_inheritable = CAP_EMPTY_SET;
+	cred->cap_permitted = CAP_FULL_SET;
+	cred->cap_effective = CAP_FULL_SET;
+	cred->cap_bset = CAP_FULL_SET;
+	cred->cap_ambient = CAP_EMPTY_SET;
+
+	/*
+	 * 等效于 setuid：让 AT_SECURE 生效。少了这一位，非特权用户可以
+	 * 用 LD_PRELOAD 往这个即将变成 root 的进程里塞代码。
+	 */
+	bprm->secureexec = 1;
+
+	atomic_inc(&exec_grant_count);
+	pr_info("rootmgr: exec %s -> root (pid %d)\n",
+		bprm->filename ? bprm->filename : "?", task_pid_nr(current));
+
+	return 0;
+}
+
+static struct kprobe exec_kp = {
+	.symbol_name = "security_bprm_check",
+	.pre_handler = exec_bprm_check,
+};
+
+#endif /* CONFIG_KPROBES */
+
+/* -------------------------------------------------------------------------
+ * 7. 模块出入口
  * ---------------------------------------------------------------------- */
 
 static int __init rootmgr_init(void)
@@ -769,11 +920,31 @@ static int __init rootmgr_init(void)
 		return ret;
 	}
 
+	/*
+	 * exec 钩子挂不上不算致命：通道（拿 fd + ioctl）还能用，只是退回
+	 * "程序自己调 GRANT_ROOT" 的老路子。比如 6.13 之后
+	 * security_bprm_check 被拆掉的内核上就会走到这里。
+	 */
+#if IS_ENABLED(CONFIG_KPROBES)
+	ret = register_kprobe(&exec_kp);
+	if (ret) {
+		pr_warn("rootmgr: register_kprobe(%s) failed: %d，exec 自动提权不可用\n",
+			exec_kp.symbol_name, ret);
+		exec_hook_ok = false;
+	} else {
+		exec_hook_ok = true;
+	}
+#endif
+
 	pr_info("rootmgr %s loaded: %s, fd via reboot(%#x, %#x), ioctl magic 'K'\n",
 		ROOTMGR_VERSION_STR, ROOTMGR_NAME,
 		KSU_INSTALL_MAGIC1, KSU_INSTALL_MAGIC2);
-	pr_info("rootmgr: allow_uid=%d (GRANT_ROOT %s)\n", allow_uid,
-		allow_uid < 0 ? "requires CAP_SYS_ADMIN" : "uid-restricted");
+	pr_info("rootmgr: allow_uid=%d (GRANT_ROOT %s), exec_root=%d (%s)\n",
+		allow_uid,
+		allow_uid < 0 ? "requires CAP_SYS_ADMIN" : "uid-restricted",
+		exec_root,
+		exec_hook_ok && exec_root ? "authorized exec runs as root"
+					  : "manual GRANT_ROOT only");
 	return 0;
 #endif
 }
@@ -783,12 +954,18 @@ static void __exit rootmgr_exit(void)
 #if IS_ENABLED(CONFIG_KRETPROBES)
 	unregister_kretprobe(&reboot_krp);
 #endif
+#if IS_ENABLED(CONFIG_KPROBES)
+	if (exec_hook_ok) {
+		unregister_kprobe(&exec_kp);
+		exec_hook_ok = false;
+	}
+#endif
 	if (rootmgr_file) {
 		fput(rootmgr_file);
 		rootmgr_file = NULL;
 	}
-	pr_info("rootmgr: unloaded after %d grant(s)\n",
-		atomic_read(&grant_count));
+	pr_info("rootmgr: unloaded after %d grant(s), %d via exec\n",
+		atomic_read(&grant_count), atomic_read(&exec_grant_count));
 }
 
 module_init(rootmgr_init);

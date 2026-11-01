@@ -74,6 +74,7 @@ struct ksu_app_entry {
 
 #define KSU_FLAG_ROOT    (1u << 0)
 #define KSU_FLAG_MANAGER (1u << 1)
+#define KSU_FLAG_AUTOEXEC (1u << 2)  /* 模块挂了 exec 钩子，授权程序执行即 root */
 
 /* 带授权表接口（SET/GET/CLEAR_APP_PROFILE）的最低版本：2.3.0 */
 #define KSU_MIN_VERSION 23000

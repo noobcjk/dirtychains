@@ -8,6 +8,9 @@
  * 超级用户页是一张授权表（仿 KernelSU）：
  *   - 默认是空的，程序在终端里执行时会被登记成「待授权」；
  *   - 点一行展开，里面是 root / 禁止 两个选项；
+ *   - 选 root 后内核 exec 钩子生效：该程序每次被 exec 时，新进程的
+ *     cred 直接就是 root（等效给文件加了个 setuid 位），不需要程序自己
+ *     再要一次权限；
  *   - 记录存在 /var/lib/rootmgr/policy.tsv（非 root 时放用户配置目录），
  *     重启后状态还在；右键可以移除一条记录。
  *
@@ -35,7 +38,7 @@
 #include "tools/kmod/rootmgr_fd.h"
 
 #define APP_TITLE   "RootMgr"
-#define MGR_VERSION "1.4"
+#define MGR_VERSION "1.5"
 
 /* 图标种类：全部用 cairo 画，不依赖图标字体 / 主题 */
 typedef enum {
@@ -93,10 +96,12 @@ typedef struct {
     GtkWidget *val_knl;
     GtkWidget *val_kmgr;
     GtkWidget *val_kcnt;
+    GtkWidget *val_kexec;
     GtkWidget *btn_escalate;
 
     /* 内核通道状态 */
     gboolean knl_ok;            /* 模块在、版本对得上 */
+    gboolean knl_autoexec;      /* exec 钩子挂上了（授权程序执行即 root） */
     gboolean knl_manager;       /* 有权限写授权表 */
     guint32  knl_ver;
     guint    knl_synced;        /* 上次成功灌进内核的条数 */
@@ -682,6 +687,7 @@ static void knl_sync(App *a)
 
     a->knl_ok = FALSE;
     a->knl_manager = FALSE;
+    a->knl_autoexec = FALSE;
     a->knl_ver = 0;
     a->knl_synced = 0;
     a->knl_miss = 0;
@@ -697,8 +703,10 @@ static void knl_sync(App *a)
     {
         struct ksu_get_info_cmd info;
 
-        if (rootmgr_get_info(&info) == 0)
+        if (rootmgr_get_info(&info) == 0) {
             a->knl_manager = !!(info.flags & KSU_FLAG_MANAGER);
+            a->knl_autoexec = !!(info.flags & KSU_FLAG_AUTOEXEC);
+        }
     }
 
     if (!a->knl_manager) {              /* 通道只读，写也写不进去 */
@@ -1644,7 +1652,8 @@ static GtkWidget *build_super(App *a)
     gtk_box_pack_start(GTK_BOX(box), card, TRUE, TRUE, 0);
 
     {
-        GtkWidget *hint = gtk_label_new("点一行展开，选 root 或禁止；右键可以移除记录。");
+        GtkWidget *hint = gtk_label_new("点一行展开，选 root 或禁止；"
+                                        "选 root 后该程序每次执行都直接拿到 root，右键可移除。");
         gtk_widget_set_name(hint, "cardvalue");
         gtk_widget_set_halign(hint, GTK_ALIGN_START);
         gtk_widget_set_margin_start(hint, 14);
@@ -1783,6 +1792,7 @@ static void refresh_settings(App *a)
                            "未连接（rootmgr.ko 还没加载）");
         gtk_label_set_text(GTK_LABEL(a->val_kmgr), "—");
         gtk_label_set_text(GTK_LABEL(a->val_kcnt), "—");
+        gtk_label_set_text(GTK_LABEL(a->val_kexec), "—");
     } else {
         g_snprintf(buf, sizeof(buf), "已连接　rootmgr %u.%u.%u",
                    a->knl_ver / 10000, a->knl_ver / 100 % 100,
@@ -1800,6 +1810,11 @@ static void refresh_settings(App *a)
         else
             g_snprintf(buf, sizeof(buf), "%u 条生效", a->knl_synced);
         gtk_label_set_text(GTK_LABEL(a->val_kcnt), buf);
+
+        gtk_label_set_text(GTK_LABEL(a->val_kexec),
+                           a->knl_autoexec
+                               ? "已启用（授权程序执行即 root）"
+                               : "未启用（只能手动提权）");
     }
 
     if (a->btn_escalate) {
@@ -1857,6 +1872,9 @@ static GtkWidget *build_settings(App *a)
     add_divider(card_knl);
     gtk_box_pack_start(GTK_BOX(card_knl),
                        info_row(IC_FILTER, "内核授权条目", &a->val_kcnt), FALSE, FALSE, 0);
+    add_divider(card_knl);
+    gtk_box_pack_start(GTK_BOX(card_knl),
+                       info_row(IC_CHIP, "exec 自动提权", &a->val_kexec), FALSE, FALSE, 0);
 
     {
         GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
@@ -1884,7 +1902,8 @@ static GtkWidget *build_settings(App *a)
     }
 
     hint = gtk_label_new("RootMgr " MGR_VERSION
-                         "　授权表由内核按 exe 的 inode 判定，模块重装后会由本程序自动重灌。");
+                         "　授权表按 exe 的 inode 存内核，模块重装后自动重灌；"
+                         "被授权为 root 的程序执行时由 exec 钩子直接变成 root。");
     gtk_widget_set_name(hint, "cardvalue");
     gtk_widget_set_halign(hint, GTK_ALIGN_START);
     gtk_widget_set_margin_start(hint, 18);

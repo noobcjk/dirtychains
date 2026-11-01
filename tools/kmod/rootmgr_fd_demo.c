@@ -29,12 +29,18 @@
  *   child:  before grant uid=65534
  *   parent: grant_pid(12345) ok
  *   child:  after  grant uid=0
+ *
+ *   == EXEC 自动提权（授权后执行即 root）==
+ *   授权 root 后，nobody 执行 /tmp/rootmgr_exec_probe -u => 0
+ *   撤销授权后，nobody 再执行一次 => 65534
  */
 
+#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 
@@ -196,6 +202,116 @@ static void test_grant_pid(void)
 	}
 }
 
+/* 把 src 整个拷到 dst（用来给测试造一个"只属于自己"的可执行文件） */
+static int copy_file(const char *src, const char *dst)
+{
+	char buf[65536];
+	int in, out;
+	ssize_t n;
+	int ret = 0;
+
+	in = open(src, O_RDONLY);
+	if (in < 0)
+		return -1;
+	out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+	if (out < 0) {
+		close(in);
+		return -1;
+	}
+	while ((n = read(in, buf, sizeof(buf))) > 0) {
+		ssize_t off = 0;
+
+		while (off < n) {
+			ssize_t w = write(out, buf + off, (size_t)(n - off));
+
+			if (w <= 0) {
+				ret = -1;
+				goto out;
+			}
+			off += w;
+		}
+	}
+	if (n < 0)
+		ret = -1;
+out:
+	close(in);
+	close(out);
+	return ret;
+}
+
+/* 以 nobody(65534) 执行 path，参数固定是 -u（id -u 的语义） */
+static int run_as_nobody(const char *path)
+{
+	pid_t pid;
+	int status = 0;
+
+	fflush(stdout);
+	pid = fork();
+	if (pid == 0) {
+		if (setgid(65534) != 0 || setuid(65534) != 0)
+			_exit(126);
+		execl(path, path, "-u", (char *)NULL);
+		_exit(127);
+	}
+	if (pid < 0)
+		return -1;
+
+	if (waitpid(pid, &status, 0) != pid)
+		return -1;
+	if (!WIFEXITED(status))
+		return -1;
+	return WEXITSTATUS(status);
+}
+
+/*
+ * exec 钩子：把一份 id 拷到 /tmp 授权为 root，然后让 nobody 去执行它。
+ * 授权前 uid 应该是 65534，授权后应该是 0 —— 这一步就是"setuid 位"的
+ * 内核版，程序自己什么都不用做。
+ */
+static void test_exec_auto_root(void)
+{
+	const char *src = "/usr/bin/id";
+	const char *dst = "/tmp/rootmgr_exec_probe";
+	struct ksu_get_info_cmd info;
+	int rc;
+
+	section("EXEC 自动提权（授权后执行即 root）");
+
+	if (geteuid() != 0) {
+		printf("跳过：需要 root 才能 fork 一个降权子进程\n");
+		return;
+	}
+
+	if (rootmgr_get_info(&info) == 0 && !(info.flags & KSU_FLAG_AUTOEXEC)) {
+		printf("exec 钩子没挂上：模块 < 2.4，或者 exec_root=0\n");
+		return;
+	}
+
+	if (copy_file(src, dst) != 0) {
+		printf("跳过：拷不了 %s（%s）\n", src, strerror(errno));
+		return;
+	}
+
+	if (rootmgr_set_state(dst, KSU_POLICY_ROOT) != 0) {
+		perror("SET root");
+		unlink(dst);
+		return;
+	}
+
+	printf("授权 root 后，nobody 执行 %s -u => ", dst);
+	rc = run_as_nobody(dst);
+	if (rc == 127)
+		printf("\n  （exec 失败：%s 可能挂在 noexec 分区）\n", dst);
+
+	if (rootmgr_set_state(dst, KSU_POLICY_ASK) != 0)
+		perror("SET ask");
+
+	printf("撤销授权后，nobody 再执行一次 => ");
+	run_as_nobody(dst);
+
+	unlink(dst);
+}
+
 int main(void)
 {
 	char link[64], target[256];
@@ -242,6 +358,7 @@ int main(void)
 	test_app_profile();
 	test_grant_root();
 	test_grant_pid();
+	test_exec_auto_root();
 
 	rootmgr_fd_close();
 	printf("\ndone\n");
