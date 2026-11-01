@@ -9,7 +9,6 @@
 /poc
 /ovswrap
 /rootmgr-gui
-/ghostlock
 /tools/kmod/rootmgr_fd_demo
 *.cmd
 .gccver-gui

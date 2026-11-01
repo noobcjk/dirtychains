@@ -2,8 +2,7 @@
 
 !此项目由AI编写!
 
-九条页缓存写原语 / 本地提权链的合集，带一个 GTK3 图形前端和五个内置引擎；
-另附一个独立的 GhostLock（CVE-2026-43499）验证程序。
+九条 CVE 链的页缓存写原语 / 本地提权 PoC 合集，带一个 GTK3 图形前端和五个内置引擎。
 
 > **免责声明**
 > 本项目仅用于**自有设备**或**已获得书面授权的渗透测试**。
@@ -18,7 +17,6 @@
 |---|---|
 | `dirtyfrag-gui.c` | **单文件主程序**：GTK3 前端 + 内置 Fragnesia / DirtyClone / DirtyDecrypt / OVS 四个引擎（原 `ovswrap.c` 已并入） |
 | `dirtyfrag_lpe.c` | 五链引擎实现，也可单独编成命令行 `poc` |
-| `cve-2026-43499.c` | GhostLock 独立验证程序（futex PI 栈 UAF），编出 `ghostlock`，不进 GUI |
 
 
 内置的漏洞链：
@@ -101,41 +99,6 @@ rxgk 在收包时把 splice 进 socket 的"载荷"——实际是目标文件的
 退出码和主引擎一致：`0` = 写成功、`1` = 没打成、`2` = 目标不合法、
 `4` = 前置条件不满足（userns 被禁 / 无 AF_RXRPC / 无 rxgk / 目标可写）。
 
-### CVE-2026-43499（GhostLock）—— 不进 GUI 的独立程序
-
-前面那些链多少都要点东西：非特权 userns、XFRM、AF_RXRPC + rxgk、openvswitch、
-io_uring 的某个新 opcode…… 任何一项被模块黑名单、sysctl、apparmor 或内核编译
-选项挡住，整条链就废了。GhostLock 是唯一一条不吃这些的：
-
-| 维度 | GhostLock |
-|---|---|
-| 位置 | `kernel/locking/rtmutex.c` 的 `remove_waiter()` |
-| 依赖 | 只要 `CONFIG_FUTEX_PI`——主流发行版都是 **built-in**，不是模块 |
-| 不需要 | userns / CAP_SYS_ADMIN / setuid 靶子 / 任何 `.ko` / 写文件 |
-| 现状 | 能**确认 UAF 真实存在**；完整提权链 `-start` 未实现，返回 `3` |
-
-所以它没进 `dirtychains` 的九链界面，单独编、单独跑：
-
-```bash
-make ghostlock
-
-./ghostlock -check            # 内核版本区间、FUTEX_PI、panic_on_oops、CPU 数
-./ghostlock -trigger -n 5     # 只触发 PI 死锁回滚，验证序列可达（安全、可重复）
-./ghostlock -dangle           # 把悬空指针解引用掉 → 内核 oops（-probe 同义）
-./ghostlock -dangle -force    # panic_on_oops=1 时必须显式确认
-./ghostlock -dangle -tag      # 三种灌栈原语各用不同标记，从 CR2 反推命中源
-```
-
-- `-trigger` 打补丁的内核同样返回 `EDEADLK`，所以它只证明"序列可达"，不等于"有漏洞"。
-- `-dangle` 才是判定：waiter 超时返回后 `pi_blocked_on` 已悬空，往那块失效的内核栈
-  灌 `0x41` 再抢一把锁，漏洞内核读 `waiter->lock` 时必然 `#GP`；已修复的内核
-  `pi_blocked_on` 是 `NULL`，函数在 `if (!waiter)` 就返回，主线程只是正常睡在锁上。
-- 判定看 `dmesg`：`RIP: rt_mutex_adjust_prio_chain+0x...`，
-  栈 `task_blocks_on_rt_mutex → rt_mutex_slowlock → futex_lock_pi`，fault 地址形如
-  `0x4141414141414141`。
-- **风险**：`-dangle` 在有漏洞的内核上必然 oops；`panic_on_oops=1` 时整机重启。
-  程序会检查该 sysctl，为 1 时必须 `-force`，交互终端上还有 5 秒倒计时（`-y` 跳过）。
-
 ---
 
 ## 构建
@@ -147,7 +110,6 @@ sudo apt install build-essential libgtk-3-dev pkg-config
 make                 # GUI 单二进制 dirtychains（前端 + 五链引擎 + Fragnesia + DirtyClone + DirtyDecrypt + OVS 引擎）
 make poc             # 独立的命令行引擎
 make ovswrap         # 独立的 OVS 命令行版（不含 GTK）
-make ghostlock       # 独立的 CVE-2026-43499 验证程序（零依赖，只用 futex PI）
 sudo make install    # 装到 /usr/local/bin，背景图与 offset/ 进 share/dirtychains
 ```
 
@@ -184,12 +146,12 @@ git push origin v1.6
 
 | 包 | 架构 | 交叉编译器 | 内容 |
 |---|---|---|---|
-| `dirtychains-<ver>-x86_64.tar.gz` | x86_64 | `gcc` | `dirtychains` + `poc` + `ovswrap` + `ghostlock` |
-| `dirtychains-<ver>-x86.tar.gz` | i686 | `gcc-i686-linux-gnu` | `poc` + `ovswrap` + `ghostlock` |
-| `dirtychains-<ver>-aarch64.tar.gz` | ARM64 | `gcc-aarch64-linux-gnu` | `poc` + `ovswrap` + `ghostlock` |
-| `dirtychains-<ver>-armhf.tar.gz` | ARMv7 硬浮点 | `gcc-arm-linux-gnueabihf` | `poc` + `ovswrap` + `ghostlock` |
+| `dirtychains-<ver>-x86_64.tar.gz` | x86_64 | `gcc` | `dirtychains` + `poc` + `ovswrap` |
+| `dirtychains-<ver>-x86.tar.gz` | i686 | `gcc-i686-linux-gnu` | `poc` + `ovswrap` |
+| `dirtychains-<ver>-aarch64.tar.gz` | ARM64 | `gcc-aarch64-linux-gnu` | `poc` + `ovswrap` |
+| `dirtychains-<ver>-armhf.tar.gz` | ARMv7 硬浮点 | `gcc-arm-linux-gnueabihf` | `poc` + `ovswrap` |
 
-- `poc` / `ovswrap` / `ghostlock` 用 `-static -no-pie` 静态链接，目标机不需要对应版本的 glibc，老内核也能加载
+- `poc` / `ovswrap` 用 `-static -no-pie` 静态链接，目标机不需要对应版本的 glibc，老内核也能加载
 - `dirtychains` 必须动态链 GTK3，交叉编译要拉整条 arm64 桌面栈，所以只在 x86_64 包里提供
   - 它是在 `ubuntu:20.04` 容器里编的，实测最低只要 **glibc 2.28 / GTK 3.24**：
     Debian 10、Ubuntu 18.10+、UOS 20、CentOS 8 都够用；22.04/24.04 上照常运行
@@ -331,7 +293,6 @@ python3 tools/mk_offset.py rec.json --root offset    # 直接写成 offset/<N>�
 .
 ├── dirtyfrag-gui.c          单文件主程序：GTK3 前端 + OVS 引擎 → 编出 dirtychains
 ├── dirtyfrag_lpe.c          五链引擎（亦可单独编 poc）
-├── cve-2026-43499.c         GhostLock：futex PI 栈 UAF 验证程序 → 编出 ghostlock
 ├── offset/                  内核偏移配置表（740 个 release）
 ├── krec-808.json            历史内嵌表的完整导出（808 条，可选，用于重建 offset/）
 ├── tools/
