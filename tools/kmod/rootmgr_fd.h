@@ -48,6 +48,7 @@
 #define KSU_NR_GRANT_PID    4
 #define KSU_NR_SET_APP_PROFILE 5
 #define KSU_NR_GET_APP_PROFILE 6
+#define KSU_NR_CLEAR_APP_PROFILE 7
 
 struct ksu_get_info_cmd {
 	uint32_t version;      /* 22000 => 2.2.0 */
@@ -74,6 +75,9 @@ struct ksu_app_entry {
 #define KSU_FLAG_ROOT    (1u << 0)
 #define KSU_FLAG_MANAGER (1u << 1)
 
+/* 带授权表接口（SET/GET/CLEAR_APP_PROFILE）的最低版本：2.3.0 */
+#define KSU_MIN_VERSION 23000
+
 #define KSU_IOCTL_PING        _IOC(_IOC_NONE, KSU_IOCTL_MAGIC, KSU_NR_PING, 0)
 #define KSU_IOCTL_GRANT_ROOT  _IOC(_IOC_NONE, KSU_IOCTL_MAGIC, KSU_NR_GRANT_ROOT, 0)
 #define KSU_IOCTL_GET_INFO    _IOC(_IOC_READ, KSU_IOCTL_MAGIC, KSU_NR_GET_INFO, \
@@ -88,6 +92,8 @@ struct ksu_app_entry {
 #define KSU_IOCTL_GET_APP_PROFILE _IOC(_IOC_READ | _IOC_WRITE, KSU_IOCTL_MAGIC, \
 				       KSU_NR_GET_APP_PROFILE, \
 				       sizeof(struct ksu_app_entry))
+#define KSU_IOCTL_CLEAR_APP_PROFILE _IOC(_IOC_NONE, KSU_IOCTL_MAGIC, \
+					 KSU_NR_CLEAR_APP_PROFILE, 0)
 
 /* 进程内的唯一缓存 */
 static int g_rootmgr_fd = -1;
@@ -200,6 +206,38 @@ static inline int rootmgr_set_state(const char *path, int state)
 static inline int rootmgr_get_app(struct ksu_app_entry *e)
 {
 	return rootmgr_call(KSU_IOCTL_GET_APP_PROFILE, e);
+}
+
+/* 清空内核里的整张授权表（全量同步前先清） */
+static inline int rootmgr_clear_app(void)
+{
+	return rootmgr_call(KSU_IOCTL_CLEAR_APP_PROFILE, NULL);
+}
+
+/* -------------------------------------------------------------------------
+ * 打开 / 关闭通道
+ * ---------------------------------------------------------------------- */
+
+/*
+ * rootmgr_open()：模块在不在。
+ *   返回 0 表示通道可用，-1 表示没装上（errno 保留原因）。
+ *   内部会顺带确认一次版本号，防止接上的是别的驱动。
+ */
+static inline int rootmgr_open(uint32_t *version)
+{
+	uint32_t v = 0;
+
+	if (rootmgr_fd() < 0)
+		return -1;
+	if (rootmgr_get_version(&v) != 0)
+		return -1;
+	if (v < KSU_MIN_VERSION) {      /* 老模块没有授权表接口 */
+		errno = ENOTSUP;
+		return -1;
+	}
+	if (version)
+		*version = v;
+	return 0;
 }
 
 #endif /* ROOTMGR_FD_H */

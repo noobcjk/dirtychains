@@ -32,8 +32,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "tools/kmod/rootmgr_fd.h"
+
 #define APP_TITLE   "RootMgr"
-#define MGR_VERSION "1.3"
+#define MGR_VERSION "1.4"
 
 /* 图标种类：全部用 cairo 画，不依赖图标字体 / 主题 */
 typedef enum {
@@ -87,11 +89,31 @@ typedef struct {
     GtkWidget *prompt;
     GPid run_pid;
 
+    /* 设置页：内核通道 */
+    GtkWidget *val_knl;
+    GtkWidget *val_kmgr;
+    GtkWidget *val_kcnt;
+    GtkWidget *btn_escalate;
+
+    /* 内核通道状态 */
+    gboolean knl_ok;            /* 模块在、版本对得上 */
+    gboolean knl_manager;       /* 有权限写授权表 */
+    guint32  knl_ver;
+    guint    knl_synced;        /* 上次成功灌进内核的条数 */
+    guint    knl_miss;          /* 路径已失效、没能灌进去的条数 */
+
+    char *policy_path;          /* 启动时定死，提权后也不换文件 */
+
     /* 底部切换栏 */
     GtkWidget *tab_ico[TAB_COUNT];
     GtkWidget *tab_lbl[TAB_COUNT];
     int        cur;
 } App;
+
+/* 定义在后面，先声明 */
+static void term_append(App *a, const char *text, const char *tag);
+static void refresh_settings(App *a);
+static void knl_sync(App *a);
 
 /* --------------------------------------------------------------------------
  * 小工具
@@ -548,11 +570,19 @@ static GdkPixbuf *prog_icon(const char *path, const char *name)
 }
 
 /* 授权记录文件：root 时放 /var/lib/rootmgr，否则放用户配置目录 */
-static char *policy_file(void)
+static char *policy_default_path(void)
 {
     if (geteuid() == 0)
         return g_strdup("/var/lib/rootmgr/policy.tsv");
     return g_build_filename(g_get_user_config_dir(), "rootmgr", "policy.tsv", NULL);
+}
+
+/* 路径在启动时定死：本程序可能中途 grant_root 提权，不能让文件位置跟着变 */
+static char *policy_file(App *a)
+{
+    if (a->policy_path)
+        return g_strdup(a->policy_path);
+    return policy_default_path();
 }
 
 static int policy_get(App *a, const char *path)
@@ -564,7 +594,7 @@ static int policy_get(App *a, const char *path)
 
 static void policy_load(App *a)
 {
-    char *pf = policy_file();
+    char *pf = policy_file(a);
     char *dir = g_path_get_dirname(pf);
     char *data = NULL;
 
@@ -604,7 +634,7 @@ static void policy_load(App *a)
 
 static void policy_save(App *a)
 {
-    char *pf = policy_file();
+    char *pf = policy_file(a);
     char *dir = g_path_get_dirname(pf);
     GString *out;
     GHashTableIter it;
@@ -628,6 +658,82 @@ static void policy_save(App *a)
     g_string_free(out, TRUE);
     g_free(dir);
     g_free(pf);
+
+    knl_sync(a);
+}
+
+/* --------------------------------------------------------------------------
+ * 内核通道：把本地授权表全量灌进 rootmgr.ko
+ * ----------------------------------------------------------------------- */
+
+/*
+ * 每次变更都全量同步：先 CLEAR 清空内核表，再按 policy 一条条 SET。
+ * 条数上限 256，一次点击最多两百多个 ioctl，没有性能问题，也省得算差异。
+ *
+ * 路径已经不存在（程序被删了）就跳过 —— 内核里绑的是 inode，文件没了
+ * 这条授权也就没有意义了。
+ */
+static void knl_sync(App *a)
+{
+    GHashTableIter it;
+    gpointer k, v;
+    guint n = 0, miss = 0;
+    guint32 ver = 0;
+
+    a->knl_ok = FALSE;
+    a->knl_manager = FALSE;
+    a->knl_ver = 0;
+    a->knl_synced = 0;
+    a->knl_miss = 0;
+
+    if (rootmgr_open(&ver) != 0) {
+        refresh_settings(a);
+        return;                         /* 模块没装，或者版本太老 */
+    }
+
+    a->knl_ok = TRUE;
+    a->knl_ver = ver;
+
+    {
+        struct ksu_get_info_cmd info;
+
+        if (rootmgr_get_info(&info) == 0)
+            a->knl_manager = !!(info.flags & KSU_FLAG_MANAGER);
+    }
+
+    if (!a->knl_manager) {              /* 通道只读，写也写不进去 */
+        refresh_settings(a);
+        return;
+    }
+
+    if (rootmgr_clear_app() != 0) {
+        refresh_settings(a);
+        return;
+    }
+
+    if (a->policy) {
+        g_hash_table_iter_init(&it, a->policy);
+        while (g_hash_table_iter_next(&it, &k, &v)) {
+            struct ksu_app_entry e;
+            int st = GPOINTER_TO_INT(v);
+
+            if (st != ST_ROOT && st != ST_DENY)
+                continue;               /* 待授权的不进内核 */
+            if (rootmgr_app_id((const char *)k, &e) != 0) {
+                miss++;
+                continue;
+            }
+            e.state = (st == ST_ROOT) ? KSU_POLICY_ROOT : KSU_POLICY_DENY;
+            if (rootmgr_set_app(&e) == 0)
+                n++;
+            else
+                miss++;
+        }
+    }
+    a->knl_synced = n;
+    a->knl_miss = miss;
+
+    refresh_settings(a);
 }
 
 /* 从一条命令行里取出真正要执行的程序全路径，取不到返回 NULL */
@@ -1211,6 +1317,8 @@ static void switch_page(App *a, int idx)
         refresh_super(a);
     if (idx == 2 && a->entry)
         gtk_widget_grab_focus(a->entry);
+    if (idx == 3)
+        refresh_settings(a);
 }
 
 static void on_tab(GtkWidget *w, GdkEventButton *ev, gpointer data)
@@ -1640,15 +1748,75 @@ static GtkWidget *build_term(App *a)
     return box;
 }
 
-/* 设置页：运行身份 + 说明 */
+/* 设置页：运行身份 + 内核通道 + 说明 */
+static void on_escalate(GtkWidget *w, gpointer data)
+{
+    App *a = data;
+    char msg[192];
+
+    (void)w;
+
+    if (rootmgr_grant_root() != 0) {
+        g_snprintf(msg, sizeof(msg), "提权失败：%s\n", g_strerror(errno));
+        term_append(a, msg, "err");
+        return;
+    }
+
+    g_snprintf(msg, sizeof(msg),
+               "已提权到 root（euid=%u），之后的命令直接以 root 执行。\n",
+               (unsigned)geteuid());
+    term_append(a, msg, "dim");
+
+    refresh_home(a);
+    refresh_settings(a);
+}
+
+static void refresh_settings(App *a)
+{
+    char buf[192];
+
+    if (!a->val_knl)
+        return;
+
+    if (!a->knl_ok) {
+        gtk_label_set_text(GTK_LABEL(a->val_knl),
+                           "未连接（rootmgr.ko 还没加载）");
+        gtk_label_set_text(GTK_LABEL(a->val_kmgr), "—");
+        gtk_label_set_text(GTK_LABEL(a->val_kcnt), "—");
+    } else {
+        g_snprintf(buf, sizeof(buf), "已连接　rootmgr %u.%u.%u",
+                   a->knl_ver / 10000, a->knl_ver / 100 % 100,
+                   a->knl_ver % 100);
+        gtk_label_set_text(GTK_LABEL(a->val_knl), buf);
+
+        gtk_label_set_text(GTK_LABEL(a->val_kmgr),
+                           a->knl_manager
+                               ? "可写（manager）"
+                               : "只读（不是 manager，请以 root 启动）");
+
+        if (a->knl_miss)
+            g_snprintf(buf, sizeof(buf), "%u 条生效，%u 条路径已失效",
+                       a->knl_synced, a->knl_miss);
+        else
+            g_snprintf(buf, sizeof(buf), "%u 条生效", a->knl_synced);
+        gtk_label_set_text(GTK_LABEL(a->val_kcnt), buf);
+    }
+
+    if (a->btn_escalate) {
+        gboolean can = a->knl_ok && a->knl_manager && !is_root();
+
+        gtk_widget_set_visible(a->btn_escalate, can);
+        gtk_widget_set_sensitive(a->btn_escalate, can);
+    }
+}
+
 static GtkWidget *build_settings(App *a)
 {
     GtkWidget *box;
-
-    (void)a;
-    box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
-    GtkWidget *card_id, *card_about, *cbody, *lbl, *hint;
+    GtkWidget *card_id, *card_knl, *hint;
     GtkWidget *v_uid, *v_euid, *v_sudo, *v_pk;
+
+    box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
 
     gtk_widget_set_margin_start(box, 8);
     gtk_widget_set_margin_end(box, 8);
@@ -1679,42 +1847,51 @@ static GtkWidget *build_settings(App *a)
     gtk_label_set_text(GTK_LABEL(v_pk),
                        have_tool("pkexec") ? "可用（执行时弹密码框）" : "未安装");
 
-    card_about = card_new();
-    cbody = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
-    gtk_widget_set_margin_start(cbody, 22);
-    gtk_widget_set_margin_end(cbody, 22);
-    gtk_widget_set_margin_top(cbody, 18);
-    gtk_widget_set_margin_bottom(cbody, 18);
+    /* 内核通道 */
+    card_knl = card_new();
+    gtk_box_pack_start(GTK_BOX(card_knl),
+                       info_row(IC_SHIELD, "rootmgr.ko", &a->val_knl), FALSE, FALSE, 0);
+    add_divider(card_knl);
+    gtk_box_pack_start(GTK_BOX(card_knl),
+                       info_row(IC_CHECK, "授权表写权限", &a->val_kmgr), FALSE, FALSE, 0);
+    add_divider(card_knl);
+    gtk_box_pack_start(GTK_BOX(card_knl),
+                       info_row(IC_FILTER, "内核授权条目", &a->val_kcnt), FALSE, FALSE, 0);
 
-    lbl = gtk_label_new("关于");
-    gtk_widget_set_name(lbl, "cardtitle");
-    gtk_widget_set_halign(lbl, GTK_ALIGN_START);
+    {
+        GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
 
-    hint = gtk_label_new("RootMgr " MGR_VERSION "　\n"
-                         "「终端」页直接调 /bin/sh -c 执行命令：以 root 运行时就是 "
-                         "root 权限，否则先试 sudo -n，再退到 pkexec。\n"
-                         "想要每次都免密，可以给 sudo 配 NOPASSWD，"
-                         "或者直接用 root 启动本程序。");
-    gtk_widget_set_name(hint, "cardvalue");
-    gtk_widget_set_halign(hint, GTK_ALIGN_START);
-    gtk_label_set_line_wrap(GTK_LABEL(hint), TRUE);
-    gtk_label_set_max_width_chars(GTK_LABEL(hint), 36);
+        gtk_widget_set_margin_start(row, 22);
+        gtk_widget_set_margin_end(row, 22);
+        gtk_widget_set_margin_top(row, 10);
+        gtk_widget_set_margin_bottom(row, 16);
 
-    gtk_box_pack_start(GTK_BOX(cbody), lbl, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(cbody), hint, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(card_about), cbody, FALSE, FALSE, 0);
+        a->btn_escalate = gtk_button_new_with_label("提权本程序到 root");
+        gtk_style_context_add_class(gtk_widget_get_style_context(a->btn_escalate),
+                                    "primary");
+        g_signal_connect(a->btn_escalate, "clicked", G_CALLBACK(on_escalate), a);
+        gtk_box_pack_start(GTK_BOX(row), a->btn_escalate, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(card_knl), row, FALSE, FALSE, 0);
+    }
 
-    /* 横屏：两张卡并排 */
+    /* 横屏：左右两张卡并排，说明压成一行小字放底部，避免撑高窗口 */
     {
         GtkWidget *cols = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
-        GtkWidget *right = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
 
         gtk_box_pack_start(GTK_BOX(cols), card_id, TRUE, TRUE, 0);
-        gtk_box_pack_start(GTK_BOX(cols), right, TRUE, TRUE, 0);
-        gtk_box_pack_start(GTK_BOX(right), card_about, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(cols), card_knl, TRUE, TRUE, 0);
         gtk_box_pack_start(GTK_BOX(box), cols, FALSE, FALSE, 0);
     }
 
+    hint = gtk_label_new("RootMgr " MGR_VERSION
+                         "　授权表由内核按 exe 的 inode 判定，模块重装后会由本程序自动重灌。");
+    gtk_widget_set_name(hint, "cardvalue");
+    gtk_widget_set_halign(hint, GTK_ALIGN_START);
+    gtk_widget_set_margin_start(hint, 18);
+    gtk_widget_set_margin_top(hint, 4);
+    gtk_box_pack_start(GTK_BOX(box), hint, FALSE, FALSE, 0);
+
+    refresh_settings(a);
     return box;
 }
 
@@ -1806,9 +1983,13 @@ int main(int argc, char **argv)
     memset(&a, 0, sizeof(a));
     gtk_init(&argc, &argv);
 
+    /* 授权文件位置在提权之前定死，免得中途换到 /var/lib */
+    a.policy_path = policy_default_path();
+
     build_ui(&a);
 
     policy_load(&a);
+    knl_sync(&a);
     refresh_home(&a);
     refresh_super(&a);
 

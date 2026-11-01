@@ -46,6 +46,7 @@
  *     nr 4  GRANT_PID    给指定 pid 提权（管理器用，arg 指向 __s32）
  *     nr 5  SET_APP_PROFILE  写一条程序授权（ino + dev + state）
  *     nr 6  GET_APP_PROFILE  读调用者自己的授权状态（ino + dev + state）
+ *     nr 7  CLEAR_APP_PROFILE 清空整张表（管理器全量同步用）
  *
  *   分派时只比对 _IOC_TYPE + _IOC_NR，不比对 size 字段 —— 32 位进程走
  *   compat_ioctl 进来时 sizeof(struct) 会变，整串 cmd 就对不上了。
@@ -99,8 +100,8 @@
 #include <linux/version.h>
 #include <linux/ioctl.h>
 
-#define ROOTMGR_VERSION_STR "2.2"
-#define ROOTMGR_VERSION_NUM 22000
+#define ROOTMGR_VERSION_STR "2.3"
+#define ROOTMGR_VERSION_NUM 23000
 #define ROOTMGR_NAME        "[ksu_driver]"
 
 /* 用户态 reboot(2) 用的暗号 */
@@ -120,6 +121,7 @@
 #define KSU_NR_GRANT_PID    4
 #define KSU_NR_SET_APP_PROFILE 5
 #define KSU_NR_GET_APP_PROFILE 6
+#define KSU_NR_CLEAR_APP_PROFILE 7
 
 /* GET_INFO 的载荷。前两个字段和 KernelSU 对齐，后面是自定的扩展。 */
 struct ksu_get_info_cmd {
@@ -167,6 +169,8 @@ struct ksu_app_entry {
 #define KSU_IOCTL_GET_APP_PROFILE _IOC(_IOC_READ | _IOC_WRITE, KSU_IOCTL_MAGIC, \
 				       KSU_NR_GET_APP_PROFILE, \
 				       sizeof(struct ksu_app_entry))
+#define KSU_IOCTL_CLEAR_APP_PROFILE _IOC(_IOC_NONE, KSU_IOCTL_MAGIC, \
+					 KSU_NR_CLEAR_APP_PROFILE, 0)
 
 /* allow_uid：-1 = 只认 CAP_SYS_ADMIN；>=0 = 只认这个 uid */
 static int allow_uid = -1;
@@ -404,6 +408,14 @@ static int app_lookup(u64 ino, u32 dev)
 	return state;
 }
 
+/* 清空整张表。管理器做全量同步时先清后灌，省得算差异。 */
+static void app_clear(void)
+{
+	mutex_lock(&app_lock);
+	app_count = 0;
+	mutex_unlock(&app_lock);
+}
+
 /* 写一条记录；state == ASK 表示删除 */
 static int app_set(const struct ksu_app_entry *e)
 {
@@ -572,6 +584,12 @@ static long rootmgr_ioctl(struct file *filp, unsigned int cmd, unsigned long arg
 			return -EPERM;
 		return app_set(&e);
 	}
+
+	case KSU_NR_CLEAR_APP_PROFILE:
+		if (!is_manager())
+			return -EPERM;
+		app_clear();
+		return 0;
 
 	case KSU_NR_GET_APP_PROFILE: {
 		struct ksu_app_entry e;
