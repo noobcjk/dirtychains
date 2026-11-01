@@ -96,6 +96,10 @@
  *        点 root 之前先想清楚。
  *     2) 只加不减：DENY 表示"不给 root"，不会把父进程已经继承下来的 root
  *        收回去。
+ *     3) 钩子按头文件里的字段偏移去读 struct linux_binprm。如果内核开了
+ *        CONFIG_RANDSTRUCT，这个结构的布局是随机化的，偏移对不上，模块
+ *        里的这段就不能用；主流发行版（Ubuntu/Debian/RHEL）默认都是
+ *        RANDSTRUCT_NONE，不受影响。
  *   整个钩子可以用模块参数 exec_root=0 关掉。
  *
  * 构建 / 使用：
