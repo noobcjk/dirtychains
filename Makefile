@@ -69,6 +69,10 @@ rootmgr-gui: rootmgr-gui.c
 kmod:
 	$(MAKE) -C tools/kmod
 
+# CVE-2026-46300（Fragnesia）PoC，GUI 的「漏洞」页会调它
+fragnesia: tools/lpe/fragnesia.c
+	$(CC) -O2 -Wall -Wextra -o tools/lpe/fragnesia tools/lpe/fragnesia.c
+
 # 内核通信模块 rootmgr.ko（[ksu_driver] 匿名 inode + reboot 暗号换 fd）
 rootmgr-ko:
 	$(MAKE) -C tools/kmod rootmgr
@@ -126,4 +130,4 @@ uninstall:
 clean:
 	rm -f $(TARGET) $(GUI_OBJ) $(ENG_OBJ) $(ENGINE) ovswrap rootmgr-gui
 
-.PHONY: all install uninstall clean poc ovswrap offset-add offset-sync kmod rootmgr-ko rootmgr-gui
+.PHONY: all install uninstall clean poc ovswrap offset-add offset-sync kmod rootmgr-ko rootmgr-gui fragnesia

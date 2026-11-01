@@ -2,8 +2,8 @@
  * rootmgr-gui.c —— root 管理器的图形界面
  *
  * 版式参照 KernelSU（Material 3）：浅灰底、大标题、白色圆角卡片。
- * 窗口默认 960x600 横屏，卡片在宽屏下分左右两列，底部是四格切换栏：
- *   主页 / 超级用户 / 终端 / 设置
+ * 窗口默认 960x600 横屏，卡片在宽屏下分左右两列，底部是五格切换栏：
+ *   主页 / 超级用户 / 终端 / 漏洞 / 设置
  *
  * 超级用户页是一张授权表（仿 KernelSU）：
  *   - 默认是空的，程序在终端里执行时会被登记成「待授权」；
@@ -18,6 +18,13 @@
  *   - 程序本身以 root 运行时，命令就是 root 权限；
  *   - 否则先试 sudo -n（免密），再退到 pkexec（弹密码框）。
  *
+ * 漏洞页跑 CVE-2026-46300（Fragnesia）的 PoC（tools/lpe/fragnesia.c）：
+ *   - 「编译」现场 cc 一份，产物在 tools/lpe/fragnesia；
+ *   - 「运行验证」把目标文件 / 偏移传进去，输出（剥掉 ANSI）落在下面的
+ *     日志里，按 PoC 的退出码给结论：1 有漏洞 / 0 已修复 / 4 前置条件不满足；
+ *   - 子进程带 FRAGNESIA_NO_SHELL=1，否则 PoC 最后会 exec 目标，把整个
+ *     GUI 换成 /bin/sh。
+ *
  * 构建：
  *   make rootmgr-gui
  */
@@ -26,6 +33,7 @@
 #include <cairo.h>
 #include <dirent.h>
 #include <errno.h>
+#include <limits.h>
 #include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,7 +46,7 @@
 #include "tools/kmod/rootmgr_fd.h"
 
 #define APP_TITLE   "RootMgr"
-#define MGR_VERSION "1.5"
+#define MGR_VERSION "1.6"
 
 /* 图标种类：全部用 cairo 画，不依赖图标字体 / 主题 */
 typedef enum {
@@ -48,13 +56,15 @@ typedef enum {
     IC_CHIP,        /* 芯片 */
     IC_SHIELD,      /* 盾牌 */
     IC_FILTER,      /* 三条横线 */
+    IC_BUG,         /* 虫子（漏洞） */
     IC_T_HOME,      /* 底部栏：房子 */
     IC_T_SHIELD,    /* 底部栏：盾牌（超级用户） */
     IC_T_TERM,      /* 底部栏：终端 */
+    IC_T_BUG,       /* 底部栏：虫子（漏洞） */
     IC_T_GEAR       /* 底部栏：齿轮（设置） */
 } IconKind;
 
-#define TAB_COUNT 4
+#define TAB_COUNT 5
 
 /* 超级用户列表：图标 / 程序位置 / 权限设置 / 层级 / 悬浮提示 */
 enum { COL_ICON, COL_PATH, COL_STATE, COL_LEVEL, COL_TIP, COL_N };
@@ -99,6 +109,18 @@ typedef struct {
     GtkWidget *val_kexec;
     GtkWidget *btn_escalate;
 
+    /* 漏洞页：CVE-2026-46300 Fragnesia */
+    GtkWidget *lpe_target;      /* 目标文件输入框 */
+    GtkWidget *lpe_off;         /* 偏移输入框 */
+    GtkWidget *lpe_status;      /* 结果一行 */
+    GtkWidget *lpe_view;
+    GtkWidget *lpe_btn_run;
+    GtkWidget *lpe_btn_build;
+    GtkTextBuffer *lpe_buf;
+    GString  *lpe_pending;      /* 还没凑齐一整行的输出（用来剥 ANSI） */
+    GPid      lpe_pid;
+    int       lpe_mode;         /* 0 空闲 / 1 编译 / 2 运行 */
+
     /* 内核通道状态 */
     gboolean knl_ok;            /* 模块在、版本对得上 */
     gboolean knl_autoexec;      /* exec 钩子挂上了（授权程序执行即 root） */
@@ -118,6 +140,7 @@ typedef struct {
 /* 定义在后面，先声明 */
 static void term_append(App *a, const char *text, const char *tag);
 static void refresh_settings(App *a);
+static void refresh_lpe(App *a);
 static void knl_sync(App *a);
 
 /* --------------------------------------------------------------------------
@@ -416,6 +439,33 @@ static gboolean on_icon_draw(GtkWidget *w, cairo_t *cr, gpointer data)
         cairo_stroke(cr);
         cairo_move_to(cr, 12.6, 15.2);
         cairo_line_to(cr, 17.2, 15.2);
+        cairo_stroke(cr);
+        break;
+
+    case IC_T_BUG:
+    case IC_BUG:
+        /* 身体 + 头 + 两根触角 + 三对腿 */
+        cairo_arc(cr, 12, 13.8, 4.7, 0, 2 * G_PI);
+        cairo_stroke(cr);
+        cairo_arc(cr, 12, 7.4, 2.4, 0, 2 * G_PI);
+        cairo_stroke(cr);
+        cairo_move_to(cr, 10.5, 5.6);
+        cairo_line_to(cr, 9.1, 3.1);
+        cairo_move_to(cr, 13.5, 5.6);
+        cairo_line_to(cr, 14.9, 3.1);
+        cairo_stroke(cr);
+        cairo_move_to(cr, 7.5, 11.2);
+        cairo_line_to(cr, 3.4, 9.3);
+        cairo_move_to(cr, 7.3, 13.8);
+        cairo_line_to(cr, 3.0, 13.8);
+        cairo_move_to(cr, 7.5, 16.4);
+        cairo_line_to(cr, 3.4, 18.3);
+        cairo_move_to(cr, 16.5, 11.2);
+        cairo_line_to(cr, 20.6, 9.3);
+        cairo_move_to(cr, 16.7, 13.8);
+        cairo_line_to(cr, 21.0, 13.8);
+        cairo_move_to(cr, 16.5, 16.4);
+        cairo_line_to(cr, 20.6, 18.3);
         cairo_stroke(cr);
         break;
 
@@ -1292,7 +1342,31 @@ static void on_term_clear(GtkWidget *w, gpointer data)
  * 页面切换
  * ----------------------------------------------------------------------- */
 
-static const char *PAGE_NAMES[TAB_COUNT] = { "home", "super", "term", "set" };
+static const char *PAGE_NAMES[TAB_COUNT] = { "home", "super", "term", "lpe", "set" };
+
+/* 把选区收成光标处的一个点：GtkEntry 一被 grab_focus 就会把整段文本选中，
+   切页时 GTK 又会自动把焦点交给第一个能获焦的控件，于是路径会莫名其妙变成蓝色。 */
+static void entry_drop_selection(GtkWidget *w)
+{
+    int pos;
+
+    if (!w)
+        return;
+    pos = gtk_editable_get_position(GTK_EDITABLE(w));
+    if (pos < 0)
+        pos = 0;
+    gtk_editable_select_region(GTK_EDITABLE(w), pos, pos);
+}
+
+static gboolean reset_entry_selection(gpointer data)
+{
+    App *a = data;
+
+    entry_drop_selection(a->lpe_target);
+    entry_drop_selection(a->lpe_off);
+    entry_drop_selection(a->entry);
+    return G_SOURCE_REMOVE;
+}
 
 static void switch_page(App *a, int idx)
 {
@@ -1326,7 +1400,12 @@ static void switch_page(App *a, int idx)
     if (idx == 2 && a->entry)
         gtk_widget_grab_focus(a->entry);
     if (idx == 3)
+        refresh_lpe(a);
+    if (idx == 4)
         refresh_settings(a);
+
+    /* 切页之后 GTK 可能已经把焦点挪到某个输入框并全选了内容，收一下 */
+    g_idle_add(reset_entry_selection, a);
 }
 
 static void on_tab(GtkWidget *w, GdkEventButton *ev, gpointer data)
@@ -1370,19 +1449,9 @@ static const char *CSS =
     "button:disabled { color: rgba(27,27,27,0.35); background-color: #f0f0f3; }\n"
     "#textbtn { background-color: transparent; padding: 6px 12px;           color: #6f6f6f; font-size: 13px; }\n"
     "#textbtn:hover { background-color: rgba(0,0,0,0.06); }\n"
-    "#logview, #logview text { background-color: #fafafc; color: #3a3a3c; }\n"
-    "#logscroll, #logscroll viewport { background-color: #fafafc; }\n"
-    "#proctree { background-color: #ffffff; -GtkTreeView-vertical-separator: 9; }\n"
-    "#proctree:selected, #proctree:selected:focus { background-color: #e7e7ec; color: #1b1b1b; }\n"
-    "#tabbar { background-color: #ededf1; border-top: 1px solid rgba(0,0,0,0.075); }\n"
-    "#tablbl { color: #8e8e93; font-size: 11.5px; }\n"
-    "#tablbl.on { color: #1b1b1b; font-weight: 600; }\n"
-    "#term, #term text { background-color: #fafafc; color: #1f1f22;\n"
-    "         font-family: \"DejaVu Sans Mono\", \"Noto Sans Mono\", monospace;\n"
-    "         font-size: 12.5px; }\n"
-    "#termscroll, #termscroll viewport { background-color: #fafafc; }\n"
-    "#prompt { color: #1b1b1b; font-family: \"DejaVu Sans Mono\", monospace;\n"
-    "          font-size: 12.5px; font-weight: 600; }\n"
+    "#logview, #logview text { font-family: \"DejaVu Sans Mono\", \"Noto Sans Mono\", monospace;\n"
+    "         font-size: 12px; }\n"
+    "#lpe_status { color: #6f6f6f; font-size: 13px; }\n"
     "#cmdline { font-family: \"DejaVu Sans Mono\", monospace; font-size: 12.5px;\n"
     "           background-color: #f4f4f7; border-radius: 12px; padding: 6px 10px; }\n"
     "button.primary { background-color: #1b1b1b; color: #ffffff; }\n"
@@ -1914,6 +1983,574 @@ static GtkWidget *build_settings(App *a)
     return box;
 }
 
+/* --------------------------------------------------------------------------
+ * 漏洞页：CVE-2026-46300 Fragnesia
+ *
+ * PoC 源码在 tools/lpe/fragnesia.c，这里只做三件事：编译、传参运行、把
+ * 输出读回来。两个环境变量是关键：
+ *   FRAGNESIA_PLAIN=1     不画 hex 动画（文本视图里没法看）
+ *   FRAGNESIA_NO_SHELL=1  最后不要 exec 目标 —— 否则整个 GUI 进程会被
+ *                         换成 /bin/sh，窗口直接消失
+ * ----------------------------------------------------------------------- */
+
+#define LPE_IDLE  0
+#define LPE_BUILD 1
+#define LPE_RUN   2
+
+#define LPE_NONE  0
+#define LPE_GOOD  1
+#define LPE_BAD   2
+
+/* <exe 所在目录>/tools/lpe/<leaf>：仓库里那个 PoC */
+static char *lpe_path(const char *leaf)
+{
+    char exe[PATH_MAX];
+    ssize_t n;
+    char *dir, *path;
+
+    n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n > 0) {
+        exe[n] = '\0';
+        dir = g_path_get_dirname(exe);
+    } else {
+        dir = g_strdup(".");
+    }
+    path = g_build_filename(dir, "tools", "lpe", leaf, NULL);
+    g_free(dir);
+    return path;
+}
+
+/* 日志视图写入（和终端一样的三档样式） */
+static void lpe_log(App *a, const char *text, const char *tag)
+{
+    GtkTextIter end;
+    GtkTextMark *mark;
+
+    if (!a->lpe_buf || !text)
+        return;
+
+    gtk_text_buffer_get_end_iter(a->lpe_buf, &end);
+    if (tag)
+        gtk_text_buffer_insert_with_tags_by_name(a->lpe_buf, &end, text, -1,
+                                                 tag, NULL);
+    else
+        gtk_text_buffer_insert(a->lpe_buf, &end, text, -1);
+
+    gtk_text_buffer_get_end_iter(a->lpe_buf, &end);
+    gtk_text_buffer_place_cursor(a->lpe_buf, &end);
+    mark = gtk_text_buffer_get_insert(a->lpe_buf);
+    gtk_text_view_scroll_mark_onscreen(GTK_TEXT_VIEW(a->lpe_view), mark);
+}
+
+/* 结果一行：颜色靠 markup，省得为一个标签多加一套 CSS 类 */
+static void lpe_set_status(App *a, const char *text, int kind)
+{
+    const char *color = kind == LPE_GOOD ? "#2e7d32" :
+                        kind == LPE_BAD  ? "#c0392b" : "#6f6f6f";
+    char *esc, *markup;
+
+    if (!a->lpe_status)
+        return;
+
+    esc = g_markup_escape_text(text, -1);
+    markup = g_strdup_printf("<span foreground=\"%s\">%s</span>", color, esc);
+    gtk_label_set_markup(GTK_LABEL(a->lpe_status), markup);
+    g_free(markup);
+    g_free(esc);
+}
+
+/*
+ * 剥掉 ANSI 控制序列。PoC 即使关掉 hex 帧，行内还是有颜色码；
+ * 逐行处理可以避免转义序列被 read() 切成两半。
+ */
+static void ansi_strip(const char *in, gsize len, GString *out)
+{
+    const char *p = in, *end = in + len;
+
+    while (p < end) {
+        if ((unsigned char)*p == 0x1b) {
+            p++;
+            if (p < end && *p == '[') {          /* CSI ... 终止字节 @~ */
+                p++;
+                while (p < end && !(*p >= '@' && *p <= '~'))
+                    p++;
+                if (p < end)
+                    p++;
+            } else if (p < end && *p == ']') {   /* OSC ... BEL */
+                p++;
+                while (p < end && *p != '\a')
+                    p++;
+                if (p < end)
+                    p++;
+            } else if (p < end) {
+                p++;
+            }
+            continue;
+        }
+        if (*p == '\r' || *p == '\a') {          /* 覆盖式刷新在视图里没意义 */
+            p++;
+            continue;
+        }
+        g_string_append_c(out, *p++);
+    }
+}
+
+/* 凑满一行就吐出去；force 时把最后半行也吐掉 */
+static void lpe_flush(App *a, gboolean force)
+{
+    char *nl;
+
+    if (!a->lpe_pending)
+        return;
+
+    while ((nl = strchr(a->lpe_pending->str, '\n')) != NULL) {
+        gsize len = (gsize)(nl - a->lpe_pending->str);
+        GString *line = g_string_new(NULL);
+
+        ansi_strip(a->lpe_pending->str, len, line);
+        g_string_append_c(line, '\n');
+        lpe_log(a, line->str, NULL);
+        g_string_free(line, TRUE);
+        g_string_erase(a->lpe_pending, 0, (gssize)len + 1);
+    }
+
+    if (force && a->lpe_pending->len > 0) {
+        GString *line = g_string_new(NULL);
+
+        ansi_strip(a->lpe_pending->str, a->lpe_pending->len, line);
+        lpe_log(a, line->str, NULL);
+        g_string_free(line, TRUE);
+        g_string_truncate(a->lpe_pending, 0);
+    }
+}
+
+static gboolean lpe_pipe_read(GIOChannel *ch, GIOCondition cond, gpointer data)
+{
+    App *a = data;
+    gchar buf[1024];
+    gsize n = 0;
+    GError *err = NULL;
+    GIOStatus st;
+
+    st = g_io_channel_read_chars(ch, buf, sizeof(buf) - 1, &n, &err);
+    if (n > 0) {
+        buf[n] = '\0';
+        if (!a->lpe_pending)
+            a->lpe_pending = g_string_new(NULL);
+        g_string_append_len(a->lpe_pending, buf, (gssize)n);
+        lpe_flush(a, FALSE);
+    }
+    if (err)
+        g_error_free(err);
+
+    if (st == G_IO_STATUS_EOF || st == G_IO_STATUS_ERROR ||
+        ((cond & (G_IO_HUP | G_IO_ERR)) && n == 0)) {
+        g_io_channel_unref(ch);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static void lpe_on_exit(GPid pid, gint status, gpointer data);
+
+/* 起一个子进程，stdout/stderr 都接到漏洞页的日志里 */
+static gboolean lpe_spawn(App *a, char **argv, char **envp, int mode)
+{
+    GPid pid = 0;
+    gint out_fd = -1, err_fd = -1;
+    GError *ge = NULL;
+
+    if (!g_spawn_async_with_pipes(NULL, argv, envp,
+                                  G_SPAWN_SEARCH_PATH | G_SPAWN_DO_NOT_REAP_CHILD,
+                                  NULL, NULL, &pid, NULL, &out_fd, &err_fd, &ge)) {
+        char msg[320];
+
+        g_snprintf(msg, sizeof(msg), "启动失败：%s\n",
+                   ge ? ge->message : "未知错误");
+        lpe_log(a, msg, "err");
+        if (ge)
+            g_error_free(ge);
+        return FALSE;
+    }
+
+    a->lpe_pid = pid;
+    a->lpe_mode = mode;
+
+    if (out_fd >= 0) {
+        GIOChannel *ch = g_io_channel_unix_new(out_fd);
+
+        g_io_channel_set_encoding(ch, NULL, NULL);
+        g_io_add_watch(ch, G_IO_IN | G_IO_HUP | G_IO_ERR, lpe_pipe_read, a);
+    }
+    if (err_fd >= 0) {
+        GIOChannel *ch = g_io_channel_unix_new(err_fd);
+
+        g_io_channel_set_encoding(ch, NULL, NULL);
+        g_io_add_watch(ch, G_IO_IN | G_IO_HUP | G_IO_ERR, lpe_pipe_read, a);
+    }
+
+    g_child_watch_add(pid, lpe_on_exit, a);
+    return TRUE;
+}
+
+static void lpe_busy(App *a, gboolean busy)
+{
+    if (a->lpe_btn_run)
+        gtk_widget_set_sensitive(a->lpe_btn_run, !busy);
+    if (a->lpe_btn_build)
+        gtk_widget_set_sensitive(a->lpe_btn_build, !busy);
+}
+
+static void lpe_on_exit(GPid pid, gint status, gpointer data)
+{
+    App *a = data;
+    int mode = a->lpe_mode;
+    int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    char msg[384];
+
+    g_spawn_close_pid(pid);
+    a->lpe_pid = 0;
+    a->lpe_mode = LPE_IDLE;
+    lpe_flush(a, TRUE);
+    lpe_busy(a, FALSE);
+
+    if (mode == LPE_BUILD) {
+        if (code == 0) {
+            lpe_log(a, "\n[编译完成] tools/lpe/fragnesia\n", "ok");
+            lpe_set_status(a, "编译完成，可以运行验证", LPE_GOOD);
+        } else {
+            lpe_log(a, "\n[编译失败] 看上面的报错\n", "err");
+            lpe_set_status(a, "编译失败", LPE_BAD);
+        }
+        return;
+    }
+
+    if (mode != LPE_RUN)
+        return;
+
+    switch (code) {
+    case 1:
+        g_snprintf(msg, sizeof(msg),
+                   "存在漏洞：目标文件的内容已被改写（exit=1）");
+        lpe_log(a, "\n结论：内核可被非特权用户改写只读文件的 page cache。\n"
+                   "      这只改了内存里的页，重启或 drop_caches 后恢复；"
+                   "目标文件若被替换成 ELF，执行它即以 root 运行。\n", "warn");
+        lpe_set_status(a, msg, LPE_BAD);
+        break;
+    case 0:
+        lpe_log(a, "\n结论：字节没有被改写，内核已修复。\n", "ok");
+        lpe_set_status(a, "已修复：目标字节未被改写（exit=0）", LPE_GOOD);
+        break;
+    case 4:
+        lpe_set_status(a, "被前置条件挡住（exit=4），见日志", LPE_BAD);
+        break;
+    case 2:
+        lpe_set_status(a, "运行失败：参数或环境不对（exit=2）", LPE_BAD);
+        break;
+    default:
+        g_snprintf(msg, sizeof(msg), "异常退出（exit=%d）", code);
+        lpe_set_status(a, msg, LPE_BAD);
+        break;
+    }
+}
+
+static void on_lpe_build(GtkWidget *w, gpointer data)
+{
+    App *a = data;
+    char *bin, *src;
+    char *argv[8];
+    char *shown;
+
+    (void)w;
+
+    if (a->lpe_mode != LPE_IDLE) {
+        lpe_log(a, "上一个任务还没结束\n", "err");
+        return;
+    }
+
+    bin = lpe_path("fragnesia");
+    src = lpe_path("fragnesia.c");
+    if (access(src, R_OK) != 0) {
+        lpe_log(a, "找不到源码：", "err");
+        lpe_log(a, src, "err");
+        lpe_log(a, "\n（这个页面要在仓库目录里用，源码在 tools/lpe/）\n", "err");
+        lpe_set_status(a, "找不到 PoC 源码", LPE_BAD);
+        g_free(bin);
+        g_free(src);
+        return;
+    }
+
+    argv[0] = "cc";
+    argv[1] = "-O2";
+    argv[2] = "-Wall";
+    argv[3] = "-Wextra";
+    argv[4] = "-o";
+    argv[5] = bin;
+    argv[6] = src;
+    argv[7] = NULL;
+
+    shown = g_strdup_printf("$ cc -O2 -Wall -Wextra -o %s %s\n", bin, src);
+    lpe_log(a, shown, "dim");
+    g_free(shown);
+
+    if (lpe_spawn(a, argv, NULL, LPE_BUILD)) {
+        lpe_busy(a, TRUE);
+        lpe_set_status(a, "编译中…", LPE_NONE);
+    }
+    g_free(bin);
+    g_free(src);
+}
+
+static void on_lpe_run(GtkWidget *w, gpointer data)
+{
+    App *a = data;
+    const char *tgt, *off;
+    char *bin;
+    char *argv[4];
+    char **env;
+
+    (void)w;
+
+    if (a->lpe_mode != LPE_IDLE) {
+        lpe_log(a, "上一个任务还没结束\n", "err");
+        return;
+    }
+
+    tgt = gtk_entry_get_text(GTK_ENTRY(a->lpe_target));
+    off = gtk_entry_get_text(GTK_ENTRY(a->lpe_off));
+    if (!tgt || !*tgt) {
+        lpe_set_status(a, "先填目标文件", LPE_BAD);
+        return;
+    }
+
+    bin = lpe_path("fragnesia");
+    if (access(bin, X_OK) != 0) {
+        lpe_log(a, "还没编译：先点「编译」\n", "err");
+        lpe_set_status(a, "未编译", LPE_BAD);
+        g_free(bin);
+        return;
+    }
+
+    lpe_log(a, "\n$ fragnesia ", "dim");
+    lpe_log(a, tgt, "cmd");
+    lpe_log(a, " ", NULL);
+    lpe_log(a, (*off ? off : "0"), "cmd");
+    lpe_log(a, "\n", NULL);
+
+    if (geteuid() == 0)
+        lpe_log(a, "[提示] 当前以 root 运行，PoC 的写权限边界检查会直接失败"
+                   "（exit=4）；要真正验证请用普通用户启动本程序。\n", "warn");
+
+    argv[0] = bin;
+    argv[1] = (char *)tgt;
+    argv[2] = (char *)(*off ? off : "0");
+    argv[3] = NULL;
+
+    env = g_get_environ();
+    env = g_environ_setenv(env, "FRAGNESIA_PLAIN", "1", TRUE);
+    env = g_environ_setenv(env, "FRAGNESIA_NO_SHELL", "1", TRUE);
+
+    if (lpe_spawn(a, argv, env, LPE_RUN)) {
+        lpe_busy(a, TRUE);
+        lpe_set_status(a, "运行中…", LPE_NONE);
+    }
+
+    g_strfreev(env);
+    g_free(bin);
+}
+
+static void refresh_lpe(App *a)
+{
+    char *bin;
+
+    if (!a->lpe_status || a->lpe_mode != LPE_IDLE)
+        return;
+
+    bin = lpe_path("fragnesia");
+    if (access(bin, X_OK) == 0)
+        lpe_set_status(a, "就绪，可运行", LPE_NONE);
+    else
+        lpe_set_status(a, "未编译，先点「编译」", LPE_NONE);
+    g_free(bin);
+}
+
+static GtkWidget *build_lpe(App *a)
+{
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    GtkWidget *card, *card_log, *head, *row, *lbl, *sub, *btn_clear, *scroll, *hint;
+
+    gtk_widget_set_margin_start(box, 8);
+    gtk_widget_set_margin_end(box, 8);
+    gtk_widget_set_margin_top(box, 8);
+    gtk_widget_set_margin_bottom(box, 12);
+
+    gtk_box_pack_start(GTK_BOX(box), page_title("漏洞", NULL), FALSE, FALSE, 0);
+
+    /* 上半：一段说明 + 一行参数，尽量矮，把高度留给日志 */
+    card = card_new();
+
+    head = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 16);
+    gtk_widget_set_margin_start(head, 22);
+    gtk_widget_set_margin_end(head, 22);
+    gtk_widget_set_margin_top(head, 14);
+    gtk_widget_set_margin_bottom(head, 10);
+    {
+        GtkWidget *ico = make_icon(IC_BUG, 24);
+        GtkWidget *col = gtk_box_new(GTK_ORIENTATION_VERTICAL, 3);
+
+        gtk_widget_set_valign(ico, GTK_ALIGN_START);
+        gtk_widget_set_margin_top(ico, 1);
+
+        lbl = gtk_label_new("CVE-2026-46300 · Fragnesia");
+        gtk_widget_set_name(lbl, "cardtitle");
+        gtk_widget_set_halign(lbl, GTK_ALIGN_START);
+
+        sub = gtk_label_new("xfrm espintcp 的 ESP 分片被当成普通数据写回页缓存，"
+                            "非特权用户即可改写只读文件");
+        gtk_widget_set_name(sub, "cardvalue");
+        gtk_widget_set_halign(sub, GTK_ALIGN_START);
+        gtk_label_set_line_wrap(GTK_LABEL(sub), TRUE);
+        gtk_label_set_max_width_chars(GTK_LABEL(sub), 86);
+
+        gtk_box_pack_start(GTK_BOX(col), lbl, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(col), sub, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(head), ico, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(head), col, TRUE, TRUE, 0);
+    }
+    gtk_box_pack_start(GTK_BOX(card), head, FALSE, FALSE, 0);
+
+    /* 参数条：目标文件 / 偏移 / 编译 / 运行 */
+    row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_margin_start(row, 62);
+    gtk_widget_set_margin_end(row, 22);
+    gtk_widget_set_margin_top(row, 4);
+    gtk_widget_set_margin_bottom(row, 4);
+
+    a->lpe_target = gtk_entry_new();
+    gtk_widget_set_name(a->lpe_target, "cmdline");
+    gtk_entry_set_text(GTK_ENTRY(a->lpe_target), "/usr/bin/su");
+    gtk_editable_select_region(GTK_EDITABLE(a->lpe_target), 0, 0);
+    gtk_widget_set_hexpand(a->lpe_target, TRUE);
+
+    a->lpe_off = gtk_entry_new();
+    gtk_widget_set_name(a->lpe_off, "cmdline");
+    gtk_entry_set_text(GTK_ENTRY(a->lpe_off), "0");
+    gtk_editable_select_region(GTK_EDITABLE(a->lpe_off), 0, 0);
+    gtk_entry_set_width_chars(GTK_ENTRY(a->lpe_off), 5);
+    gtk_entry_set_max_width_chars(GTK_ENTRY(a->lpe_off), 5);
+
+    a->lpe_btn_build = gtk_button_new_with_label("编译");
+    a->lpe_btn_run = gtk_button_new_with_label("运行验证");
+    gtk_style_context_add_class(gtk_widget_get_style_context(a->lpe_btn_run),
+                                "primary");
+
+    {
+        GtkWidget *lbl_t = gtk_label_new("目标文件");
+        GtkWidget *lbl_o = gtk_label_new("偏移");
+
+        gtk_widget_set_name(lbl_t, "rowlabel");
+        gtk_widget_set_name(lbl_o, "rowlabel");
+        gtk_widget_set_valign(lbl_t, GTK_ALIGN_CENTER);
+        gtk_widget_set_valign(lbl_o, GTK_ALIGN_CENTER);
+
+        gtk_box_pack_start(GTK_BOX(row), lbl_t, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(row), a->lpe_target, TRUE, TRUE, 0);
+        gtk_box_pack_start(GTK_BOX(row), lbl_o, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(row), a->lpe_off, FALSE, FALSE, 0);
+    }
+    gtk_box_pack_start(GTK_BOX(row), a->lpe_btn_build, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(row), a->lpe_btn_run, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(card), row, FALSE, FALSE, 0);
+
+    a->lpe_status = gtk_label_new("");
+    gtk_widget_set_halign(a->lpe_status, GTK_ALIGN_START);
+    gtk_widget_set_margin_start(a->lpe_status, 62);
+    gtk_widget_set_margin_end(a->lpe_status, 22);
+    gtk_widget_set_margin_top(a->lpe_status, 4);
+    gtk_widget_set_margin_bottom(a->lpe_status, 12);
+    gtk_label_set_line_wrap(GTK_LABEL(a->lpe_status), TRUE);
+    gtk_box_pack_start(GTK_BOX(card), a->lpe_status, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(box), card, FALSE, FALSE, 0);
+
+    /* 下半：日志 */
+    card_log = card_new();
+    gtk_widget_set_vexpand(card_log, TRUE);
+
+    {
+        GtkWidget *cbody = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+
+        gtk_widget_set_margin_start(cbody, 14);
+        gtk_widget_set_margin_end(cbody, 14);
+        gtk_widget_set_margin_top(cbody, 10);
+        gtk_widget_set_margin_bottom(cbody, 10);
+
+        head = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+        lbl = gtk_label_new("输出");
+        gtk_widget_set_name(lbl, "cardtitle");
+        gtk_widget_set_halign(lbl, GTK_ALIGN_START);
+        btn_clear = gtk_button_new_with_label("清屏");
+        gtk_widget_set_name(btn_clear, "textbtn");
+        gtk_box_pack_start(GTK_BOX(head), lbl, TRUE, TRUE, 0);
+        gtk_box_pack_end(GTK_BOX(head), btn_clear, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(cbody), head, FALSE, FALSE, 0);
+
+        scroll = gtk_scrolled_window_new(NULL, NULL);
+        gtk_widget_set_name(scroll, "logscroll");
+        gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
+                                       GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+        gtk_widget_set_vexpand(scroll, TRUE);
+
+        a->lpe_buf = gtk_text_buffer_new(NULL);
+        gtk_text_buffer_create_tag(a->lpe_buf, "cmd",
+                                   "weight", PANGO_WEIGHT_BOLD, NULL);
+        gtk_text_buffer_create_tag(a->lpe_buf, "err",
+                                   "foreground", "#c0392b", NULL);
+        gtk_text_buffer_create_tag(a->lpe_buf, "warn",
+                                   "foreground", "#b26a00", NULL);
+        gtk_text_buffer_create_tag(a->lpe_buf, "ok",
+                                   "foreground", "#2e7d32", NULL);
+        gtk_text_buffer_create_tag(a->lpe_buf, "dim",
+                                   "foreground", "#8e8e93", NULL);
+
+        a->lpe_view = gtk_text_view_new_with_buffer(a->lpe_buf);
+        gtk_widget_set_name(a->lpe_view, "logview");
+        gtk_text_view_set_editable(GTK_TEXT_VIEW(a->lpe_view), FALSE);
+        gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(a->lpe_view), FALSE);
+        gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(a->lpe_view), GTK_WRAP_WORD_CHAR);
+        gtk_text_view_set_left_margin(GTK_TEXT_VIEW(a->lpe_view), 10);
+        gtk_text_view_set_right_margin(GTK_TEXT_VIEW(a->lpe_view), 10);
+        gtk_text_view_set_top_margin(GTK_TEXT_VIEW(a->lpe_view), 6);
+        gtk_container_add(GTK_CONTAINER(scroll), a->lpe_view);
+        gtk_box_pack_start(GTK_BOX(cbody), scroll, TRUE, TRUE, 0);
+
+        gtk_box_pack_start(GTK_BOX(card_log), cbody, TRUE, TRUE, 0);
+        gtk_box_pack_start(GTK_BOX(box), card_log, TRUE, TRUE, 0);
+
+        g_signal_connect_swapped(btn_clear, "clicked",
+                                 G_CALLBACK(gtk_text_buffer_set_text),
+                                 a->lpe_buf);
+    }
+
+    hint = gtk_label_new("载荷固定为内置 192 字节 ELF（setuid(0) + execve /bin/sh），"
+                         "只改目标文件的前 192 字节，且只改 page cache。");
+    gtk_widget_set_name(hint, "cardvalue");
+    gtk_widget_set_halign(hint, GTK_ALIGN_START);
+    gtk_widget_set_margin_start(hint, 18);
+    gtk_widget_set_margin_top(hint, 2);
+    gtk_box_pack_start(GTK_BOX(box), hint, FALSE, FALSE, 0);
+
+    g_signal_connect(a->lpe_btn_build, "clicked", G_CALLBACK(on_lpe_build), a);
+    g_signal_connect(a->lpe_btn_run, "clicked", G_CALLBACK(on_lpe_run), a);
+
+    lpe_log(a, "CVE-2026-46300（Fragnesia）\n", "cmd");
+    lpe_log(a, "ESP 分片在 TCP coalesce 后被当成普通数据写回页缓存，\n"
+               "非特权用户即可改写只读文件。\n", "dim");
+    lpe_log(a, "载荷：192 字节 ELF，setuid(0) + execve(\"/bin/sh\")\n", "dim");
+    refresh_lpe(a);
+    return box;
+}
+
 /* 底部栏一格：图标 + 文字 */
 static GtkWidget *tab_item(App *a, int idx, IconKind kind, const char *text)
 {
@@ -1952,7 +2589,8 @@ static GtkWidget *build_tabbar(App *a)
     gtk_box_pack_start(GTK_BOX(bar), tab_item(a, 0, IC_T_HOME, "主页"), TRUE, TRUE, 0);
     gtk_box_pack_start(GTK_BOX(bar), tab_item(a, 1, IC_T_SHIELD, "超级用户"), TRUE, TRUE, 0);
     gtk_box_pack_start(GTK_BOX(bar), tab_item(a, 2, IC_T_TERM, "终端"), TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(bar), tab_item(a, 3, IC_T_GEAR, "设置"), TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(bar), tab_item(a, 3, IC_T_BUG, "漏洞"), TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(bar), tab_item(a, 4, IC_T_GEAR, "设置"), TRUE, TRUE, 0);
     return bar;
 }
 
@@ -1987,12 +2625,18 @@ static void build_ui(App *a)
     gtk_stack_add_named(GTK_STACK(a->stack), build_home(a), "home");
     gtk_stack_add_named(GTK_STACK(a->stack), build_super(a), "super");
     gtk_stack_add_named(GTK_STACK(a->stack), build_term(a), "term");
+    gtk_stack_add_named(GTK_STACK(a->stack), build_lpe(a), "lpe");
     gtk_stack_add_named(GTK_STACK(a->stack), build_settings(a), "set");
 
     gtk_box_pack_end(GTK_BOX(shell), build_tabbar(a), FALSE, FALSE, 0);
 
     gtk_widget_show_all(a->win);
     switch_page(a, 0);
+
+    /* 启动时 GTK 会把焦点交给第一个可获得焦点的控件（漏洞页的目标文件框），
+       顺带把里面的路径整段选中，看上去像被用户划了一半。等焦点分配完再清一次。 */
+    gtk_window_set_focus(GTK_WINDOW(a->win), NULL);
+    g_idle_add(reset_entry_selection, a);
 }
 
 int main(int argc, char **argv)
