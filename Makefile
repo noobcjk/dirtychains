@@ -52,6 +52,10 @@ $(TARGET): $(GUI_OBJ) $(ENG_OBJ)
 poc: $(ENGINE_SRC)
 	$(CC) $(ENGINE_CFLAGS) -o $@ $<
 
+# CVE-2026-43499 (futex PI requeue UAF) 独立复现程序，纯 C，不依赖 GUI
+cve43499: cve-2026-43499.c
+	$(CC) -O2 -Wall -Wextra -pthread -std=gnu99 -o $@ $<
+
 # CVE-2026-64531 (net/openvswitch CT action 越界) 命令行版
 # 源码就在 dirtyfrag-gui.c 里，用 OVSWRAP_STANDALONE 把 GTK 段裁掉
 ovswrap: $(SRC)
