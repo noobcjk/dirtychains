@@ -6978,7 +6978,7 @@ static int diagspill_main(int argc, char **argv)
 
 #define APP_TITLE       "DirtyChains · 本地提权"
 /* 构建标识: 标题栏副标题上直接显示, 用来确认跑的是不是最新这份 */
-#define DF_BUILD        "2026-11-06-r39"
+#define DF_BUILD        "2026-11-06-r40"
 #define APP_SUBTITLE    "十链 PoC 图形前端 · " DF_BUILD
 #define LOG_MAX_LINES   20000
 #define PTY_COLS        110
@@ -7125,6 +7125,7 @@ typedef struct {
     GtkTextMark *log_end_mark;
     GtkWidget *entry_input, *btn_send, *btn_ctrlc;
     GtkWidget *status_lbl, *spinner;
+    GtkWidget *frame_params, *frame_actions; /* 未选择 CVE 时整块隐藏 */
 
     GtkTextTag *tag_fg[8];   /* 30..37 */
     GtkTextTag *tag_bold, *tag_dim;
@@ -8059,12 +8060,33 @@ static const Chain *cur_chain(App *a)
     return &chains[idx - 1];
 }
 
+/*
+ * 未选择 CVE 时把「参数」面板和整行动作按钮收起来:
+ * 没有链可选, 这些控件既没有意义也容易让人误点。
+ * 选中任意一条链 (含「全部」) 后再放出来。
+ */
+static void sync_tools_visible(App *a)
+{
+    gboolean has;
+
+    if (!a->frame_params || !a->frame_actions)
+        return;
+    has = gtk_combo_box_get_active(GTK_COMBO_BOX(a->combo)) >= 0;
+    gtk_widget_set_visible(a->frame_params, has);
+    gtk_widget_set_visible(a->frame_actions, has);
+}
+
 static void update_desc(App *a)
 {
     int idx = gtk_combo_box_get_active(GTK_COMBO_BOX(a->combo));
 
+    sync_tools_visible(a);
+
     if (idx < 0) {
-        gtk_label_set_markup(GTK_LABEL(a->lbl_name), "<b>暂未选择CVE</b>");
+        /* 空状态: 标题放大, 只留一句怎么开始 */
+        gtk_label_set_markup(GTK_LABEL(a->lbl_name),
+                             "<span size=\"xx-large\" weight=\"bold\">"
+                             "暂未选择 CVE</span>");
         gtk_label_set_text(GTK_LABEL(a->lbl_desc),
                            "点左上角「展开」，从类别面板选择漏洞类别；"
                            "同一类别里有多个漏洞时再在「漏洞选择」里挑。");
@@ -11480,6 +11502,9 @@ static void build_window(App *a)
     gtk_widget_set_margin_top(frame_actions, 8);
     gtk_box_pack_start(GTK_BOX(frame_actions), build_actions(a), TRUE, TRUE, 0);
 
+    a->frame_params = frame_params;
+    a->frame_actions = frame_actions;
+
     /* ── 日志 ── */
     pane = build_log_pane(a);
     gtk_widget_set_margin_start(pane, 12);
@@ -11785,6 +11810,8 @@ int main(int argc, char **argv)
 
     /* 未选择 CVE: 参数面板隐藏 OVS 专属行 (内核版本) */
     sync_params_ui(&app);
+    /* show_all 会把参数/按钮重新露出来, 这里按当前选择再收一次 */
+    sync_tools_visible(&app);
 
     /* 启动横幅写入日志 */
     {
