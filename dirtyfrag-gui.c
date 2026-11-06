@@ -6978,7 +6978,7 @@ static int diagspill_main(int argc, char **argv)
 
 #define APP_TITLE       "DirtyChains · 本地提权"
 /* 构建标识: 标题栏副标题上直接显示, 用来确认跑的是不是最新这份 */
-#define DF_BUILD        "2026-11-01-r37"
+#define DF_BUILD        "2026-11-06-r38"
 #define APP_SUBTITLE    "十链 PoC 图形前端 · " DF_BUILD
 #define LOG_MAX_LINES   20000
 #define PTY_COLS        110
@@ -11376,8 +11376,8 @@ static void build_window(App *a)
         if (mon)
             gdk_monitor_get_workarea(mon, &geo);   /* 已扣掉面板/任务栏 */
         /* 左右各留 40px: 小屏上窗口贴边后不容易再拖回来 */
-        ww = MIN(980, geo.width - 80);
-        hh = MIN(760, geo.height - 90);
+        ww = MIN(1180, geo.width - 80);
+        hh = MIN(820, geo.height - 90);
         if (ww < 640)
             ww = 640;
         if (hh < 460)
@@ -11511,7 +11511,7 @@ static void build_window(App *a)
         gtk_box_pack_end(GTK_BOX(statusbar), env, FALSE, FALSE, 0);
     }
 
-    gtk_box_pack_start(GTK_BOX(vbox), head, FALSE, FALSE, 0);
+    /* head 会在下面的左右两栏里并入左栏, 不再单独整宽堆到 vbox */
 
     /* ── 任务抽屉 (左上角「展开」控制, 从左侧推挤出来) ── */
     a->revealer = gtk_revealer_new();
@@ -11565,11 +11565,36 @@ static void build_window(App *a)
         gtk_widget_set_margin_end(cve, 12);
         gtk_widget_set_margin_top(cve, 8);
     }
-    gtk_box_pack_start(GTK_BOX(vbox), a->cve_revealer, FALSE, FALSE, 0);
+    /*
+     * 左右两栏: 左栏放标题/说明、漏洞选择、参数、按钮;
+     * 右栏整列放日志 (原来日志在底部整宽, 现在挪到右侧红框的位置)。
+     * 底部的状态栏仍整宽, 横跨两栏。
+     */
+    {
+        GtkWidget *body = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+        GtkWidget *leftcol = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
 
-    gtk_box_pack_start(GTK_BOX(vbox), frame_params, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(vbox), frame_actions, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(vbox), pane, TRUE, TRUE, 0);
+        /* 左栏 */
+        gtk_box_pack_start(GTK_BOX(leftcol), head, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(leftcol), a->cve_revealer, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(leftcol), frame_params, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(leftcol), frame_actions, FALSE, FALSE, 0);
+        gtk_widget_set_hexpand(leftcol, TRUE);
+        gtk_widget_set_vexpand(leftcol, TRUE);
+        gtk_widget_set_valign(leftcol, GTK_ALIGN_FILL);
+
+        /* 右栏: 日志。固定列宽, 高度随内容区铺满 */
+        gtk_widget_set_size_request(pane, 360, -1);
+        gtk_widget_set_hexpand(pane, FALSE);
+        gtk_widget_set_vexpand(pane, TRUE);
+        gtk_widget_set_valign(pane, GTK_ALIGN_FILL);
+
+        gtk_box_pack_start(GTK_BOX(body), leftcol, TRUE, TRUE, 0);
+        gtk_box_pack_start(GTK_BOX(body), pane, FALSE, TRUE, 0);
+        gtk_widget_set_vexpand(body, TRUE);
+
+        gtk_box_pack_start(GTK_BOX(vbox), body, TRUE, TRUE, 0);
+    }
     gtk_box_pack_start(GTK_BOX(vbox), statusbar, FALSE, FALSE, 0);
 
     gtk_widget_set_hexpand(vbox, TRUE);
