@@ -7410,27 +7410,40 @@ static gboolean on_bg_draw(GtkWidget *w, cairo_t *cr, gpointer data)
  * ------------------------------------------------------------------------ */
 
 /*
- * 兜底填色: 在控件自己的绘制之前, 先把整块画成不透明底色。
+ * 日志区背景: 把窗口壁纸的对应区域贴到日志控件自己的 GdkWindow 上。
  *
- * GtkTextView / GtkScrolledWindow 各带一个 GdkWindow。没有合成器时, 若
- * 样式里没有不透明背景, GTK 的默认 draw handler 不会清屏, 这块窗口就
- * 保留 X 服务器的未定义内容 —— 表现为日志区一片黑 (root window) 或透出
- * 桌面壁纸, 而且拖动窗口时不会自己刷新。
+ * GtkTextView / GtkScrolledWindow 各带一个 GdkWindow, 无法直接透出上层
+ * 已经画好的壁纸; 而单纯置 transparent, 在没有合成器的 X11 上 GTK 不会
+ * 清屏, 会露出 root window 的旧像素 (拖动时那块不刷新, 像贴在屏幕上)。
+ * 所以这里先算出控件在背景层里的位置, 再从 bg_surf 拷同坐标的一块过来,
+ * 整块不透明, 视觉上和其余部分的壁纸无缝连续。
+ * 背景图缺失时退回原来的不透明浅色底, 保证不会出现黑块。
  *
  * draw 信号是 RUN_LAST, 普通 connect 排在默认 handler 之前, 所以这里填的
- * 底色会留下, 随后默认 handler 只往上画文字/滚动条。这样即使系统主题或
- * CSS 选择器没命中 (深色主题、精简主题、旧 GTK), 也不会露出黑块。
+ * 底色会留下, 随后默认 handler 只往上画文字/滚动条。
  */
 static gboolean on_panel_draw(GtkWidget *w, cairo_t *cr, gpointer data)
 {
-    GdkRGBA c;
-    const char *hex = data;
+    App *a = data;
+    int wx = 0, wy = 0;
 
-    (void)w;
-    if (hex && gdk_rgba_parse(&c, hex))
-        gdk_cairo_set_source_rgba(cr, &c);
-    else
-        cairo_set_source_rgb(cr, 0.984, 0.992, 1.0);
+    /* 面板可能比背景层先收到重绘, 这里顺手保证缓存尺寸与当前窗口一致 */
+    if (a && a->bg_pix && a->bg_area)
+        bg_cache_rebuild(a,
+                         gtk_widget_get_allocated_width(a->bg_area),
+                         gtk_widget_get_allocated_height(a->bg_area));
+
+    if (a && a->bg_surf && a->bg_area &&
+        gtk_widget_translate_coordinates(w, a->bg_area, 0, 0, &wx, &wy)) {
+        cairo_save(cr);
+        cairo_set_source_surface(cr, a->bg_surf, -(double)wx, -(double)wy);
+        cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+        cairo_paint(cr);
+        cairo_restore(cr);
+        return FALSE;
+    }
+
+    cairo_set_source_rgb(cr, 0.984, 0.992, 1.0);
     cairo_paint(cr);
     return FALSE;
 }
@@ -10547,17 +10560,14 @@ static void install_css(void)
         "}\n"
 
         /*
-         * 日志区: 浅色卡片。
+         * 日志区: 壁纸连续。
          *
-         * 这里绝对不能用 rgba/transparent: GtkScrolledWindow 与 GtkTextView
-         * 在 X11 下各带自己的 GdkWindow, 没有合成器时 alpha 背景不会被清屏,
-         * 露出的是 X root window 的旧像素 —— 表现就是日志区"透明"到能看见
-         * 桌面壁纸, 而且拖动窗口时那块画面不跟着刷新 (像贴在屏幕上)。
-         * 因此四层统一给不透明底色; 想要半透明效果只在有合成器时叠加,
-         * 见 install_css() 末尾的 composited 分支。
+         * 四层都不能画自己的底色 —— 背景由 on_panel_draw 按控件位置,
+         * 从窗口壁纸缓存里拷对应区域过来, 本身就是不透明像素, 所以
+         * 无合成器时也不会露黑块。这里若再给 solid 色就会盖掉壁纸。
          */
         "#mainwin #logcard {\n"
-        "  background-color: #fbfdff;\n"
+        "  background-color: transparent;\n"
         "  border: 1px solid rgba(150,185,220,0.55);\n"
         "  border-radius: 12px;\n"
         "  padding: 0;\n"
@@ -10567,7 +10577,7 @@ static void install_css(void)
         "#mainwin #logcard textview,\n"
         "#mainwin #logcard textview text {\n"
         "  background-image: none;\n"
-        "  background-color: #fbfdff;\n"
+        "  background-color: transparent;\n"
         "}\n"
         "#mainwin #logview {\n"
         "  color: #2b3644;\n"
@@ -10718,7 +10728,7 @@ static void install_css(void)
 
         if (scr && gdk_screen_is_composited(scr)) {
             static const char *css_alpha =
-                "#mainwin #logcard { background-color: rgba(255,255,255,0.72); }\n"
+                "#mainwin #logcard { background-color: transparent; }\n"
                 "#mainwin #logcard scrolledwindow,\n"
                 "#mainwin #logcard viewport,\n"
                 "#mainwin #logcard textview,\n"
@@ -11133,9 +11143,8 @@ static GtkWidget *build_log_pane(App *a)
                                    GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
     gtk_widget_set_vexpand(scroller, TRUE);
     gtk_container_add(GTK_CONTAINER(card), scroller);
-    /* 两个控件各有独立 GdkWindow, 都要自己保证底色 (见 on_panel_draw) */
-    g_signal_connect(scroller, "draw", G_CALLBACK(on_panel_draw),
-                     (gpointer)"#fbfdff");
+    /* 两个控件各有独立 GdkWindow, 都要自己画背景 (见 on_panel_draw) */
+    g_signal_connect(scroller, "draw", G_CALLBACK(on_panel_draw), a);
 
     a->logview = gtk_text_view_new();
     a->logbuf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(a->logview));
@@ -11151,8 +11160,7 @@ static GtkWidget *build_log_pane(App *a)
     gtk_text_view_set_bottom_margin(GTK_TEXT_VIEW(a->logview), 6);
     gtk_widget_set_name(a->logview, "logview");
     gtk_container_add(GTK_CONTAINER(scroller), a->logview);
-    g_signal_connect(a->logview, "draw", G_CALLBACK(on_panel_draw),
-                     (gpointer)"#fbfdff");
+    g_signal_connect(a->logview, "draw", G_CALLBACK(on_panel_draw), a);
 
     {
         GtkTextIter end;
