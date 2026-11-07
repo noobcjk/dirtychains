@@ -56,6 +56,10 @@ poc: $(ENGINE_SRC)
 cve43499: cve-2026-43499.c
 	$(CC) -O2 -Wall -Wextra -pthread -std=gnu99 -o $@ $<
 
+# 用 gdb 量 cve43499 的栈偏移 k：只调两个 syscall，不触发漏洞
+kstack-depth: kstack-depth.c
+	$(CC) -O2 -Wall -Wextra -std=gnu99 -o $@ $<
+
 # CVE-2026-64531 (net/openvswitch CT action 越界) 命令行版
 # 源码就在 dirtyfrag-gui.c 里，用 OVSWRAP_STANDALONE 把 GTK 段裁掉
 ovswrap: $(SRC)

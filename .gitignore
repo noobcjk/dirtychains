@@ -8,6 +8,7 @@
 /dirtychains
 /poc
 /cve43499
+/kstack-depth
 /ovswrap
 /rootmgr-gui
 /tools/kmod/rootmgr_fd_demo
